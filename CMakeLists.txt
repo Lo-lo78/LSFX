@@ -10,7 +10,8 @@ set(SFIZZ_SHARED OFF CACHE BOOL "" FORCE)
 set(SFIZZ_JACK OFF CACHE BOOL "" FORCE)
 set(SFIZZ_RENDER OFF CACHE BOOL "" FORCE)
 set(ENABLE_LTO OFF CACHE BOOL "" FORCE)
-FetchContent_Declare(sfizz GIT_REPOSITORY https://github.com/sfztools/sfizz.git GIT_TAG 1.2.3 GIT_SHALLOW TRUE GIT_SUBMODULES_RECURSE TRUE)
+FetchContent_Declare(sfizz GIT_REPOSITORY https://github.com/sfztools/sfizz.git GIT_TAG 1.2.3 GIT_SHALLOW TRUE GIT_SUBMODULES_RECURSE TRUE
+    PATCH_COMMAND "${CMAKE_COMMAND}" "-DSFIZZ_SOURCE_DIR=<SOURCE_DIR>" -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/PatchSfizz.cmake")
 FetchContent_MakeAvailable(sfizz)
 juce_add_plugin(LSFX
     COMPANY_NAME "Lo-lo" BUNDLE_ID "org.lolo.lsoundfont"
