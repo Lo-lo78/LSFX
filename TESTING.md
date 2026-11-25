@@ -1,16 +1,6 @@
-# TEST1 checklist
-
-- [ ] GitHub Actions: configure, compile and package Windows x64 VST3.
-- [ ] REAPER scans the VST3; opening the UI does not crash.
-- [ ] Load original FluidR3 GM.SF2. Expected 189 preset headers in this user's bank; no bank conversion.
-- [ ] Channel 1 bank 0/program 0 plays a piano. Check bank 0 program 40, program 80 and a non-zero bank.
-- [ ] Channel 10, bank 128 program 0: drum kit.
-- [ ] Check Note Off 0x80 and Note On velocity zero, sustain CC64, pitch bend, channel pressure, CC7, CC10, CC11, CC0 and Program Change.
-- [ ] Play MIDI on all 16 channels with distinct programs. Compare with another SF2 player using the same file, gain, interpolation and FX settings.
-- [ ] NVDA: Tab/Shift+Tab through named controls, select bank/program by keyboard, use Read status, browse a path with spaces, focus after file dialog and after status dialog.
-- [ ] Save project, close/reopen, confirm file and all selected programs restore. Save a REAPER preset, instantiate another LSoundFont and load the preset.
-- [ ] Move/rename bank: show clear error, no wrong-bank playback after load attempt. Reopen original path.
-- [ ] Change audio sample rate 44.1/48/96 kHz, check tuning, rendering, CPU and memory.
-- [ ] Load second SF2 (different banks), rapid repeated load requests, close editor while loading, remove plugin during load.
-- [ ] SF3: open a known valid SF3 test bank; not yet confirmed.
-- [ ] Benchmark CPU, voice stealing, sonic quality vs BASSMIDI only after functional validation.
+# TEST2
+1. Remove old LSoundFont VST3 from scan paths (same plugin ID); install LSFX. Scan REAPER.
+2. Open FluidR3 GM.sf2. Play same MIDI, host sample rate and block size as TEST1. Compare REAPER Performance Meter at rest, 1 note, 4 notes, and full MIDI arrangement. Use generic UI to compare Fourth order / Seventh order and effects Off / Both. Compare dry sound separately from effects; no claim of equal wet sound.
+3. Check sustain, note-off, program changes, channel 10 drums, panic and release. Verify silence after release with effects off; verify effects tails with effects on.
+4. Open an SFZ with samples in its original relative directory. Play MIDI channel 1; test velocity layers, sustain, release, pitch wheel, CC, and sample offsets. Test switching from SF2 to SFZ and back, missing samples, save/reopen project. SFZ is single instrument, not 16 independent channels yet; aftertouch and complete SFZ opcode coverage not validated.
+5. Test realtime and offline render, sample rate changes, host blocks larger than 1024. Confirm TEST1 state restoration and keyboard accessibility. No Windows compile or REAPER runtime tests performed here.

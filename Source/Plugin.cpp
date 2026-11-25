@@ -1,5 +1,6 @@
 #include <JuceHeader.h>
 #include <fluidsynth.h>
+#include <sfizz.h>
 #include <array>
 #include <atomic>
 #include <algorithm>
@@ -17,14 +18,17 @@ struct Preset { int bank, program; juce::String name; };
 struct Engine {
     fluid_settings_t* settings = nullptr;
     fluid_synth_t* synth = nullptr;
+    sfizz_synth_t* sfz = nullptr;
+    int quality = -1, effects = -1;
+    int quietSamples = 0;
     int font = -1;
     double rate = 44100;
-    ~Engine() { if (synth) delete_fluid_synth(synth); if (settings) delete_fluid_settings(settings); }
+    ~Engine() { if (sfz) sfizz_free(sfz); if (synth) delete_fluid_synth(synth); if (settings) delete_fluid_settings(settings); }
 };
 using Programs = std::array<int, channels>;
 Programs defaults() { Programs p{}; p[9] = pack(128, 0); return p; }
 struct Request { juce::String path; double rate = 44100; Programs programs = defaults(); uint64_t serial = 0; };
-struct View { juce::String path, status = "No SoundFont loaded"; std::vector<Preset> presets; uint64_t revision = 0; bool loading = false; };
+struct View { juce::String path, status = "No SoundFont loaded"; std::vector<Preset> presets; uint64_t revision = 0; bool loading = false; bool isSfz = false; };
 }
 
 class Processor final : public juce::AudioProcessor {
@@ -33,6 +37,8 @@ public:
         auto p = defaults();
         for (int i=0; i<channels; ++i) { selected[i].store(p[i]); commands[i].store(-1); }
         addParameter(gain = new juce::AudioParameterFloat({"gain",1}, "Output gain", juce::NormalisableRange<float>(-60.0f, 6.0f, 0.1f), -6.0f, juce::AudioParameterFloatAttributes().withLabel("dB")));
+        addParameter(quality = new juce::AudioParameterChoice({"quality",1}, "SF2 interpolation", {"Linear", "Fourth order", "Seventh order"}, 1));
+        addParameter(effects = new juce::AudioParameterChoice({"effects",1}, "SF2 effects", {"Off", "Reverb", "Chorus", "Both"}, 0));
         worker = std::thread([this]{ work(); });
     }
     ~Processor() override {
@@ -40,7 +46,7 @@ public:
         cv.notify_one();
         if (worker.joinable()) worker.join();
     }
-    const juce::String getName() const override { return "LSoundFont"; }
+    const juce::String getName() const override { return "LSFX"; }
     bool acceptsMidi() const override { return true; }
     bool producesMidi() const override { return false; }
     bool isMidiEffect() const override { return false; }
@@ -63,6 +69,7 @@ public:
     }
     void releaseResources() override { panic.store(true); }
     void reset() override { panic.store(true); }
+    uint64_t getRevision() { std::lock_guard<std::mutex> lock(viewMutex); return view.revision; }
     View getView() { std::lock_guard<std::mutex> lock(viewMutex); return view; }
     int current(int ch) const { const auto cmd=commands[ch].load(); return cmd>=0 ? cmd : selected[ch].load(); }
     void select(int ch,int bank,int prog) { if (ch>=0 && ch<channels && bank>=0 && bank<=16383 && prog>=0 && prog<128) commands[ch].store(pack(bank,prog)); }
@@ -75,12 +82,45 @@ public:
         // No waiting for disk I/O or for the worker on the audio thread.
         std::unique_lock<std::mutex> lock(engineMutex, std::try_to_lock);
         if (!lock.owns_lock() || !engine || std::abs(engine->rate-hostRate.load())>0.01 || b.getNumChannels()<2) { midi.clear(); return; }
+        if (engine->sfz) {
+            auto* z=engine->sfz;
+            const bool p=panic.exchange(false);
+            if(p) { sfizz_send_cc(z,0,64,0); sfizz_send_cc(z,0,120,0); sfizz_send_cc(z,0,123,0); for(int key=0;key<128;++key) sfizz_send_note_off(z,0,key,0); }
+            // Fixed-size chunks guarantee the configured maximum block size.
+            auto it=midi.begin(); const auto end=midi.end();
+            for(int start=0;start<b.getNumSamples();) {
+                const int count=juce::jmin(1024,b.getNumSamples()-start);
+                while(it!=end) {
+                    const auto m=*it;
+                    if(m.samplePosition>=start+count) break;
+                    ++it;
+                    if(m.numBytes<2 || (m.data[0]&15)!=0) continue;
+                    const int st=m.data[0]&240, a=m.data[1]&127, v=m.numBytes>=3?m.data[2]&127:0;
+                    const int t=juce::jlimit(0,count-1,m.samplePosition-start);
+                    if(st==0x90 && m.numBytes>=3 && v) sfizz_send_note_on(z,t,a,v);
+                    else if((st==0x80 || st==0x90) && m.numBytes>=3) sfizz_send_note_off(z,t,a,v);
+                    else if(st==0xb0 && m.numBytes>=3) sfizz_send_cc(z,t,a,v);
+                    else if(st==0xe0 && m.numBytes>=3) sfizz_send_hd_pitch_wheel(z,t,((a|(v<<7))-8192)/8192.0f);
+                    else if(st==0xc0) sfizz_send_program_change(z,t,a);
+                }
+                float* out[]={b.getWritePointer(0,start),b.getWritePointer(1,start)};
+                sfizz_render_block(z,out,2,count); start+=count;
+            }
+            b.applyGain(juce::Decibels::decibelsToGain(gain->get())); midi.clear(); return;
+        }
         auto* s = engine->synth;
-        if (panic.exchange(false)) for (int ch=0;ch<channels;++ch) fluid_synth_all_sounds_off(s,ch);
+        const int q=quality->getIndex(), fx=effects->getIndex();
+        bool controlChanged = q!=engine->quality || fx!=engine->effects;
+        if(q!=engine->quality) { const int methods[]={FLUID_INTERP_LINEAR,FLUID_INTERP_4THORDER,FLUID_INTERP_7THORDER}; fluid_synth_set_interp_method(s,-1,methods[q]); engine->quality=q; }
+        if(fx!=engine->effects) { fluid_synth_reverb_on(s,-1,(fx&1)!=0); fluid_synth_chorus_on(s,-1,(fx&2)!=0); engine->effects=fx; }
+        if (panic.exchange(false)) { controlChanged=true; for (int ch=0;ch<channels;++ch) fluid_synth_all_sounds_off(s,ch); }
         for (int ch=0; ch<channels; ++ch) {
             const int cmd = commands[ch].exchange(-1);
-            if (cmd>=0 && fluid_synth_program_select(s,ch,engine->font,cmd>>7,cmd&127)==FLUID_OK) selected[ch].store(cmd);
+            if (cmd>=0) { controlChanged=true; if(fluid_synth_program_select(s,ch,engine->font,cmd>>7,cmd&127)==FLUID_OK) selected[ch].store(cmd); }
         }
+        const bool idleCandidate = fx==0 && !controlChanged && midi.isEmpty() && fluid_synth_get_active_voice_count(s)==0;
+        if(idleCandidate && engine->quietSamples>=256) return;
+        if(!idleCandidate) engine->quietSamples=0;
         const float g = juce::Decibels::decibelsToGain(gain->get());
         // FluidSynth renders each section preceding the corresponding MIDI event.
         // Its internal block size may still quantise event timing slightly.
@@ -114,12 +154,13 @@ public:
             }
         }
         render(cursor,b.getNumSamples()-cursor);
+        if(idleCandidate && fluid_synth_get_active_voice_count(s)==0) engine->quietSamples=juce::jmin(256,engine->quietSamples+b.getNumSamples());
         b.applyGain(g); midi.clear();
     }
     void getStateInformation(juce::MemoryBlock& dest) override {
         juce::String path; Programs p; stateForSave(path,p);
         juce::XmlElement x("LSoundFontState");
-        x.setAttribute("version",1); x.setAttribute("file",path); x.setAttribute("gain",static_cast<double>(gain->get()));
+        x.setAttribute("version",2); x.setAttribute("quality",quality->getIndex()); x.setAttribute("effects",effects->getIndex()); x.setAttribute("file",path); x.setAttribute("gain",static_cast<double>(gain->get()));
         for(int i=0;i<channels;++i) x.setAttribute("ch"+juce::String(i+1),p[i]);
         copyXmlToBinary(x,dest);
     }
@@ -128,11 +169,15 @@ public:
             auto p=defaults();
             for(int i=0;i<channels;++i) p[i]=juce::jlimit(0,pack(16383,127),x->getIntAttribute("ch"+juce::String(i+1),p[i]));
             gain->setValueNotifyingHost(gain->convertTo0to1(static_cast<float>(x->getDoubleAttribute("gain",-6.0))));
+            quality->setValueNotifyingHost(quality->convertTo0to1(static_cast<float>(juce::jlimit(0,2,x->getIntAttribute("quality",1)))));
+            effects->setValueNotifyingHost(effects->convertTo0to1(static_cast<float>(juce::jlimit(0,3,x->getIntAttribute("effects",0)))));
             load(x->getStringAttribute("file"),p);
         }
     }
 private:
     juce::AudioParameterFloat* gain = nullptr;
+    juce::AudioParameterChoice* quality = nullptr;
+    juce::AudioParameterChoice* effects = nullptr;
     std::atomic<double> hostRate{44100};
     std::array<std::atomic<int>,channels> selected{},commands{};
     std::atomic<bool> panic{false};
@@ -174,22 +219,33 @@ private:
             juce::String error;
             if(r.path.isNotEmpty()) {
                 if(!juce::File(r.path).existsAsFile()) error="SoundFont not found: "+r.path;
-                else {
+                else if(juce::File(r.path).hasFileExtension("sfz")) {
+                    fresh=std::make_unique<Engine>(); fresh->rate=r.rate;
+                    fresh->sfz=sfizz_create_synth();
+                    if(fresh->sfz) {
+                        sfizz_set_sample_rate(fresh->sfz,static_cast<float>(r.rate));
+                        sfizz_set_samples_per_block(fresh->sfz,1024);
+                        sfizz_set_num_voices(fresh->sfz,128);
+                    }
+                    if(!fresh->sfz || !sfizz_load_file(fresh->sfz,r.path.toRawUTF8())) error="Unable to load SFZ: "+r.path;
+                } else {
                     fresh=std::make_unique<Engine>(); fresh->rate=r.rate;
                     fresh->settings=new_fluid_settings();
                     if(fresh->settings) {
                         fluid_settings_setnum(fresh->settings,"synth.sample-rate",r.rate);
                         fluid_settings_setint(fresh->settings,"synth.midi-channels",16);
                         fluid_settings_setint(fresh->settings,"synth.polyphony",256);
-                        fluid_settings_setint(fresh->settings,"synth.reverb.active",1);
-                        fluid_settings_setint(fresh->settings,"synth.chorus.active",1);
+                        fluid_settings_setint(fresh->settings,"synth.reverb.active",0);
+                        fluid_settings_setint(fresh->settings,"synth.chorus.active",0);
                         fluid_settings_setstr(fresh->settings,"synth.midi-bank-select","gs");
+                        fluid_settings_setint(fresh->settings,"synth.threadsafe-api",0);
+                        fluid_settings_setint(fresh->settings,"synth.cpu-cores",1);
                         fresh->synth=new_fluid_synth(fresh->settings);
                     }
                     if(fresh->synth) fresh->font=fluid_synth_sfload(fresh->synth,r.path.toRawUTF8(),1);
                     if(fresh->font<0) error="Unable to load SoundFont: "+r.path;
                     else {
-                        fluid_synth_set_interp_method(fresh->synth,-1,FLUID_INTERP_7THORDER);
+                        fluid_synth_set_interp_method(fresh->synth,-1,FLUID_INTERP_4THORDER);
                         if(auto* sf=fluid_synth_get_sfont_by_id(fresh->synth,fresh->font)) {
                             fluid_sfont_iteration_start(sf);
                             while(auto* p=fluid_sfont_iteration_next(sf)) {
@@ -210,12 +266,12 @@ private:
               { std::lock_guard<std::mutex> audio(engineMutex);
                 retired=std::move(engine);
                 if(error.isEmpty()) engine=std::move(fresh);
-                for(int i=0;i<channels;++i) { commands[i].store(-1); selected[i].store(r.programs[i]); if(engine) updateProgram(engine->synth,i); }
+                for(int i=0;i<channels;++i) { commands[i].store(-1); selected[i].store(r.programs[i]); if(engine && engine->synth) updateProgram(engine->synth,i); }
               }
               loadingSerial=0; failedSerial=error.isNotEmpty()?r.serial:~uint64_t(0);
               { std::lock_guard<std::mutex> ui(viewMutex);
-                view.path=r.path; view.presets=error.isEmpty()?std::move(presets):std::vector<Preset>{}; view.loading=false;
-                view.status=error.isNotEmpty()?error:r.path.isEmpty()?"No SoundFont loaded":"Loaded: "+juce::File(r.path).getFileName()+"; "+juce::String(static_cast<int>(view.presets.size()))+" presets";
+                view.isSfz=error.isEmpty() && juce::File(r.path).hasFileExtension("sfz"); view.path=r.path; view.presets=error.isEmpty()?std::move(presets):std::vector<Preset>{}; view.loading=false;
+                view.status=error.isNotEmpty()?error:r.path.isEmpty()?"No SoundFont loaded":"Loaded: "+juce::File(r.path).getFileName()+"; "+(view.isSfz?juce::String("SFZ, MIDI channel 1"):juce::String(static_cast<int>(view.presets.size()))+" presets");
                 ++view.revision;
               }
             }
@@ -229,9 +285,9 @@ class Editor final : public juce::AudioProcessorEditor, private juce::Timer {
 public:
     explicit Editor(Processor& p) : AudioProcessorEditor(p), proc(p) {
         setWantsKeyboardFocus(true);
-        title.setText("LSoundFont 0.0.1 TEST1",juce::dontSendNotification); title.setFont(juce::FontOptions(21.0f)); addAndMakeVisible(title);
+        title.setText("LSFX 0.0.1 TEST2",juce::dontSendNotification); title.setFont(juce::FontOptions(21.0f)); addAndMakeVisible(title);
         status.setText("No SoundFont loaded",juce::dontSendNotification); status.setTitle("SoundFont status"); addAndMakeVisible(status);
-        setup(open,"Open SoundFont",1); setup(channel,"MIDI channel",2); setup(bank,"Bank",3); setup(program,"Program",4); setup(level,"Output gain",5); setup(stop,"Panic - all sounds off",6); setup(readStatus,"Read status",7);
+        setup(open,"Open SF2 or SFZ",1); setup(channel,"MIDI channel",2); setup(bank,"Bank",3); setup(program,"Program",4); setup(level,"Output gain",5); setup(stop,"Panic - all sounds off",6); setup(readStatus,"Read status",7);
         channelLabel.setText("MIDI channel",juce::dontSendNotification); bankLabel.setText("Bank",juce::dontSendNotification); programLabel.setText("Program",juce::dontSendNotification); levelLabel.setText("Output gain (dB)",juce::dontSendNotification);
         for(auto* l:{&channelLabel,&bankLabel,&programLabel,&levelLabel}) addAndMakeVisible(*l);
         for(int i=1;i<=16;++i) channel.addItem("Channel "+juce::String(i),i);
@@ -241,7 +297,7 @@ public:
         program.onChange=[this]{ if(!updating) apply(); };
         open.onClick=[this]{ browse(); };
         stop.onClick=[this]{proc.allOff();};
-        readStatus.onClick=[this]{ juce::AlertWindow::showMessageBoxAsync(juce::MessageBoxIconType::InfoIcon,"LSoundFont status",proc.getView().status); };
+        readStatus.onClick=[this]{ juce::AlertWindow::showMessageBoxAsync(juce::MessageBoxIconType::InfoIcon,"LSFX status",proc.getView().status); };
         level.setSliderStyle(juce::Slider::LinearHorizontal); level.setTextBoxStyle(juce::Slider::TextBoxRight,false,90,25); level.setRange(-60.0,6.0,0.1); level.setValue(proc.gainParameter().get(),juce::dontSendNotification);
         level.onDragStart=[this]{proc.gainParameter().beginChangeGesture(); dragging=true;};
         level.onDragEnd=[this]{dragging=false;proc.gainParameter().endChangeGesture();};
@@ -258,7 +314,7 @@ public:
 private:
     Processor& proc;
     juce::Label title,status,channelLabel,bankLabel,programLabel,levelLabel;
-    juce::TextButton open{"Open SoundFont..."},stop{"Panic - all sounds off"},readStatus{"Read status"};
+    juce::TextButton open{"Open SF2 or SFZ..."},stop{"Panic - all sounds off"},readStatus{"Read status"};
     juce::ComboBox channel,bank,program;
     juce::Slider level;
     std::unique_ptr<juce::FileChooser> chooser;
@@ -270,7 +326,7 @@ private:
     void browse() {
         if(chooser) return;
         auto start=cached.path.isNotEmpty()?juce::File(cached.path).getParentDirectory():juce::File::getSpecialLocation(juce::File::userDocumentsDirectory);
-        chooser=std::make_unique<juce::FileChooser>("Open SoundFont",start,"*.sf2;*.sf3",true);
+        chooser=std::make_unique<juce::FileChooser>("Open SF2 or SFZ",start,"*.sf2;*.sfz",true);
         juce::Component::SafePointer<Editor> safe(this);
         chooser->launchAsync(juce::FileBrowserComponent::openMode|juce::FileBrowserComponent::canSelectFiles,[safe](const juce::FileChooser& fc) {
             if(auto* self=safe.getComponent()) { auto file=fc.getResult(); if(file!=juce::File{}) self->proc.loadFile(file); juce::MessageManager::callAsync([safe]{if(auto* e=safe.getComponent()) e->chooser.reset();}); }
@@ -288,8 +344,8 @@ private:
         }
     }
     void refresh(bool force) {
-        auto v=proc.getView();
-        const bool changed=v.revision!=revision;
+        const bool changed=proc.getRevision()!=revision;
+        View v; if(changed) v=proc.getView();
         if(changed) {revision=v.revision;cached=std::move(v);status.setText(cached.status,juce::dontSendNotification);status.setDescription(cached.status);}
         const int code=proc.current(juce::jmax(0,channel.getSelectedId()-1));
         if(force||changed||code!=shownCode) {
@@ -303,7 +359,7 @@ private:
             bank.setSelectedId((code>>7)+1,juce::dontSendNotification); rebuildPrograms(code>>7,code&127); shownCode=code;
             updating=false;
         }
-        const bool ready=!cached.loading&&!cached.presets.empty(); bank.setEnabled(ready);program.setEnabled(ready);
+        const bool ready=!cached.loading&&!cached.presets.empty(); bank.setEnabled(ready);program.setEnabled(ready);channel.setEnabled(!cached.isSfz);
         if(!dragging) level.setValue(proc.gainParameter().get(),juce::dontSendNotification);
     }
     void timerCallback() override {refresh(false);}
