@@ -1,0 +1,51 @@
+name: Build LSoundFont VST3 Windows x64
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  windows:
+    runs-on: windows-2022
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install FluidSynth and SF3 decoder
+        shell: pwsh
+        run: |
+          $root = $env:VCPKG_INSTALLATION_ROOT
+          if (-not $root) { throw 'VCPKG_INSTALLATION_ROOT is not set on the runner' }
+          & "$root/vcpkg.exe" install 'fluidsynth[sndfile]:x64-windows-static-md' --classic
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Configure
+        shell: pwsh
+        run: |
+          cmake -S . -B build -G 'Visual Studio 17 2022' -A x64 "-DCMAKE_TOOLCHAIN_FILE=$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake" -DVCPKG_TARGET_TRIPLET=x64-windows-static-md -DVCPKG_MANIFEST_MODE=OFF
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Build VST3
+        run: cmake --build build --config Release --target LSoundFont_VST3 --parallel 2
+      - name: Package TEST1
+        shell: pwsh
+        run: |
+          $bundle = 'build/LSoundFont_artefacts/Release/VST3/LSoundFont.vst3'
+          if (-not (Test-Path $bundle)) { throw "Missing VST3: $bundle" }
+          New-Item -ItemType Directory -Force package,package/ThirdParty | Out-Null
+          Copy-Item -Recurse $bundle package/
+          Copy-Item README.md,THIRD_PARTY.md,TESTING.md package/
+          Copy-Item build/_deps/juce-src/LICENSE.md package/ThirdParty/JUCE-LICENSE.md
+          $root = $env:VCPKG_INSTALLATION_ROOT
+          Get-ChildItem "$root/installed/x64-windows-static-md/share" -Directory | ForEach-Object {
+            $lic = Join-Path $_.FullName 'copyright'
+            if (Test-Path $lic) { Copy-Item $lic "package/ThirdParty/$($_.Name)-copyright.txt" }
+          }
+          & "$root/vcpkg.exe" list | Out-File -Encoding utf8 package/ThirdParty/vcpkg-versions.txt
+          git -C $root rev-parse HEAD | Out-File -Encoding utf8 package/ThirdParty/vcpkg-commit.txt
+          git rev-parse HEAD | Out-File -Encoding utf8 package/source-commit.txt
+          Compress-Archive -Path package/* -DestinationPath LSoundFont.0.0.1.TEST1.Windows.x64.VST3.zip -Force
+      - uses: actions/upload-artifact@v4
+        with:
+          name: LSoundFont-0.0.1-TEST1-Windows-x64
+          path: LSoundFont.0.0.1.TEST1.Windows.x64.VST3.zip
+          if-no-files-found: error
