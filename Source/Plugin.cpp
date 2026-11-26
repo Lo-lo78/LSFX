@@ -766,12 +766,12 @@ public:
     explicit Editor(Processor& p) : AudioProcessorEditor(p), proc(p) {
         setWantsKeyboardFocus(true);
         setFocusContainerType(juce::Component::FocusContainerType::keyboardFocusContainer);
-        title.setText("LSFX 0.0.1 TEST16",juce::dontSendNotification); title.setFont(juce::FontOptions(21.0f)); title.setAccessible(false); addAndMakeVisible(title);
+        title.setText("LSFX 0.0.1 TEST17",juce::dontSendNotification); title.setFont(juce::FontOptions(21.0f)); title.setAccessible(false); addAndMakeVisible(title);
         status.setText("No SoundFont loaded",juce::dontSendNotification); status.setTitle("Instrument status"); addAndMakeVisible(status);
         setup(open,"Open SF2 or SFZ",1); setup(parameters,"Parameters",2); setup(channel,"MIDI channel",3); setup(bank,"Bank",21); setup(program,"Program",22); setup(level,"Output gain",20);
         setup(grid,"Parameter grid",1); setup(value,"Parameter value",2); setup(closeGrid,"Close parameters",3);
         open.setDescription("Alt+O"); parameters.setDescription("Alt+L"); channel.setDescription("Alt+M"); bank.setDescription("Alt+B"); program.setDescription("Alt+P"); level.setDescription("Alt+G");
-        grid.setDescription("Alt+L. Enter or Tab edits the selected parameter. Escape closes parameters.");
+        grid.setDescription("Alt+L. Home/End: column boundaries. Ctrl+Home/End: grid boundaries. Enter or Tab edits the selected parameter. Escape closes parameters.");
         channelLabel.setText("MIDI channel",juce::dontSendNotification); bankLabel.setText("Bank",juce::dontSendNotification); programLabel.setText("Program",juce::dontSendNotification); levelLabel.setText("Output gain (dB)",juce::dontSendNotification);
         gridTitle.setText("Parameters",juce::dontSendNotification); hint.setText("Arrows: grid or value. Type to search. Enter: edit / browse. Esc: close.",juce::dontSendNotification);
         for(auto* l:{&channelLabel,&bankLabel,&programLabel,&levelLabel,&gridTitle,&hint}) addAndMakeVisible(*l);
@@ -791,7 +791,7 @@ public:
         for(int ch=0;ch<channels;++ch) {
             auto& c=channelLevels[ch];
             setup(c,"Output gain channel "+juce::String(ch+1),4+ch);
-            c.setDescription("Left/right selects channel; up/down changes level. SF2 uses a voice attenuation offset; SFZ uses audio gain. Alt+left/right changes step.");
+            c.setDescription("Left/right selects channel; up/down changes level. Tab leaves the output strip. SF2 uses a voice attenuation offset; SFZ uses audio gain. Alt+left/right changes step.");
             c.setSliderStyle(juce::Slider::LinearVertical); c.setTextBoxStyle(juce::Slider::NoTextBox,true,0,0);
             c.setRange(channelGainMin,channelGainMax,0.1); c.textFromValueFunction=[](double v){return juce::String(v,1)+" dB";};
             c.setValue(proc.channelGainParameter(ch).get(),juce::dontSendNotification);
@@ -1103,7 +1103,7 @@ private:
         levelReadout.setText(juce::String(level.getValue(),1)+" dB",juce::dontSendNotification);
         speak(level,levelReadout.getText());
     }
-    void navigateGrid(int code) {
+    void navigateGrid(int code,bool wholeGrid=false) {
         if(rows.empty()) return;
         const int i=juce::jmax(0,grid.getSelectedItemIndex()), count=static_cast<int>(rows.size());
         const int row=i%gridRowsPerColumn, first=i-row, last=juce::jmin(first+gridRowsPerColumn-1,count-1);
@@ -1114,8 +1114,8 @@ private:
         else if(code==juce::KeyPress::rightKey&&i+gridRowsPerColumn<count) target=i+gridRowsPerColumn;
         else if(code==juce::KeyPress::pageUpKey) target=juce::jmax(first,i-5);
         else if(code==juce::KeyPress::pageDownKey) target=juce::jmin(last,i+5);
-        else if(code==juce::KeyPress::homeKey) target=0;
-        else if(code==juce::KeyPress::endKey) target=count-1;
+        else if(code==juce::KeyPress::homeKey) target=wholeGrid?0:first;
+        else if(code==juce::KeyPress::endKey) target=wholeGrid?count-1:last;
         if(target!=i) selectGridRow(target,true);
     }
     bool handleKey(const juce::KeyPress& k,juce::Component* origin) {
@@ -1133,7 +1133,22 @@ private:
         if(outputCh>=0) lastGainChannel=outputCh;
         // Leave the host and the native combo popup in control of their own keys.
         if(chooser||grid.isPopupActive()||bank.isPopupActive()||program.isPopupActive()||channel.isPopupActive()) return false;
-        if(alt&&!ctrl&&!mods.isShiftDown()) {
+        // The channel gain strip is one logical Tab stop, even though each
+        // fader remains a native accessible control for arrows and mouse.
+        if(!gridOpen&&!alt&&!ctrl&&code==juce::KeyPress::tabKey) {
+            const bool backwards=mods.isShiftDown();
+            auto& remembered=channelLevels[cached.isSfz?0:lastGainChannel];
+            if(outputCh>=0) {
+                if(backwards) focus(channel.isEnabled()?static_cast<juce::Component&>(channel):static_cast<juce::Component&>(parameters));
+                else focus(level);
+                return true;
+            }
+            if((!backwards&&(origin==&channel||(origin==&parameters&&!channel.isEnabled())))||(backwards&&origin==&level)) {
+                focus(remembered);
+                return true;
+            }
+        }
+
             search.reset();
             if(gridOpen&&(origin==&grid||origin==&value)) {
                 if(horizontal) {changeStep(*origin,direction);return true;}
@@ -1158,7 +1173,7 @@ private:
         }
         if(gridOpen&&!alt&&!ctrl&&code==juce::KeyPress::escapeKey) {closeParameters();return true;}
         if(alt||ctrl) {
-            if(!alt&&ctrl&&gridOpen&&origin==&grid&&boundary) {search.reset();navigateGrid(code);return true;}
+            if(!alt&&ctrl&&gridOpen&&origin==&grid&&boundary) {search.reset();navigateGrid(code,true);return true;}
             return false;
         }
         if(gridOpen&&(origin==&grid||origin==&value)) {
