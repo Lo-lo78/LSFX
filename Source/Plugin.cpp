@@ -12,11 +12,15 @@
 #include <algorithm>
 #include <cmath>
 #include <condition_variable>
+#include <chrono>
+#include <optional>
 #include <memory>
 #include <mutex>
 #include <thread>
 #include <vector>
 #include <functional>
+#include <map>
+#include "VirtualProgramMap.h"
 #if JUCE_WINDOWS
  #include <Windows.h>
  #include <UIAutomation.h>
@@ -88,11 +92,152 @@ Controls emptyControls() { Controls c; c.fill(unset); return c; }
 int controlIndex(int ch,int id) { return ch*slots+id; }
 const ControlSpec* sf2Spec(int id) { for(const auto& c:sf2Controls) if(c.id==id) return &c; return nullptr; }
 struct CCLabel { int cc; juce::String name; int initial=unset; };
-struct Preset { int bank, program; juce::String name; };
+struct Preset { int bank, program; juce::String name; juce::String path; int sourceBank=0, sourceProgram=0, font=-1, sfzIndex=-1; };
+struct MapEdit { int bank=0, program=-1, sourceBank=0, sourceProgram=0; juce::String path; };
+using MapEdits=std::vector<MapEdit>;
+const Preset* findPreset(const std::vector<Preset>& list,int code) {
+    const auto it=std::lower_bound(list.begin(),list.end(),code,[](const Preset& a,int key){return pack(a.bank,a.program)<key;});
+    return it!=list.end()&&pack(it->bank,it->program)==code?&*it:nullptr;
+}
+std::vector<Preset> catalogSF2(fluid_synth_t* synth,int font,const juce::String& path) {
+    std::vector<Preset> result;
+    if(auto* sf=fluid_synth_get_sfont_by_id(synth,font)) {
+        fluid_sfont_iteration_start(sf);
+        while(auto* p=fluid_sfont_iteration_next(sf)) {
+            const int bank=fluid_preset_get_banknum(p), program=fluid_preset_get_num(p);
+            if(lsfx::validAddress(bank,program)) result.push_back({bank,program,juce::String::fromUTF8(fluid_preset_get_name(p)),path,bank,program,font});
+        }
+    }
+    std::sort(result.begin(),result.end(),[](const Preset& a,const Preset& b){return pack(a.bank,a.program)<pack(b.bank,b.program);});
+    return result;
+}
+juce::String sourceName(const juce::String& path) {
+    const juce::File f(path);
+    return (f.hasFileExtension("sfz")?juce::String("SFZ "):juce::String("SF2 "))+f.getFileNameWithoutExtension();
+}
+struct CatalogResult { std::vector<Preset> presets; juce::String error; };
+CatalogResult inspectSF2(const juce::File& file) {
+    CatalogResult result;
+    if(!file.existsAsFile()) {result.error="SoundFont not found: "+file.getFullPathName();return result;}
+    std::unique_ptr<fluid_settings_t,decltype(&delete_fluid_settings)> settings(new_fluid_settings(),delete_fluid_settings);
+    if(!settings) {result.error="Unable to create FluidSynth settings";return result;}
+    fluid_settings_setint(settings.get(),"synth.midi-channels",16);
+    fluid_settings_setint(settings.get(),"synth.threadsafe-api",0);
+    fluid_settings_setint(settings.get(),"synth.cpu-cores",1);
+    fluid_settings_setint(settings.get(),"synth.audio-channels",1);
+    fluid_settings_setint(settings.get(),"synth.audio-groups",1);
+    fluid_settings_setint(settings.get(),"synth.effects-groups",1);
+    fluid_settings_setint(settings.get(),"synth.reverb.active",0);
+    fluid_settings_setint(settings.get(),"synth.chorus.active",0);
+    std::unique_ptr<fluid_synth_t,decltype(&delete_fluid_synth)> synth(new_fluid_synth(settings.get()),delete_fluid_synth);
+    if(!synth) {result.error="Unable to create FluidSynth";return result;}
+    const int font=fluid_synth_sfload(synth.get(),file.getFullPathName().toRawUTF8(),0);
+    if(font<0) {result.error="Unable to load SoundFont: "+file.getFullPathName();return result;}
+    result.presets=catalogSF2(synth.get(),font,file.getFullPathName());
+    if(result.presets.empty()) result.error="No presets found: "+file.getFileName();
+    return result;
+}
+struct SfzSlot {
+    sfizz_synth_t* synth=nullptr;
+    int owner=-1, defaultQuality=0, appliedQuality=-1;
+    bool used=false;
+    ~SfzSlot() { if(synth) sfizz_free(synth); }
+    void stop() {
+        sfizz_send_cc(synth,0,64,0); sfizz_send_cc(synth,0,123,0);
+        for(int key=0;key<128;++key) sfizz_send_note_off(synth,0,key,0);
+        sfizz_send_cc(synth,0,120,0);
+    }
+};
+struct SfzSource {
+    juce::String path;
+    std::vector<CCLabel> labels;
+    std::array<int,120> initialCC{};
+    std::array<std::unique_ptr<SfzSlot>,channels> pool;
+};
+std::unique_ptr<SfzSlot> createSfz(const juce::String& path,double rate,std::vector<CCLabel>* labels=nullptr,std::array<int,120>* initialCC=nullptr) {
+    auto slot=std::make_unique<SfzSlot>();
+    slot->synth=sfizz_create_synth();
+    if(!slot->synth) return {};
+    auto* z=slot->synth;
+    sfizz_set_sample_rate(z,static_cast<float>(rate));
+    sfizz_set_samples_per_block(z,renderChunk);
+    sfizz_set_num_voices(z,128);
+    if(!sfizz_load_file(z,path.toRawUTF8())) return {};
+    slot->defaultQuality=sfizz_get_sample_quality(z,SFIZZ_PROCESS_LIVE);
+    if(labels) {
+        if(initialCC) initialCC->fill(unset);
+        const auto n=sfizz_get_num_cc_labels(z);
+        for(unsigned i=0;i<n;++i) {
+            const int cc=sfizz_get_cc_label_number(z,static_cast<int>(i));
+            if(cc<=0||cc==32||cc>=120) continue;
+            const char* text=sfizz_get_cc_label_text(z,static_cast<int>(i));
+            if(text&&*text) labels->push_back({cc,juce::String::fromUTF8(text)});
+        }
+        std::sort(labels->begin(),labels->end(),[](const CCLabel& a,const CCLabel& b){return a.cc<b.cc;});
+        labels->erase(std::unique(labels->begin(),labels->end(),[](const CCLabel& a,const CCLabel& b){return a.cc==b.cc;}),labels->end());
+        int reply=unset;
+        if(auto* client=sfizz_create_client(&reply)) {
+            sfizz_set_receive_callback(client,[](void* data,int,const char*,const char* sig,const sfizz_arg_t* args){
+                if(sig&&sig[0]=='f'&&args&&std::isfinite(args[0].f))
+                    *static_cast<int*>(data)=juce::jlimit(0,127,juce::roundToInt(args[0].f*127.0f));
+            });
+            if(initialCC) for(int cc=1;cc<120;++cc) if(cc!=32) {
+                reply=unset;
+                const auto address="/cc"+juce::String(cc)+"/value";
+                sfizz_send_message(z,client,0,address.toRawUTF8(),"",nullptr);
+                (*initialCC)[cc]=reply;
+            }
+            for(auto& cc:*labels) {
+                if(initialCC) cc.initial=(*initialCC)[cc.cc];
+                else {
+                    reply=unset;
+                    const auto address="/cc"+juce::String(cc.cc)+"/value";
+                    sfizz_send_message(z,client,0,address.toRawUTF8(),"",nullptr);
+                    cc.initial=reply;
+                }
+            }
+            sfizz_delete_client(client);
+        }
+    }
+    return slot;
+}
 struct Engine {
     fluid_settings_t* settings = nullptr;
     fluid_synth_t* synth = nullptr;
-    sfizz_synth_t* sfz = nullptr;
+    std::vector<SfzSource> sfzSources;
+    std::array<SfzSlot*,channels> sfzActive{};
+    std::array<int,channels> sfzAddress{};
+    Controls sfzCC=emptyControls();
+    uint64_t serial=0;
+    bool hasSF2=false;
+    bool hasSFZ() const { return !sfzSources.empty(); }
+    lsfx::StereoDelay sfzModulation;
+    std::array<float,renderChunk> sfzL{},sfzR{},sfzMainL{},sfzMainR{};
+    void releaseSfz(int ch) {
+        if(auto* slot=sfzActive[ch]) { slot->stop(); slot->owner=-1; sfzActive[ch]=nullptr; }
+        sfzAddress[ch]=-1;
+    }
+    bool activateSfz(int ch,int code,const Preset* p) {
+        if(sfzActive[ch]&&sfzAddress[ch]==code) return true;
+        releaseSfz(ch);
+        if(!p||p->sfzIndex<0) return true;
+        auto& source=sfzSources[static_cast<size_t>(p->sfzIndex)];
+        for(auto& candidate:source.pool) if(candidate&&candidate->owner<0) {
+            auto& slot=*candidate; slot.owner=ch;
+            sfzActive[ch]=&slot; sfzAddress[ch]=code;
+            if(slot.used) {
+                // Restore instrument defaults when reusing an instance on another channel.
+                sfizz_send_cc(slot.synth,0,121,0);
+                sfizz_send_hd_pitch_wheel(slot.synth,0,0.0f);
+                for(int cc=1;cc<120;++cc) if(cc!=32&&source.initialCC[cc]!=unset)
+                    sfizz_send_cc(slot.synth,0,cc,source.initialCC[cc]);
+            }
+            slot.used=true;
+            for(int cc=1;cc<120;++cc) if(cc!=32&&sfzCC[controlIndex(ch,cc)]!=unset) sfizz_send_cc(slot.synth,0,cc,sfzCC[controlIndex(ch,cc)]);
+            return true;
+        }
+        return false;
+    }
     int quality = -1, effects = -1;
     int quietSamples = 0;
     int midiDisabledFx=0;
@@ -117,18 +262,18 @@ struct Engine {
     int ambienceApplied=0;
     lsfx::StereoDelay reverbDelay, modulation, delay;
     juce::Reverb sfzReverb;
-    void prepareFX() { lastFx.fill(-1); output.prepare(rate); reverbDelay.prepare(rate); modulation.prepare(rate); delay.prepare(rate); sfzReverb.setSampleRate(rate); }
-    void resetFX() { output.reset(); reverbDelay.reset(); modulation.reset(); delay.reset(); sfzReverb.reset(); quietSamples=0; }
+    void prepareFX() { lastFx.fill(-1); output.prepare(rate); reverbDelay.prepare(rate); modulation.prepare(rate); delay.prepare(rate); sfzReverb.setSampleRate(rate); sfzModulation.prepare(rate); sfzAddress.fill(-1); }
+    void resetFX() { output.reset(); reverbDelay.reset(); modulation.reset(); delay.reset(); sfzReverb.reset(); sfzModulation.reset(); quietSamples=0; }
 
-    int sfzDefaultQuality=0, sfzAppliedQuality=-1;
     int font = -1;
+    std::vector<Preset> map;
     double rate = 44100;
-    ~Engine() { if (sfz) sfizz_free(sfz); if (synth) delete_fluid_synth(synth); if (settings) delete_fluid_settings(settings); }
+    ~Engine() { if (synth) delete_fluid_synth(synth); if (settings) delete_fluid_settings(settings); }
 };
 using Programs = std::array<int, channels>;
 Programs defaults() { Programs p{}; p[9] = pack(128, 0); return p; }
-struct Request { juce::String path; double rate = 44100; Programs programs = defaults(); uint64_t serial = 0; Controls controls=emptyControls(); };
-struct View { juce::String path, status = "No SoundFont loaded"; std::vector<Preset> presets; uint64_t revision = 0; bool loading = false; bool isSfz = false; bool ready=false; std::vector<CCLabel> labels; };
+struct Request { juce::String path; double rate = 44100; Programs programs = defaults(); uint64_t serial = 0; Controls controls=emptyControls(); MapEdits edits; int sfzCode=0; };
+struct View { juce::String path, status = "No SoundFont loaded"; std::vector<Preset> presets; uint64_t revision = 0; bool loading = false; bool ready=false; std::map<juce::String,std::vector<CCLabel>> labels; };
 }
 
 class Processor final : public juce::AudioProcessor {
@@ -141,7 +286,7 @@ public:
     }
     Processor() : AudioProcessor(makeBuses()) {
         auto p = defaults();
-        for (int i=0; i<channels; ++i) { selected[i].store(p[i]); commands[i].store(-1); }
+        for (int i=0; i<channels; ++i) { selected[i].store(p[i]); commands[i].store(-1); sfzNeeded[i].store(-1); sfzRetry[i].store(-1); }
         addParameter(gain = new juce::AudioParameterFloat({"gain",1}, "Master output gain", juce::NormalisableRange<float>(-60.0f, 6.0f, 0.1f), 0.0f, juce::AudioParameterFloatAttributes().withLabel("dB")));
         addParameter(quality = new juce::AudioParameterChoice({"quality",1}, "SF2 interpolation", {"Linear", "Fourth order", "Seventh order"}, 1));
         addParameter(effects = new juce::AudioParameterChoice({"effects",1}, "Effects", {"Off", "Reverb", "Chorus", "Both"}, 0));
@@ -195,9 +340,9 @@ public:
     void prepareToPlay(double rate, int) override {
         const auto old = hostRate.exchange(rate);
         if (std::abs(old-rate)>0.01) {
-            juce::String path; Programs p; Controls c;
-            stateForSave(path,p,&c);
-            if (path.isNotEmpty()) load(path,p,c);
+            juce::String path; Programs p; Controls c; MapEdits edits; int sfzCode=0;
+            stateForSave(path,p,&c,&edits,&sfzCode);
+            if (path.isNotEmpty()||!edits.empty()) load(path,p,c,std::move(edits),sfzCode);
         }
     }
     void releaseResources() override { panic.store(true); }
@@ -207,9 +352,46 @@ public:
     int current(int ch) const { const auto cmd=commands[ch].load(); return cmd>=0 ? cmd : selected[ch].load(); }
     void select(int ch,int bank,int prog) { if (ch>=0 && ch<channels && bank>=0 && bank<=16383 && prog>=0 && prog<128) commands[ch].store(pack(bank,prog)); }
     void allOff() { panic.store(true); }
+    // Full instance initialization, not just MIDI panic. Keep user-wide
+    // browser settings and on-disk presets intact. Worker retires the engine.
+    void initializeInstance() {
+        clearing.store(true);
+        panic.store(true);
+        setCurrentPresetFile(juce::File{});
+        setUiChannel(0);
+        load({},defaults(),emptyControls());
+        for(auto* parameter:getParameters()) {
+            if(parameter->getValue()!=parameter->getDefaultValue()) {
+                parameter->beginChangeGesture();
+                parameter->setValueNotifyingHost(parameter->getDefaultValue());
+                parameter->endChangeGesture();
+            }
+        }
+    }
     int uiChannel() const { return editorChannel.load(); }
     void setUiChannel(int ch) { editorChannel.store(juce::jlimit(0,channels-1,ch)); }
-    void retryFile() { juce::String path; Programs p; Controls c; stateForSave(path,p,&c); if(path.isNotEmpty()) load(path,p,c); }
+    void retryFile() { juce::String path; Programs p; Controls c; MapEdits edits; int sfzCode=0; stateForSave(path,p,&c,&edits,&sfzCode); if(path.isNotEmpty()||!edits.empty()) load(path,p,c,std::move(edits),sfzCode); }
+    juce::Result importSF2(const juce::File& file,int destBank,int destProgram,int sourceBank,int sourceProgram,int ch) {
+        if(!lsfx::validAddress(destBank,destProgram<0?0:destProgram)||!lsfx::validAddress(sourceBank,sourceProgram)) return juce::Result::fail("Invalid bank or program");
+        juce::String path; Programs p; Controls c; MapEdits edits; int sfzCode=0;
+        stateForSave(path,p,&c,&edits,&sfzCode);
+        edits.erase(std::remove_if(edits.begin(),edits.end(),[&](const MapEdit& e){return e.bank==destBank&&(destProgram<0||e.program==destProgram);}),edits.end());
+        edits.push_back({destBank,destProgram,sourceBank,sourceProgram,file.getFullPathName()});
+        p[ch]=pack(destBank,destProgram<0?(p[ch]&127):destProgram);
+        if(midiFX->getIndex()==1&&effects->getIndex()==0) effects->setValueNotifyingHost(effects->convertTo0to1(3.0f));
+        load(path,p,c,std::move(edits),sfzCode,true); return juce::Result::ok();
+    }
+    juce::Result importSFZ(const juce::File& file,int code,int ch) {
+        if(!lsfx::validAddress(code>>7,code&127)||ch<0||ch>=channels||!file.hasFileExtension("sfz")||!file.existsAsFile()) return juce::Result::fail("Invalid SFZ assignment");
+        juce::String path; Programs p; Controls c; MapEdits edits; int sfzCode=0;
+        stateForSave(path,p,&c,&edits,&sfzCode);
+        edits.erase(std::remove_if(edits.begin(),edits.end(),[&](const MapEdit& e){return e.bank==(code>>7)&&e.program==(code&127);}),edits.end());
+        edits.push_back({code>>7,code&127,0,0,file.getFullPathName()});
+        // Preserve the single-SFZ opening convention on a completely empty map.
+        // Explicit assignments in a populated map keep their addresses unchanged.
+        if(path.isEmpty()&&edits.size()==1) for(int i=0;i<channels;++i) if(i!=ch&&p[i]==code) p[i]=pack(code>>7,(code+1)&127);
+        p[ch]=code; load(path,p,c,std::move(edits),sfzCode,true); return juce::Result::ok();
+    }
     juce::File currentPresetFile() { std::lock_guard<std::mutex> lock(presetMutex); return currentPreset; }
     void setCurrentPresetFile(const juce::File& f) { std::lock_guard<std::mutex> lock(presetMutex); currentPreset=f; }
     juce::Result savePresetFile(const juce::File& f) {
@@ -232,13 +414,21 @@ public:
             if(!juce::File::isAbsolutePath(path)) return juce::Result::fail("Invalid instrument path: "+path);
             if(!juce::File(path).existsAsFile()) { missing=path; return juce::Result::fail("Instrument file not found"); }
         }
+        for(auto* entry=xml->getFirstChildElement();entry;entry=entry->getNextElement()) if(entry->hasTagName("MapEdit")) {
+            const auto mapped=entry->getStringAttribute("path");
+            if(!juce::File::isAbsolutePath(mapped)) return juce::Result::fail("Invalid instrument path: "+mapped);
+            if(!juce::File(mapped).existsAsFile()) {missing=mapped; return juce::Result::fail("Instrument file not found");}
+        }
         xml->setAttribute("presetFile",f.getRelativePathFrom(presetRoot())); copyXmlToBinary(*xml,state); return juce::Result::ok();
     }
     void loadFile(const juce::File& f) {
         setCurrentPresetFile(juce::File{});
+        if(f.hasFileExtension("sfz")) setUiChannel(0);
         if(f.hasFileExtension("sf2;sf3") && midiFX->getIndex()==1 && effects->getIndex()==0)
             effects->setValueNotifyingHost(effects->convertTo0to1(3.0f));
-        load(f.getFullPathName(), defaults());
+        auto p=defaults();
+        if(f.hasFileExtension("sfz")) for(int ch=1;ch<channels;++ch) if(p[ch]==0) p[ch]=pack(0,1);
+        load(f.getFullPathName(), p);
     }
     juce::AudioParameterFloat& gainParameter() { return *gain; }
     juce::AudioParameterFloat& channelGainParameter(int ch) { return *channelGain[static_cast<size_t>(ch)]; }
@@ -258,7 +448,7 @@ public:
         if(id<128) { if(id==0||id==32||id>=120) return; value=juce::jlimit(0,127,value); }
         else if(auto* spec=sf2Spec(id)) value=juce::jlimit(spec->lo,spec->hi,value); else return;
         std::lock_guard<std::mutex> lock(requestMutex);
-        if(pending||loadingSerial!=0||failedSerial==latest.serial||latest.path.isEmpty()) return;
+        if(pending||loadingSerial!=0||failedSerial==latest.serial||(latest.path.isEmpty()&&latest.edits.empty())) return;
         const int i=controlIndex(ch,id); overrides[i]=value;
         controlCommands[i].store(value); controlDirty.store(true);
     }
@@ -269,11 +459,11 @@ public:
         // No waiting for disk I/O or for the worker on the audio thread.
         std::unique_lock<std::mutex> lock(engineMutex, std::try_to_lock);
         if (!lock.owns_lock()) { ++droppedBlocks; for(const auto m:midi) if(m.numBytes>0&&m.data[0]<0xf8) { panic.store(true); break; } midi.clear(); return; }
-        if (!engine || std::abs(engine->rate-hostRate.load())>0.01 || b.getNumChannels()<2) { activeVoices.store(0); sleeping.store(false); midi.clear(); return; }
-        if(engine->sfz) engine->channelGains[0].setTargetValue(juce::Decibels::decibelsToGain(channelGain[0]->get(),channelGainMin-1.0f));
+        if (clearing.load() || !engine || std::abs(engine->rate-hostRate.load())>0.01 || b.getNumChannels()<2) { activeVoices.store(0); sleeping.store(false); midi.clear(); return; }
+        for(int ch=0;ch<channels;++ch) engine->channelGains[ch].setTargetValue(juce::Decibels::decibelsToGain(channelGain[ch]->get(),channelGainMin-1.0f));
         bool routingChanged=false;
         for(int ch=0;ch<channels;++ch) {
-            const int next=(engine->sfz||sf2MultiOutput)?channelRoute[ch]->getIndex():0;
+            const int next=(engine->sfzActive[ch]||sf2MultiOutput)?channelRoute[ch]->getIndex():0;
             routingChanged=routingChanged||engine->routes[ch]!=next;
             engine->routes[ch]=next;
         }
@@ -288,71 +478,29 @@ public:
         const int followMode=midiFX->getIndex();
         if(engine->lastMidiFxMode!=followMode) {engine->midiDisabledFx=0; engine->lastMidiFxMode=followMode;}
         const bool settingsChanged=configureFX(*engine,f,fx);
-        if (engine->sfz) {
-            if(routingChanged) engine->resetFX();
-            auto* z=engine->sfz;
-            const int sq=sfzQuality->getIndex();
-            if(sq!=engine->sfzAppliedQuality) {
-                if(sq!=0 || engine->sfzAppliedQuality!=-1) sfizz_set_sample_quality(z,SFIZZ_PROCESS_LIVE,sq==0?engine->sfzDefaultQuality:sq-1);
-                engine->sfzAppliedQuality=sq;
-            }
-            applyControls(*engine);
-            const bool p=panic.exchange(false);
-            if(p) { engine->resetFX(); controlValues[controlIndex(0,64)].store(0); sfizz_send_cc(z,0,64,0); sfizz_send_cc(z,0,120,0); sfizz_send_cc(z,0,123,0); for(int key=0;key<128;++key) sfizz_send_note_off(z,0,key,0); }
-            // Fixed-size chunks guarantee the configured maximum block size.
-            auto it=midi.begin(); const auto end=midi.end();
-            for(int start=0;start<b.getNumSamples();) {
-                const int count=juce::jmin(1024,b.getNumSamples()-start);
-                while(it!=end) {
-                    const auto m=*it;
-                    if(m.samplePosition>=start+count) break;
-                    ++it;
-                    if(m.numBytes<2 || (m.data[0]&15)!=0) continue;
-                    const int st=m.data[0]&240, a=m.data[1]&127, v=m.numBytes>=3?m.data[2]&127:0;
-                    const int t=juce::jlimit(0,count-1,m.samplePosition-start);
-                    if(st==0x90 && m.numBytes>=3 && v) sfizz_send_note_on(z,t,a,v);
-                    else if((st==0x80 || st==0x90) && m.numBytes>=3) sfizz_send_note_off(z,t,a,v);
-                    else if(st==0xb0 && m.numBytes>=3) { sfizz_send_cc(z,t,a,v); if(a<120) controlValues[controlIndex(0,a)].store(v); }
-                    else if(st==0xe0 && m.numBytes>=3) sfizz_send_hd_pitch_wheel(z,t,((a|(v<<7))-8192)/8192.0f);
-                    else if(st==0xc0) { receiveProgram(0,a); sfizz_send_program_change(z,t,a); }
-                }
-                float* out[]={b.getWritePointer(0,start),b.getWritePointer(1,start)};
-                sfizz_render_block(z,out,2,count);
-                auto& g=engine->channelGains[0];
-                if(g.isSmoothing()) { for(int i=0;i<count;++i) {const float v=g.getNextValue();out[0][i]*=v;out[1][i]*=v;} }
-                else if(g.getCurrentValue()!=1.0f) {b.applyGain(0,start,count,g.getCurrentValue());b.applyGain(1,start,count,g.getCurrentValue());}
-                start+=count;
-            }
-            activeVoices.store(sfizz_get_num_active_voices(z)); sleeping.store(false);
-            const int route=engine->routes[0];
-            if(route==0) processMaster(*engine,b,f,fx);
-            else {
-                if(dest[route]>=0) { b.copyFrom(dest[route],0,b,0,0,b.getNumSamples()); b.copyFrom(dest[route]+1,0,b,1,0,b.getNumSamples()); }
-                b.clear(0,0,b.getNumSamples()); b.clear(1,0,b.getNumSamples());
-            }
-            midi.clear(); return;
-        }
         auto* s = engine->synth;
         const int q=quality->getIndex();
         bool controlChanged = q!=engine->quality || settingsChanged || routingChanged;
         if(applyControls(*engine)) controlChanged=true;
-        if(updateSF2Trims(*engine)) controlChanged=true;
-        if(applyInitialAmbience(*engine,f[sf2Ambience])) controlChanged=true;
+        if(engine->hasSF2&&updateSF2Trims(*engine)) controlChanged=true;
+        if(engine->hasSF2&&applyInitialAmbience(*engine,f[sf2Ambience])) controlChanged=true;
         if(q!=engine->quality) { const int methods[]={FLUID_INTERP_LINEAR,FLUID_INTERP_4THORDER,FLUID_INTERP_7THORDER}; fluid_synth_set_interp_method(s,-1,methods[q]); engine->quality=q; }
-        if (panic.exchange(false)) { controlChanged=true; engine->resetFX(); for (int ch=0;ch<channels;++ch) { fluid_synth_cc(s,ch,64,0); fluid_synth_cc(s,ch,66,0); controlValues[controlIndex(ch,64)].store(0); controlValues[controlIndex(ch,66)].store(0); fluid_synth_all_sounds_off(s,ch); } }
+        if (panic.exchange(false)) { controlChanged=true; engine->resetFX(); for (int ch=0;ch<channels;++ch) { if(auto* z=engine->sfzActive[ch]) z->stop(); engine->sfzCC[controlIndex(ch,64)]=0; fluid_synth_cc(s,ch,64,0); fluid_synth_cc(s,ch,66,0); controlValues[controlIndex(ch,64)].store(0); controlValues[controlIndex(ch,66)].store(0); fluid_synth_all_sounds_off(s,ch); } }
         for (int ch=0; ch<channels; ++ch) {
             const int cmd = commands[ch].exchange(-1);
-            if (cmd>=0) { controlChanged=true; if(fluid_synth_program_select(s,ch,engine->font,cmd>>7,cmd&127)==FLUID_OK) selected[ch].store(cmd); }
+            if (cmd>=0) { controlChanged=true; selectLive(*engine,ch,cmd); }
+            const int retry=sfzRetry[ch].exchange(-1);
+            if(retry>=0&&retry==selected[ch].load()&&!engine->sfzActive[ch]) { controlChanged=true; selectLive(*engine,ch,retry); }
         }
         // A manual program change must also retain the user trim.
-        if(controlChanged) updateSF2Trims(*engine);
+        if(controlChanged&&engine->hasSF2) updateSF2Trims(*engine);
         if constexpr (sf2MultiOutput) { if(updateRouteSends(*engine)) controlChanged=true; }
         // MIDI clock / sensing do not need to wake the synthesizer.
         bool relevantMidi=false;
         for(const auto m:midi) if(m.numBytes>0&&m.data[0]<0xf8) { relevantMidi=true; break; }
         const int before=fluid_synth_get_active_voice_count(s);
         const int sleepAfter=int(engine->rate*2.0);
-        if(!controlChanged&&!relevantMidi&&before==0&&engine->quietSamples>=sleepAfter) { activeVoices.store(0); sleeping.store(true); midi.clear(); return; }
+        if(!engine->hasSFZ()&&!controlChanged&&!relevantMidi&&before==0&&engine->quietSamples>=sleepAfter) { activeVoices.store(0); sleeping.store(true); midi.clear(); return; }
         sleeping.store(false);
         if(controlChanged||relevantMidi||before>0) engine->quietSamples=0;
         // FluidSynth renders each section preceding the corresponding MIDI event.
@@ -364,10 +512,12 @@ public:
                 // TEST14: use the original TEST11 single-stereo render path.
                 // All sixteen MIDI channels and the native FX are mixed by FluidSynth.
                 // Optional channel trim is applied to voice attenuation before mixing.
-                if(fluid_synth_write_float(s,count,b.getWritePointer(0,start),0,1,b.getWritePointer(1,start),0,1)!=FLUID_OK) {
+                if(engine->hasSF2&&fluid_synth_write_float(s,count,b.getWritePointer(0,start),0,1,b.getWritePointer(1,start),0,1)!=FLUID_OK) {
                     b.clear(0,start,count); b.clear(1,start,count);
                     return;
                 }
+                if(!engine->hasSF2) {b.clear(0,start,count); b.clear(1,start,count);}
+                if(engine->hasSFZ()) renderSfz(*engine,b,dest,f,fx,start,count);
                 rawPeak=juce::jmax(rawPeak,juce::jmax(b.getMagnitude(0,start,count),b.getMagnitude(1,start,count)));
                 wetPeak=juce::jmax(wetPeak,processMaster(*engine,b,f,fx,start,count));
             } else {
@@ -406,7 +556,12 @@ public:
                 ++sysexCount;
                 int len=n-1; if(d[n-1]==0xf7) --len;
                 if(len>0) fluid_synth_sysex(s,reinterpret_cast<const char*>(d+1),len,nullptr,nullptr,nullptr,0);
-                for(int c=0;c<channels;++c) { updateProgram(s,c); refreshFluidControls(s,c); }
+                bool resetMap=false;
+                lsfx::decodeMidiEffects(d,n,[&](lsfx::MidiFx k,int,int,int){if(k==lsfx::MidiFx::reset) resetMap=true;});
+                for(int c=0;c<channels;++c) {
+                    if(resetMap) {const int code=defaults()[c];selectLive(*engine,c,code);}
+                    if(!engine->sfzActive[c]) refreshFluidControls(s,c);
+                }
                 applyMidiSysEx(*engine,d,n,f,fx);
                 updateSF2Trims(*engine);
                 if constexpr (sf2MultiOutput) updateRouteSends(*engine);
@@ -414,13 +569,20 @@ public:
                 const int a=d[1]&127, v=n>=3 ? d[2]&127 : 0;
                 if constexpr (sf2MultiOutput) { if((status&0xf0)==0x90) updateRouteSend(*engine,ch); }
                 switch(status&0xf0) {
-                    case 0x80: if(n>=3) fluid_synth_noteoff(s,ch,a); break;
-                    case 0x90: if(n>=3) { if(v) fluid_synth_noteon(s,ch,a,v); else fluid_synth_noteoff(s,ch,a); } break;
-                    case 0xa0: if(n>=3) fluid_synth_key_pressure(s,ch,a,v); break;
-                    case 0xb0: if(n>=3) { receiveFluidCC(*engine,ch,a,v,f,fx); if(a==121||a==6||a==38||a==96||a==97) { refreshFluidControls(s,ch); updateSF2Trim(*engine,ch); } if constexpr (sf2MultiOutput) updateRouteSend(*engine,ch); } break;
-                    case 0xc0: receiveProgram(ch,a); fluid_synth_program_change(s,ch,a); updateProgram(s,ch); updateSF2Trim(*engine,ch); if constexpr (sf2MultiOutput) updateRouteSend(*engine,ch); break;
-                    case 0xd0: fluid_synth_channel_pressure(s,ch,a); break;
-                    case 0xe0: if(n>=3) fluid_synth_pitch_bend(s,ch,a|(v<<7)); break;
+                    case 0x80: if(n>=3) { if(auto* z=engine->sfzActive[ch]) sfizz_send_note_off(z->synth,0,a,v); else fluid_synth_noteoff(s,ch,a); } break;
+                    case 0x90: if(n>=3) {
+                        if(auto* z=engine->sfzActive[ch]) { if(v) sfizz_send_note_on(z->synth,0,a,v); else sfizz_send_note_off(z->synth,0,a,0); }
+                        else if(const auto* preset=findPreset(engine->map,selected[ch].load());preset&&preset->sfzIndex<0) { if(v) fluid_synth_noteon(s,ch,a,v); else fluid_synth_noteoff(s,ch,a); }
+                    } break;
+                    case 0xa0: if(n>=3) {if(auto* z=engine->sfzActive[ch]) sfizz_send_poly_aftertouch(z->synth,0,a,v); else fluid_synth_key_pressure(s,ch,a,v);} break;
+                    case 0xb0: if(n>=3) { receiveFluidCC(*engine,ch,a,v,f,fx); if(a==121||a==6||a==38||a==96||a==97) { if(!engine->sfzActive[ch]) refreshFluidControls(s,ch); updateSF2Trim(*engine,ch); } if constexpr (sf2MultiOutput) updateRouteSend(*engine,ch); } break;
+                    case 0xc0: { receiveProgram(ch,a); int font=0,bank=selected[ch].load()>>7,program=0;
+                        fluid_synth_get_program(s,ch,&font,&bank,&program);
+                        const int code=pack(juce::jlimit(0,16383,bank),a);
+                        selectLive(*engine,ch,code); updateSF2Trim(*engine,ch);
+                        if constexpr (sf2MultiOutput) updateRouteSend(*engine,ch); break; }
+                    case 0xd0: if(auto* z=engine->sfzActive[ch]) sfizz_send_channel_aftertouch(z->synth,0,a); else fluid_synth_channel_pressure(s,ch,a); break;
+                    case 0xe0: if(n>=3) { fluid_synth_pitch_bend(s,ch,a|(v<<7)); if(auto* z=engine->sfzActive[ch]) sfizz_send_hd_pitch_wheel(z->synth,0,((a|(v<<7))-8192)/8192.0f); } break;
                     default: break;
                 }
             }
@@ -450,21 +612,22 @@ public:
             first=next;
         }
         render(cursor,b.getNumSamples()-cursor);
-        const int after=fluid_synth_get_active_voice_count(s); activeVoices.store(after);
+        int after=fluid_synth_get_active_voice_count(s); for(auto* z:engine->sfzActive) if(z) after+=sfizz_get_num_active_voices(z->synth); activeVoices.store(after);
         if(after==0&&before==0&&!relevantMidi&&!controlChanged&&rawPeak<0.00001f&&wetPeak<0.00001f)
             engine->quietSamples=juce::jmin(sleepAfter,engine->quietSamples+b.getNumSamples());
         else engine->quietSamples=0;
         midi.clear();
     }
     void getStateInformation(juce::MemoryBlock& dest) override {
-        juce::String path; Programs p; Controls c; stateForSave(path,p,&c);
+        juce::String path; Programs p; Controls c; MapEdits edits; int sfzCode=0; stateForSave(path,p,&c,&edits,&sfzCode);
         juce::XmlElement x("LSoundFontState");
         x.setAttribute("uiChannel",uiChannel());
-        x.setAttribute("version",9); x.setAttribute("midiFX",midiFX->getIndex()); for(int i=0;i<fxCount;++i) x.setAttribute(fxSpecs[i].key,i==drumTrim?0:readFXValue(i)); x.setAttribute("sfzQuality",sfzQuality->getIndex()); x.setAttribute("quality",quality->getIndex()); x.setAttribute("effects",effects->getIndex()); x.setAttribute("file",path); x.setAttribute("gain",static_cast<double>(gain->get()));
+        x.setAttribute("version",11); x.setAttribute("sfzCode",sfzCode); x.setAttribute("midiFX",midiFX->getIndex()); for(int i=0;i<fxCount;++i) x.setAttribute(fxSpecs[i].key,i==drumTrim?0:readFXValue(i)); x.setAttribute("sfzQuality",sfzQuality->getIndex()); x.setAttribute("quality",quality->getIndex()); x.setAttribute("effects",effects->getIndex()); x.setAttribute("file",path); x.setAttribute("gain",static_cast<double>(gain->get()));
         for(int i=0;i<channels;++i) { x.setAttribute("ch"+juce::String(i+1),p[i]); x.setAttribute(channelGainId(i),double(channelGain[i]->get())); x.setAttribute(routeId(i),channelRoute[i]->getIndex()); }
         for(int i=0;i<controlCount;++i) if(c[i]!=unset) {
             auto* entry=x.createNewChildElement("Control"); entry->setAttribute("index",i); entry->setAttribute("value",c[i]);
         }
+        for(const auto& e:edits) {auto* entry=x.createNewChildElement("MapEdit"); entry->setAttribute("bank",e.bank);entry->setAttribute("program",e.program);entry->setAttribute("sourceBank",e.sourceBank);entry->setAttribute("sourceProgram",e.sourceProgram);entry->setAttribute("path",e.path);}
         const auto preset=currentPresetFile();
         if(preset!=juce::File{}&&preset.isAChildOf(presetRoot())) x.setAttribute("presetFile",preset.getRelativePathFrom(presetRoot()));
         copyXmlToBinary(x,dest);
@@ -496,7 +659,17 @@ public:
                 if(id<120&&id!=0&&id!=32) c[i]=juce::jlimit(0,127,v);
                 else if(id>=128) if(auto* spec=sf2Spec(id)) c[i]=juce::jlimit(spec->lo,spec->hi,v);
             }
-            load(x->getStringAttribute("file"),p,c);
+            MapEdits edits;
+            for(auto* entry=x->getFirstChildElement();entry;entry=entry->getNextElement()) if(entry->hasTagName("MapEdit")) {
+                MapEdit e{entry->getIntAttribute("bank",-1),entry->getIntAttribute("program",-2),entry->getIntAttribute("sourceBank",-1),entry->getIntAttribute("sourceProgram",-1),entry->getStringAttribute("path")};
+                if(e.program>=-1&&lsfx::validAddress(e.bank,e.program<0?0:e.program)&&lsfx::validAddress(e.sourceBank,e.sourceProgram)&&juce::File::isAbsolutePath(e.path)&&(juce::File(e.path).hasFileExtension("sf2;sf3")||(e.program>=0&&juce::File(e.path).hasFileExtension("sfz")))) edits.push_back(std::move(e));
+            }
+            const auto basePath=x->getStringAttribute("file");
+            const int baseCode=juce::jlimit(0,pack(16383,127),x->getIntAttribute("sfzCode",0));
+            if(x->getIntAttribute("version",0)<11&&juce::File(basePath).hasFileExtension("sfz")&&edits.empty()) {
+                for(int ch=1;ch<channels;++ch) if(p[ch]==baseCode) p[ch]=pack(baseCode>>7,(baseCode+1)&127);
+            }
+            load(basePath,p,c,std::move(edits),baseCode);
         }
     }
 private:
@@ -524,12 +697,16 @@ private:
     }
     void receiveFluidCC(Engine& e,int ch,int cc,int v,FXValues& f,int& fx) {
         fluid_synth_cc(e.synth,ch,cc,v);
+        if(cc!=0&&cc!=32) {
+            if(cc<120) e.sfzCC[controlIndex(ch,cc)]=v;
+            if(auto* z=e.sfzActive[ch]) sfizz_send_cc(z->synth,0,cc,v);
+        }
         if(cc==91) e.reverbSendExplicit[ch]=true;
         if(cc<120) controlValues[controlIndex(ch,cc)].store(v);
         if(cc==91||cc==93) {
             if(cc==91) ++reverbCC; else ++chorusCC;
             const int bit=cc==91?1:2;
-            if(e.routes[ch]==0 && v>0 && midiFX->getIndex()==1 && !(e.midiDisabledFx&bit) && !(fx&bit)) {
+            if(e.hasSF2&&!e.sfzActive[ch]&&e.routes[ch]==0 && v>0 && midiFX->getIndex()==1 && !(e.midiDisabledFx&bit) && !(fx&bit)) {
                 midiEffectMask(fx|bit,fx); configureFX(e,f,fx);
             }
         }
@@ -540,7 +717,7 @@ private:
         for(int ch=0;ch<channels;++ch) if(!e.reverbSendExplicit[ch]) {
             const int send=profile==1?40:0;
             fluid_synth_cc(e.synth,ch,91,send);
-            controlValues[controlIndex(ch,91)].store(send);
+            if(!e.sfzActive[ch]) controlValues[controlIndex(ch,91)].store(send);
         }
         return true;
     }
@@ -594,9 +771,9 @@ private:
         if(e.lastFx==f&&e.effects==enabled) return false;
         const auto old=e.lastFx;
         if(old[rvType]!=f[rvType]||((e.effects^enabled)&1)) { e.reverbDelay.reset(); e.sfzReverb.reset(); }
-        if(old[chType]!=f[chType]||((e.effects^enabled)&2)) e.modulation.reset();
+        if(old[chType]!=f[chType]||((e.effects^enabled)&2)) {e.modulation.reset(); e.sfzModulation.reset();}
         if(old[delayMode]!=f[delayMode]||(old[delayMix]==0)!=(f[delayMix]==0)) e.delay.reset();
-        if(e.synth) {
+        if(e.hasSF2) {
             auto* s=e.synth;
             if(old[rvType]!=f[rvType]||old[rvLevel]!=f[rvLevel]||old[rvTime]!=f[rvTime]||old[rvDamp]!=f[rvDamp]||old[rvWidth]!=f[rvWidth]||e.effects!=enabled) {
             fluid_synth_reverb_on(s,-1,(enabled&1)&&f[rvType]<6);
@@ -612,7 +789,8 @@ private:
             fluid_synth_set_chorus_group_speed(s,-1,f[chRate]*.01);
             fluid_synth_set_chorus_group_depth(s,-1,chorusDepthMs(f));
             }
-        } else if(e.sfz && (old[rvType]!=f[rvType]||old[rvLevel]!=f[rvLevel]||old[rvTime]!=f[rvTime]||old[rvDamp]!=f[rvDamp]||old[rvWidth]!=f[rvWidth]||e.effects!=enabled)) {
+        }
+        if(e.hasSFZ() && (old[rvType]!=f[rvType]||old[rvLevel]!=f[rvLevel]||old[rvTime]!=f[rvTime]||old[rvDamp]!=f[rvDamp]||old[rvWidth]!=f[rvWidth]||e.effects!=enabled)) {
             juce::Reverb::Parameters p;
             p.roomSize=roomSize(f); p.damping=f[rvDamp]*.01f; p.width=f[rvWidth]*.01f;
             p.wetLevel=f[rvLevel]*.0035f; p.dryLevel=0.5f; p.freezeMode=0;
@@ -622,10 +800,10 @@ private:
     }
     float processMaster(Engine& e,juce::AudioBuffer<float>& b,const FXValues& f,int enabled,int start=0,int count=-1) {
         const bool reverbEcho=(enabled&1)&&f[rvType]>=6;
-        const bool chorusCustom=(enabled&2)&&(e.sfz||f[chType]>=4);
+        const bool chorusCustom=(enabled&2)&&(!e.hasSF2||f[chType]>=4);
         const bool extraDelay=f[delayMix]>0;
         auto* l=b.getWritePointer(0,start); auto* r=b.getWritePointer(1,start); const int n=count<0?b.getNumSamples()-start:count;
-        if(e.sfz&&(enabled&1)&&f[rvType]<6) e.sfzReverb.processStereo(l,r,n);
+        if(!e.hasSF2&&e.hasSFZ()&&(enabled&1)&&f[rvType]<6) e.sfzReverb.processStereo(l,r,n);
         const float g=juce::Decibels::decibelsToGain(gain->get())*e.midiMaster, trim=juce::Decibels::decibelsToGain(float(f[inputTrim]));
         float peak=0;
         for(int i=0;i<n;++i) {
@@ -645,10 +823,43 @@ private:
                 l[i]+=wl*f[delayMix]*.01f; r[i]+=wr*f[delayMix]*.01f;
             }
             peak=(std::max)(peak,(std::max)(std::abs(l[i]),std::abs(r[i])));
-            if(e.synth) e.output.processSoundFont(l[i],r[i],g,trim,f[sf2Dynamics]);
+            if(e.hasSF2) e.output.processSoundFont(l[i],r[i],g,trim,f[sf2Dynamics]);
             else e.output.process(l[i],r[i],g,trim);
         }
         return peak;
+    }
+    void renderSfz(Engine& e,juce::AudioBuffer<float>& b,const std::array<int,stereoBuses>& dest,const FXValues& f,int fx,int start,int count) {
+        const int sq=sfzQuality->getIndex();
+        for(int offset=0;offset<count;) {
+            const int n=juce::jmin(renderChunk,count-offset),pos=start+offset;
+            std::fill_n(e.sfzMainL.data(),n,0.0f); std::fill_n(e.sfzMainR.data(),n,0.0f);
+            for(int ch=0;ch<channels;++ch) if(auto* slot=e.sfzActive[ch]) {
+                if(slot->appliedQuality!=sq) {
+                    if(sq!=0||slot->appliedQuality!=-1) sfizz_set_sample_quality(slot->synth,SFIZZ_PROCESS_LIVE,sq==0?slot->defaultQuality:sq-1);
+                    slot->appliedQuality=sq;
+                }
+                float* out[]={e.sfzL.data(),e.sfzR.data()};
+                std::fill_n(out[0],n,0.0f); std::fill_n(out[1],n,0.0f);
+                sfizz_render_block(slot->synth,out,2,n);
+                auto& g=e.channelGains[ch];
+                for(int i=0;i<n;++i) {const float v=g.getNextValue();out[0][i]*=v;out[1][i]*=v;}
+                const int route=channelRoute[ch]->getIndex();
+                if(route==0) for(int i=0;i<n;++i) {e.sfzMainL[i]+=out[0][i];e.sfzMainR[i]+=out[1][i];}
+                else if(dest[route]>=0) {b.addFrom(dest[route],pos,out[0],n); b.addFrom(dest[route]+1,pos,out[1],n);}
+            }
+            // FluidSynth retains its native shared effects. Apply the existing
+            // SFZ shared reverb/chorus only to the SFZ Main submix in hybrid mode.
+            if(e.hasSF2) {
+                if((fx&1)&&f[rvType]<6) e.sfzReverb.processStereo(e.sfzMainL.data(),e.sfzMainR.data(),n);
+                if((fx&2)&&f[chType]<4) for(int i=0;i<n;++i) {
+                    float wl=0,wr=0;
+                    e.sfzModulation.process(e.sfzMainL[i],e.sfzMainR[i],14.0f,chorusDepthMs(f),f[chRate]*.01f,0,false,wl,wr);
+                    e.sfzMainL[i]+=wl*f[chLevel]*.01f; e.sfzMainR[i]+=wr*f[chLevel]*.01f;
+                }
+            }
+            b.addFrom(0,pos,e.sfzMainL.data(),n); b.addFrom(1,pos,e.sfzMainR.data(),n);
+            offset+=n;
+        }
     }
     juce::AudioParameterFloat* gain = nullptr;
     std::array<juce::AudioParameterFloat*,channels> channelGain{};
@@ -684,11 +895,11 @@ private:
     std::atomic<bool> controlDirty{false};
     Controls overrides=emptyControls(); // protected by requestMutex
     static void sendControl(Engine& e,int ch,int id,int value) {
-        if(e.sfz) { if(ch==0&&id<120&&id!=0&&id!=32) sfizz_send_cc(e.sfz,0,id,value); }
-        else if(e.synth) {
-            if(id<120&&id!=0&&id!=32) { fluid_synth_cc(e.synth,ch,id,value); if(id==91) e.reverbSendExplicit[ch]=true; }
-            else if(id>=128) if(auto* spec=sf2Spec(id)) fluid_synth_set_gen(e.synth,ch,spec->gen,static_cast<float>(value));
-        }
+        if(id<120&&id!=0&&id!=32) {
+            e.sfzCC[controlIndex(ch,id)]=value;
+            if(auto* z=e.sfzActive[ch]) sfizz_send_cc(z->synth,0,id,value);
+            fluid_synth_cc(e.synth,ch,id,value); if(id==91) e.reverbSendExplicit[ch]=true;
+        } else if(id>=128) if(auto* spec=sf2Spec(id)) fluid_synth_set_gen(e.synth,ch,spec->gen,static_cast<float>(value));
     }
     bool applyControls(Engine& e) {
         if(!controlDirty.exchange(false)) return false;
@@ -718,86 +929,113 @@ private:
     }
     std::atomic<double> hostRate{44100};
     std::array<std::atomic<int>,channels> selected{},commands{};
-    std::atomic<bool> panic{false};
+    std::array<std::atomic<int>,channels> sfzNeeded{},sfzRetry{};
+    std::atomic<bool> extraSfzPending{false};
+    std::atomic<bool> panic{false}, clearing{false};
     std::mutex engineMutex, requestMutex, viewMutex;
     std::condition_variable cv;
     std::unique_ptr<Engine> engine;
     std::thread worker;
     bool stopping=false, pending=false;
     Request latest;
+    std::optional<Request> importRollback;
+    bool rollbackWasFailed=false;
     View view;
-    static void choose(Engine& e,int ch,int code) {
-        fluid_synth_program_select(e.synth,ch,e.font,code>>7,code&127);
+    static bool choose(Engine& e,int ch,int code) {
+        const auto* preset=findPreset(e.map,code);
+        const bool sfz=preset&&preset->sfzIndex>=0;
+        if(!preset||sfz||fluid_synth_program_select(e.synth,ch,preset->font,preset->sourceBank,preset->sourceProgram)!=FLUID_OK) {
+            fluid_synth_all_sounds_off(e.synth,ch);
+            fluid_synth_unset_program(e.synth,ch);
+        }
+        const bool ready=e.activateSfz(ch,code,preset);
+        // Destination bank must remain independent of original SF2 bank.
+        fluid_synth_bank_select(e.synth,ch,code>>7);
+        return ready;
     }
-    void updateProgram(fluid_synth_t* s,int ch) {
-        int font=-1,bank=0,prog=0;
-        if(fluid_synth_get_program(s,ch,&font,&bank,&prog)==FLUID_OK && bank>=0 && bank<=16383 && prog>=0 && prog<128) selected[ch].store(pack(bank,prog));
+    void readSfzControls(Engine& e,int ch,const Preset& preset) {
+        for(int cc=1;cc<120;++cc) if(cc!=32) controlValues[controlIndex(ch,cc)].store(e.sfzCC[controlIndex(ch,cc)]);
+        for(const auto& cc:e.sfzSources[static_cast<size_t>(preset.sfzIndex)].labels) {
+            const int v=e.sfzCC[controlIndex(ch,cc.cc)];
+            controlValues[controlIndex(ch,cc.cc)].store(v==unset?cc.initial:v);
+        }
     }
-    void stateForSave(juce::String& path, Programs& p, Controls* controls=nullptr) {
+    void selectLive(Engine& e,int ch,int code) {
+        const bool ready=choose(e,ch,code); selected[ch].store(code);
+        sfzNeeded[ch].store(ready?-1:code);
+        if(!ready) { extraSfzPending.store(true); cv.notify_one(); }
+        const auto* preset=findPreset(e.map,code);
+        if(preset&&preset->sfzIndex>=0) readSfzControls(e,ch,*preset);
+        else refreshFluidControls(e.synth,ch);
+        e.routes[ch]=((preset&&preset->sfzIndex>=0)||sf2MultiOutput)?channelRoute[ch]->getIndex():0;
+    }
+    // Worker-only extra copies when several channels select the same SFZ.
+    void loadExtraSfz() {
+        for(int ch=0;ch<channels;++ch) {
+            const int code=sfzNeeded[ch].exchange(-1);
+            if(code<0) continue;
+            juce::String path; double rate=0; uint64_t serial=0; int index=-1;
+            { std::lock_guard<std::mutex> audio(engineMutex);
+              if(!engine||selected[ch].load()!=code||engine->sfzActive[ch]) continue;
+              const auto* p=findPreset(engine->map,code);
+              if(!p||p->sfzIndex<0) continue;
+              index=p->sfzIndex; path=p->path; rate=engine->rate; serial=engine->serial;
+              for(auto& slot:engine->sfzSources[static_cast<size_t>(index)].pool) if(slot&&slot->owner<0) {sfzRetry[ch].store(code);index=-1;break;}
+            }
+            if(index<0) continue;
+            auto slot=createSfz(path,rate);
+            if(!slot) {
+                std::lock_guard<std::mutex> ui(viewMutex);
+                if(!view.loading) {view.status="Unable to prepare SFZ for channel "+juce::String(ch+1)+": "+path; ++view.revision;}
+                continue;
+            }
+            { std::lock_guard<std::mutex> audio(engineMutex);
+              if(!engine||engine->serial!=serial||selected[ch].load()!=code||engine->sfzActive[ch]) continue;
+              for(auto& available:engine->sfzSources[static_cast<size_t>(index)].pool) if(!available) {available=std::move(slot);break;}
+              sfzRetry[ch].store(code);
+            }
+        }
+    }
+    void stateForSave(juce::String& path, Programs& p, Controls* controls=nullptr,MapEdits* edits=nullptr,int* sfzCode=nullptr) {
         std::lock_guard<std::mutex> lock(requestMutex);
-        path=latest.path;
+        path=latest.path; if(edits) *edits=latest.edits; if(sfzCode) *sfzCode=latest.sfzCode;
         if(controls) *controls=(pending||loadingSerial!=0||failedSerial==latest.serial)?latest.controls:overrides;
         // While a new bank is loading retain the requested state, not old programs.
         if (pending || loadingSerial!=0 || failedSerial==latest.serial) p=latest.programs;
         else for(int i=0;i<channels;++i) { int cmd=commands[i].load(); p[i]=cmd>=0 ? cmd : selected[i].load(); }
     }
     uint64_t loadingSerial=0, failedSerial=~uint64_t(0);
-    void load(const juce::String& path,Programs p,Controls c=emptyControls()) {
+    void load(const juce::String& path,Programs p,Controls c=emptyControls(),MapEdits edits={},int sfzCode=0,bool preserveOnFailure=false) {
         { std::lock_guard<std::mutex> lock(requestMutex);
-          latest={path,hostRate.load(),p,latest.serial+1,c}; pending=true;
-          std::lock_guard<std::mutex> ui(viewMutex); view.loading=true; view.isSfz=path.isNotEmpty()&&juce::File(path).hasFileExtension("sfz"); view.labels.clear(); view.status=path.isEmpty()?"Unloading SoundFont":"Loading "+juce::File(path).getFileName(); ++view.revision;
+          importRollback.reset();
+          if(preserveOnFailure&&!pending&&loadingSerial==0) {
+              importRollback=latest; rollbackWasFailed=failedSerial==latest.serial;
+              if(!rollbackWasFailed) {
+                  importRollback->controls=overrides;
+                  for(int i=0;i<channels;++i) importRollback->programs[i]=current(i);
+              }
+          }
+          latest={path,hostRate.load(),p,latest.serial+1,c,std::move(edits),sfzCode}; pending=true;
+          const bool empty=path.isEmpty()&&latest.edits.empty();
+          if(empty) clearing.store(true);
+          const auto display=path.isNotEmpty()?path:latest.edits.empty()?juce::String{}:latest.edits.front().path;
+          std::lock_guard<std::mutex> ui(viewMutex); view.loading=true; view.status=empty?"Unloading SoundFont":"Loading "+juce::File(display).getFileName(); ++view.revision;
         }
         cv.notify_one();
     }
     void work() {
         for(;;) {
             Request r;
-            { std::unique_lock<std::mutex> lock(requestMutex); cv.wait(lock,[&]{return stopping||pending;}); if(stopping) return; r=latest; pending=false; loadingSerial=r.serial; }
+            { std::unique_lock<std::mutex> lock(requestMutex); cv.wait_for(lock,std::chrono::milliseconds(100),[&]{return stopping||pending||extraSfzPending.load();}); if(stopping) return; if(!pending) {if(!extraSfzPending.exchange(false)) continue;lock.unlock();loadExtraSfz();continue;} r=latest; pending=false; loadingSerial=r.serial; }
             std::unique_ptr<Engine> fresh;
             std::vector<Preset> presets;
-            std::vector<CCLabel> labels;
+            std::map<juce::String,std::vector<CCLabel>> labels;
             juce::String error;
-            if(r.path.isNotEmpty()) {
-                if(!juce::File(r.path).existsAsFile()) error="SoundFont not found: "+r.path;
-                else if(juce::File(r.path).hasFileExtension("sfz")) {
-                    fresh=std::make_unique<Engine>(); fresh->rate=r.rate; fresh->prepareFX(); fresh->prepareMixer();
-                    fresh->sfz=sfizz_create_synth();
-                    if(fresh->sfz) {
-                        sfizz_set_sample_rate(fresh->sfz,static_cast<float>(r.rate));
-                        sfizz_set_samples_per_block(fresh->sfz,1024);
-                        sfizz_set_num_voices(fresh->sfz,128);
-                    }
-                    if(!fresh->sfz || !sfizz_load_file(fresh->sfz,r.path.toRawUTF8())) error="Unable to load SFZ: "+r.path;
-                    else {
-                        fresh->sfzDefaultQuality=sfizz_get_sample_quality(fresh->sfz,SFIZZ_PROCESS_LIVE);
-                        const auto n=sfizz_get_num_cc_labels(fresh->sfz);
-                        for(unsigned i=0;i<n;++i) {
-                            const int cc=sfizz_get_cc_label_number(fresh->sfz,static_cast<int>(i));
-                            if(cc<=0||cc==32||cc>=120) continue;
-                            const char* text=sfizz_get_cc_label_text(fresh->sfz,static_cast<int>(i));
-                            if(text&&*text) labels.push_back({cc,juce::String::fromUTF8(text)});
-                        }
-                        std::sort(labels.begin(),labels.end(),[](const CCLabel& a,const CCLabel& b){return a.cc<b.cc;});
-                        labels.erase(std::unique(labels.begin(),labels.end(),[](const CCLabel& a,const CCLabel& b){return a.cc==b.cc;}),labels.end());
-                        // sfizz 1.2.3 dispatches these read-only OSC replies synchronously.
-                        // Query the fresh, unpublished synth; no concurrent audio calls.
-                        int reply=unset;
-                        if(auto* client=sfizz_create_client(&reply)) {
-                            sfizz_set_receive_callback(client,[](void* data,int,const char*,const char* sig,const sfizz_arg_t* args){
-                                if(sig&&sig[0]=='f'&&args&&std::isfinite(args[0].f))
-                                    *static_cast<int*>(data)=juce::jlimit(0,127,juce::roundToInt(args[0].f*127.0f));
-                            });
-                            for(auto& cc:labels) {
-                                reply=unset;
-                                const auto path="/cc"+juce::String(cc.cc)+"/value";
-                                sfizz_send_message(fresh->sfz,client,0,path.toRawUTF8(),"",nullptr);
-                                cc.initial=reply;
-                            }
-                            sfizz_delete_client(client);
-                        }
-                    }
-                } else {
-                    fresh=std::make_unique<Engine>(); fresh->rate=r.rate; fresh->prepareFX();
+            const bool empty=r.path.isEmpty()&&r.edits.empty();
+            if(!empty) {
+                if(r.path.isNotEmpty()&&!juce::File(r.path).existsAsFile()) error="SoundFont not found: "+r.path;
+                else {
+                    fresh=std::make_unique<Engine>(); fresh->rate=r.rate; fresh->serial=r.serial; fresh->sfzCC=r.controls; fresh->prepareFX(); fresh->prepareMixer();
                     fresh->settings=new_fluid_settings();
                     if(fresh->settings) {
                         fluid_settings_setnum(fresh->settings,"synth.sample-rate",r.rate);
@@ -815,19 +1053,69 @@ private:
                         fluid_settings_setint(fresh->settings,"synth.cpu-cores",1);
                         fresh->synth=new_fluid_synth(fresh->settings);
                     }
-                    if(fresh->synth) fresh->font=fluid_synth_sfload(fresh->synth,r.path.toRawUTF8(),1);
-                    if(fresh->font<0) error="Unable to load SoundFont: "+r.path;
+                    if(!fresh->synth) error="Unable to create FluidSynth";
                     else {
-                        fluid_synth_set_interp_method(fresh->synth,-1,FLUID_INTERP_4THORDER);
-                        if(auto* sf=fluid_synth_get_sfont_by_id(fresh->synth,fresh->font)) {
-                            fluid_sfont_iteration_start(sf);
-                            while(auto* p=fluid_sfont_iteration_next(sf)) {
-                                const int bank=fluid_preset_get_banknum(p), program=fluid_preset_get_num(p);
-                                if(bank>=0 && bank<=16383 && program>=0 && program<128) presets.push_back({bank,program,juce::String::fromUTF8(fluid_preset_get_name(p))});
+                        // Every distinct source is loaded once into the validated stereo synth.
+                        std::map<juce::String,std::vector<Preset>> sources;
+                        auto source=[&](const juce::String& path)->const std::vector<Preset>* {
+                            if(auto it=sources.find(path);it!=sources.end()) return &it->second;
+                            if(!juce::File(path).existsAsFile()) {error="SoundFont not found: "+path;return nullptr;}
+                            const int font=fluid_synth_sfload(fresh->synth,path.toRawUTF8(),fresh->font<0?1:0);
+                            if(font<0) {error="Unable to load SoundFont: "+path;return nullptr;}
+                            if(fresh->font<0) fresh->font=font;
+                            return &sources.emplace(path,catalogSF2(fresh->synth,font,path)).first->second;
+                        };
+                        std::map<int,Preset> mapped;
+                        auto mapSfz=[&](const juce::String& path,int bank,int program) {
+                            if(!juce::File(path).existsAsFile()) {error="SoundFont not found: "+path;return;}
+                            mapped[pack(bank,program)]={bank,program,juce::File(path).getFileNameWithoutExtension(),path,0,0,-1,-1};
+                        };
+                        if(r.path.isNotEmpty()) {
+                            if(juce::File(r.path).hasFileExtension("sfz")) mapSfz(r.path,r.sfzCode>>7,r.sfzCode&127);
+                            else if(auto* list=source(r.path)) for(const auto& p:*list) mapped[pack(p.bank,p.program)]=p;
+                        }
+                        for(const auto& e:r.edits) {
+                            if(error.isNotEmpty()) break;
+                            if(juce::File(e.path).hasFileExtension("sfz")) { if(e.program<0) {error="SFZ cannot replace a bank";break;} mapSfz(e.path,e.bank,e.program); continue; }
+                            const auto* list=source(e.path); if(!list) break;
+                            if(e.program<0) {
+                                if(!lsfx::replaceBank(mapped,*list,e.bank,e.sourceBank)) error="Source bank no longer exists: "+e.path;
+                            } else if(auto* p=findPreset(*list,pack(e.sourceBank,e.sourceProgram))) {
+                                lsfx::assignProgram(mapped,*p,e.bank,e.program);
+                            } else error="Source preset no longer exists: "+e.path;
+                        }
+                        if(error.isEmpty()) {
+                            std::map<juce::String,int> sfzIndices;
+                            for(auto& item:mapped) {
+                                auto& p=item.second;
+                                if(juce::File(p.path).hasFileExtension("sfz")) {
+                                    auto it=sfzIndices.find(p.path);
+                                    if(it==sfzIndices.end()) {
+                                        const int index=static_cast<int>(fresh->sfzSources.size());
+                                        SfzSource entry; entry.path=p.path;
+                                        // One preload per distinct source; extra copies only for currently selected channels.
+                                        int copies=0;
+                                        for(int code:r.programs) {auto pos=mapped.find(code); if(pos!=mapped.end()&&pos->second.path==p.path) ++copies;}
+                                        copies=juce::jmax(1,copies);
+                                        for(int i=0;i<copies;++i) {
+                                            entry.pool[i]=createSfz(p.path,r.rate,i==0?&entry.labels:nullptr,i==0?&entry.initialCC:nullptr);
+                                            if(!entry.pool[i]) {error="Unable to load SFZ: "+p.path;break;}
+                                        }
+                                        if(error.isNotEmpty()) break;
+                                        labels.emplace(p.path,entry.labels);
+                                        fresh->sfzSources.push_back(std::move(entry));
+                                        it=sfzIndices.emplace(p.path,index).first;
+                                    }
+                                    p.sfzIndex=it->second;
+                                } else fresh->hasSF2=true;
+                            }
+                            if(error.isEmpty()) {
+                                for(auto& item:mapped) presets.push_back(std::move(item.second));
+                                fresh->map=presets;
+                                fluid_synth_set_interp_method(fresh->synth,-1,FLUID_INTERP_4THORDER);
+                                for(int i=0;i<channels;++i) if(!choose(*fresh,i,r.programs[i])) {error="Unable to allocate SFZ channel";break;}
                             }
                         }
-                        std::sort(presets.begin(),presets.end(),[](const Preset& a,const Preset& b){return pack(a.bank,a.program)<pack(b.bank,b.program);});
-                        for(int i=0;i<channels;++i) choose(*fresh,i,r.programs[i]);
                     }
                 }
             }
@@ -835,27 +1123,45 @@ private:
             { std::lock_guard<std::mutex> lock(requestMutex);
               if(stopping) return;
               if(r.serial!=latest.serial) { loadingSerial=0; continue; }
-              // Failed replacement unloads the previous bank deliberately: no wrong-bank playback.
+              if(error.isNotEmpty()&&importRollback) {
+                  latest=std::move(*importRollback); latest.serial=r.serial; importRollback.reset();
+                  loadingSerial=0; failedSerial=rollbackWasFailed?r.serial:~uint64_t(0);
+                  std::lock_guard<std::mutex> ui(viewMutex);
+                  view.loading=false; view.status="Import failed: "+error+"; previous map retained"; ++view.revision;
+                  continue;
+              }
+              importRollback.reset();
+              // Failed full replacement unloads the previous bank deliberately: no wrong-bank playback.
               { std::lock_guard<std::mutex> audio(engineMutex);
                 retired=std::move(engine);
                 if(error.isEmpty()) engine=std::move(fresh);
                 overrides=r.controls; controlDirty.store(false);
                 for(int i=0;i<controlCount;++i) { controlValues[i].store(unset); controlCommands[i].store(unset); }
                 if(engine) {
-                    if(engine->sfz) engine->channelGains[0].setCurrentAndTargetValue(juce::Decibels::decibelsToGain(channelGain[0]->get(),channelGainMin-1.0f));
-                    // Restore explicit overrides on the first audio callback, not the loader thread.
-                    if(engine->synth) for(int ch=0;ch<channels;++ch) refreshFluidControls(engine->synth,ch);
-                    else if(engine->sfz) for(const auto& cc:labels) controlValues[controlIndex(0,cc.cc)].store(cc.initial);
-                    for(int i=0;i<controlCount;++i) if(r.controls[i]!=unset && (engine->synth || (i<120))) {
+                    for(int ch=0;ch<channels;++ch) {
+                        engine->channelGains[ch].setCurrentAndTargetValue(juce::Decibels::decibelsToGain(channelGain[ch]->get(),channelGainMin-1.0f));
+                        const auto* preset=findPreset(engine->map,r.programs[ch]);
+                        if(preset&&preset->sfzIndex>=0) readSfzControls(*engine,ch,*preset);
+                        else refreshFluidControls(engine->synth,ch);
+                    }
+                    // Restore explicit overrides on the first audio callback.
+                    for(int i=0;i<controlCount;++i) if(r.controls[i]!=unset) {
                         controlCommands[i].store(r.controls[i]); controlDirty.store(true);
                     }
                 }
-                for(int i=0;i<channels;++i) { commands[i].store(-1); selected[i].store(r.programs[i]); if(engine && engine->synth) updateProgram(engine->synth,i); }
+                for(int i=0;i<channels;++i) { commands[i].store(-1); sfzNeeded[i].store(-1); sfzRetry[i].store(-1); selected[i].store(r.programs[i]); }
+                if(empty) {
+                    activeVoices.store(0); sleeping.store(false); droppedBlocks.store(0);
+                    programChanges.store(0); lastProgram.store(-1); reverbCC.store(0);
+                    chorusCC.store(0); sysexCount.store(0); fxSysexCount.store(0);
+                    panic.store(false);
+                }
+                clearing.store(false);
               }
               loadingSerial=0; failedSerial=error.isNotEmpty()?r.serial:~uint64_t(0);
               { std::lock_guard<std::mutex> ui(viewMutex);
-                view.isSfz=r.path.isNotEmpty()&&juce::File(r.path).hasFileExtension("sfz"); view.ready=error.isEmpty()&&r.path.isNotEmpty(); view.labels=std::move(labels); view.path=r.path; view.presets=error.isEmpty()?std::move(presets):std::vector<Preset>{}; view.loading=false;
-                view.status=error.isNotEmpty()?error:r.path.isEmpty()?"No SoundFont loaded":"Loaded: "+juce::File(r.path).getFileName()+"; "+(view.isSfz?juce::String("SFZ, MIDI channel 1"):juce::String(static_cast<int>(view.presets.size()))+" presets"+(sf2MultiOutput?juce::String():juce::String("; SF2 stereo recovery, Main 1/2 only")));
+                view.ready=error.isEmpty()&&!empty; view.labels=std::move(labels); view.path=r.path.isNotEmpty()?r.path:r.edits.empty()?juce::String{}:r.edits.front().path; view.presets=error.isEmpty()?std::move(presets):std::vector<Preset>{}; view.loading=false;
+                view.status=error.isNotEmpty()?error:empty?"No SoundFont loaded":"Loaded: "+juce::File(view.path).getFileName()+"; "+juce::String(static_cast<int>(view.presets.size()))+" mapped programs"+(sf2MultiOutput?juce::String():juce::String("; SF2 Main 1/2 only"));
                 ++view.revision;
               }
             }
@@ -926,7 +1232,7 @@ public:
     explicit Editor(Processor& p) : AudioProcessorEditor(p), proc(p) {
         setWantsKeyboardFocus(true);
         setFocusContainerType(juce::Component::FocusContainerType::keyboardFocusContainer);
-        title.setText("LSFX 0.0.1 TEST20.1",juce::dontSendNotification); title.setFont(juce::FontOptions(21.0f)); title.setAccessible(false); addAndMakeVisible(title);
+        title.setText("LSFX 0.0.1 TEST23",juce::dontSendNotification); title.setFont(juce::FontOptions(21.0f)); title.setAccessible(false); addAndMakeVisible(title);
         status.setText("No SoundFont loaded",juce::dontSendNotification); status.setTitle("Instrument status"); addAndMakeVisible(status);
         setup(open,"Open SF2 or SFZ",1); setup(parameters,"Parameters",2); setup(channel,"MIDI channel",3); setup(bank,"Bank",37); setup(program,"Program",38); setup(level,"Master output gain",36);
         setup(grid,"Parameter grid",1); setup(value,"Parameter value",2); setup(closeGrid,"Close parameters",3);
@@ -966,7 +1272,7 @@ public:
             setup(c,"Output routing channel "+juce::String(ch+1),20+ch);
             c.setDescription({});
             c.setSliderStyle(juce::Slider::LinearVertical); c.setTextBoxStyle(juce::Slider::NoTextBox,true,0,0);
-            c.setRange(0,stereoBuses-1,1); c.textFromValueFunction=[this](double v){return routingValue(v);};
+            c.setRange(0,stereoBuses-1,1); c.textFromValueFunction=[this,ch](double v){return routingValue(v,ch);};
             c.setValue(proc.routeParameter(ch).getIndex(),juce::dontSendNotification);
             c.onDragStart=[this,ch]{proc.routeParameter(ch).beginChangeGesture();routeDragging[ch]=true;lastRouteChannel=ch;};
             c.onDragEnd=[this,ch]{routeDragging[ch]=false;proc.routeParameter(ch).endChangeGesture();};
@@ -995,7 +1301,7 @@ public:
         showGrid(false); setSize(900,690); refresh(true); startTimerHz(5);
         scheduleInitialFocus();
     }
-    ~Editor() override { stopTimer(); removeKeyListener(this); panelText.removeKeyListener(this); presetList.removeKeyListener(this); presetList.setModel(nullptr); chooser.reset(); }
+    ~Editor() override { stopTimer(); removeKeyListener(this); panelText.removeKeyListener(this); presetList.removeKeyListener(this); presetList.setModel(nullptr); chooser.reset(); if(catalogThread.joinable()) catalogThread.join(); }
     void paint(juce::Graphics& g) override {
         g.fillAll(juce::Colour(0xff202429));
         if(panelMode!=Panel::none) return;
@@ -1102,10 +1408,12 @@ private:
     int lastRouteChannel=0;
     int lastGainChannel=0;
     std::unique_ptr<juce::FileChooser> chooser;
+    std::thread catalogThread;
+    bool catalogBusy=false;
     View cached;
     std::vector<GridRow> rows;
     uint64_t revision=~uint64_t(0);
-    int shownCode=-1,stepIndex=0,lastSf2Row=rowGain,lastSfzRow=rowGain;
+    int shownCode=-1,gridShownCode=-1,stepIndex=0,lastSf2Row=rowGain,lastSfzRow=rowGain;
     bool updating=false,dragging=false,gridOpen=false,updatingGrid=false,initialFocusPending=true,focusScheduled=false;
     bool returnFromChooser=false,announceLoaded=false;
     uint32_t chooserReturnedAt=0;
@@ -1183,17 +1491,24 @@ private:
         initialFocusPending=false; returnFromChooser=false; focus(grid);
     }
     void closeParameters() { if(!gridOpen) return; showGrid(false); focus(parameters); }
-    int selectedChannel() const { return cached.isSfz?0:juce::jlimit(0,15,channel.getSelectedId()-1); }
+    int selectedChannel() const { return juce::jlimit(0,15,channel.getSelectedId()-1); }
+    bool isSfzChannel(int ch) const { const auto* p=findPreset(cached.presets,proc.current(ch));return p&&p->sfzIndex>=0; }
+    bool isCurrentSfz() const { return isSfzChannel(selectedChannel()); }
+    bool currentProgramReady() const { return cached.ready&&!cached.loading&&findPreset(cached.presets,proc.current(selectedChannel()))!=nullptr; }
     const GridRow* selectedRow() const { const int i=grid.getSelectedItemIndex(); return i>=0&&i<static_cast<int>(rows.size())?&rows[static_cast<size_t>(i)]:nullptr; }
     void rebuildGrid() {
-        const int preferred=cached.isSfz?lastSfzRow:lastSf2Row;
+        const int preferred=isCurrentSfz()?lastSfzRow:lastSf2Row;
+        gridShownCode=proc.current(selectedChannel());
         rows.clear();
         rows.push_back({rowGain,"Output gain",-60,6,0.1,false," dB"});
         rows.push_back({rowRoute,"Output routing",0,stereoBuses-1,1,true,{}});
-        if(cached.ready&&!cached.loading) {
-            if(cached.isSfz) {
+        if(currentProgramReady()) {
+            if(isCurrentSfz()) {
                 rows.push_back({rowSfzQuality,"SFZ live sample quality",0,11,1,true,{}});
-                for(const auto& cc:cached.labels) rows.push_back({cc.cc,cc.name+" (CC"+juce::String(cc.cc)+")",0,127,1,false,{}});
+                if(const auto* p=findPreset(cached.presets,proc.current(selectedChannel()))) {
+                    if(const auto it=cached.labels.find(p->path);it!=cached.labels.end())
+                        for(const auto& cc:it->second) rows.push_back({cc.cc,cc.name+" (CC"+juce::String(cc.cc)+")",0,127,1,false,{}});
+                }
             } else {
                 rows.push_back({rowChannel,"MIDI channel",1,16,1,true,{}});
                 rows.push_back({rowInterpolation,"SF2 interpolation",0,2,1,true,{}});
@@ -1201,12 +1516,12 @@ private:
                 for(const auto& c:sf2Controls) rows.push_back({c.id,c.name,static_cast<double>(c.lo),static_cast<double>(c.hi),static_cast<double>(c.step),false,c.unit});
             }
         }
-        if(cached.ready&&!cached.loading) {
+        if(currentProgramReady()) {
             rows.push_back({rowEffects,"Effects",0,3,1,true,{}});
-            if(!cached.isSfz) rows.push_back({rowMidiFX,"MIDI effects reception",0,1,1,true,{}});
-            for(int i=0;i<fxCount;++i) { if(i==drumTrim||(cached.isSfz&&(i==sf2Dynamics||i==sf2Ambience))) continue; const auto& f=fxSpecs[i]; rows.push_back({fxRow(i),f.label,double(f.lo),double(f.hi),1,i==rvType||i==chType||i==delayMode||i==sf2Dynamics||i==sf2Ambience,f.unit}); }
+            if(!isCurrentSfz()) rows.push_back({rowMidiFX,"MIDI effects reception",0,1,1,true,{}});
+            for(int i=0;i<fxCount;++i) { if(i==drumTrim||(isCurrentSfz()&&(i==sf2Dynamics||i==sf2Ambience))) continue; const auto& f=fxSpecs[i]; rows.push_back({fxRow(i),f.label,double(f.lo),double(f.hi),1,i==rvType||i==chType||i==delayMode||i==sf2Dynamics||i==sf2Ambience,f.unit}); }
         }
-        gridTitle.setText(cached.ready&&!cached.loading?(cached.isSfz?"SFZ parameters":"SF2 parameters - channel "+juce::String(selectedChannel()+1)):"Parameters",juce::dontSendNotification);
+        gridTitle.setText(currentProgramReady()?(juce::String(isCurrentSfz()?"SFZ parameters - channel ":"SF2 parameters - channel ")+juce::String(selectedChannel()+1)):juce::String("Parameters"),juce::dontSendNotification);
         updatingGrid=true; grid.clear(juce::dontSendNotification);
         int target=0;
         for(size_t i=0;i<rows.size();++i) { if(rows[i].id==preferred) target=static_cast<int>(i); grid.addItem(rowLine(rows[i]),static_cast<int>(i)+1); }
@@ -1221,7 +1536,7 @@ private:
         if(r.id==rowMidiFX) return proc.midiFXParameter().getIndex();
         if(r.id==rowSfzQuality) return proc.sfzQualityParameter().getIndex();
         if(r.id==rowChannel) return selectedChannel()+1;
-        return cached.ready&&!cached.loading?proc.getControl(selectedChannel(),r.id):unset;
+        return currentProgramReady()?proc.getControl(selectedChannel(),r.id):unset;
     }
     juce::String formatValue(const GridRow& r,double v) const {
         if(v==unset) return "Instrument default (not read)";
@@ -1240,9 +1555,9 @@ private:
         if(r.id==rowSfzQuality) return proc.sfzQualityParameter().choices[juce::jlimit(0,11,juce::roundToInt(v))];
         return juce::String(juce::roundToInt(v))+r.unit;
     }
-    juce::String routingValue(double v) const {
+    juce::String routingValue(double v,int ch=-1) const {
         const auto name=routeName(juce::roundToInt(v));
-        if(!sf2MultiOutput&&!cached.isSfz&&v!=0) return name+" (stored; SF2 Main 1/2 only)";
+        if(!sf2MultiOutput&&!isSfzChannel(ch<0?selectedChannel():ch)&&v!=0) return name+" (stored; SF2 Main 1/2 only)";
         return name;
     }
     juce::String rowName(const GridRow& r) const { return r.id==rowGain||r.id==rowRoute?r.name+" channel "+juce::String(selectedChannel()+1):r.name; }
@@ -1262,7 +1577,7 @@ private:
     }
     void syncValue() {
         if(auto* row=selectedRow()) {
-            const auto r=*row; if(cached.isSfz) lastSfzRow=r.id; else lastSf2Row=r.id;
+            const auto r=*row; if(isCurrentSfz()) lastSfzRow=r.id; else lastSf2Row=r.id;
             updatingGrid=true;
             value.setTitle(rowName(r)); value.setName(rowName(r)); value.setRange(r.low,r.high,r.step);
             value.textFromValueFunction=[this,r](double v) { return formatValue(r,(r.id>=0&&readRow(r)==unset&&v==r.low)?static_cast<double>(unset):v); };
@@ -1295,7 +1610,7 @@ private:
     }
     void editSelected(juce::Component& source,int direction,bool coarse,bool boundary=false) {
         if(auto* row=selectedRow()) {
-            const auto r=*row; if(r.id>=0&&(!cached.ready||cached.loading)) {speak(source,"Load an instrument first");return;} double v=readRow(r); if(v==unset) v=r.low;
+            const auto r=*row; if(r.id>=0&&!currentProgramReady()) {speak(source,"Load an instrument first");return;} double v=readRow(r); if(v==unset) v=r.low;
             const double delta=r.step*(r.choice?1:stepWidths[stepIndex]*(coarse?pageMultiplier:1))*direction;
             const double previous=readRow(r);
             const double next=juce::jlimit(r.low,r.high,boundary?(direction>0?r.high:r.low):v+delta);
@@ -1365,7 +1680,7 @@ private:
         if(routeCh>=0) lastRouteChannel=routeCh;
         if(outputCh>=0) lastGainChannel=outputCh;
         // Leave the host and the native combo popup in control of their own keys.
-        if(chooser) return false;
+        if(chooser||catalogBusy) return false;
         if(panelMode!=Panel::none) return handlePanelKey(k,origin);
         if(!gridOpen&&(bank.isPopupActive()||program.isPopupActive()||channel.isPopupActive())) return false;
         if(ctrl&&!alt&&(ch=='s'||code==19||k.getTextCharacter()==19)) {if(mods.isShiftDown()) showSaveAs(); else saveCurrent();return true;}
@@ -1379,14 +1694,14 @@ private:
         // fader remains a native accessible control for arrows and mouse.
         if(!gridOpen&&!alt&&!ctrl&&code==juce::KeyPress::tabKey) {
             const bool backwards=mods.isShiftDown();
-            auto& remembered=channelLevels[cached.isSfz?0:lastGainChannel];
+            auto& remembered=channelLevels[lastGainChannel];
             if(outputCh>=0) {
                 if(backwards) focus(channel.isEnabled()?static_cast<juce::Component&>(channel):static_cast<juce::Component&>(parameters));
-                else focus(routeLevels[cached.isSfz?0:lastRouteChannel]);
+                else focus(routeLevels[lastRouteChannel]);
                 return true;
             }
             if(routeCh>=0) { if(backwards) focus(remembered); else focus(level); return true; }
-            if(backwards&&origin==&level) { focus(routeLevels[cached.isSfz?0:lastRouteChannel]); return true; }
+            if(backwards&&origin==&level) { focus(routeLevels[lastRouteChannel]); return true; }
             if(!backwards&&(origin==&channel||(origin==&parameters&&!channel.isEnabled()))) {
                 focus(remembered);
                 return true;
@@ -1407,6 +1722,7 @@ private:
                 if(horizontal) {changeStep(level,direction);return true;}
                 if(vertical||page||boundary) {changeMainLevel(direction,page,boundary);return true;}
             }
+            if(ch=='i') { requestInitialize(origin); return true; }
             if(ch=='a') {proc.allOff(); if(origin) speak(*origin,"All sounds off"); return true;}
             if(ch=='s') {showStatus(); return true;}
             if(ch=='l') {openParameters();return true;}
@@ -1414,8 +1730,11 @@ private:
             if(ch=='v'&&gridOpen) {focus(value);return true;}
             if(ch=='c'&&gridOpen) {closeParameters();return true;}
             juce::Component* target=nullptr;
-            if(ch=='o') target=&open; else if(ch=='m') target=&channel; else if(ch=='k') target=&bank; else if(ch=='p') target=&program; else if(ch=='g') target=&level; else if(ch=='u') target=&channelLevels[cached.isSfz?0:lastGainChannel]; else if(ch=='r') target=&routeLevels[cached.isSfz?0:lastRouteChannel];
+            if(ch=='o') target=&open; else if(ch=='m') target=&channel; else if(ch=='k') target=&bank; else if(ch=='p') target=&program; else if(ch=='g') target=&level; else if(ch=='u') target=&channelLevels[lastGainChannel]; else if(ch=='r') target=&routeLevels[lastRouteChannel];
             if(target) {if(target->isEnabled()) {if(gridOpen) showGrid(false,target); focus(*target);} return true;}
+        }
+        if(!gridOpen&&!alt&&!ctrl&&code==juce::KeyPress::returnKey&&(origin==&bank||origin==&program)) {
+            if(!cached.loading) {if(origin==&bank) browseImport(false);else browseImport(true);} return true;
         }
         if(gridOpen&&!alt&&!ctrl&&code==juce::KeyPress::escapeKey) {closeParameters();return true;}
         if(alt||ctrl) {
@@ -1455,15 +1774,15 @@ private:
             }
         }
         if(routeCh>=0) {
-            if(horizontal) {const int next=juce::jlimit(0,cached.isSfz?0:channels-1,routeCh+direction); if(next!=routeCh) {lastRouteChannel=next;focus(routeLevels[next]);} return true;}
+            if(horizontal) {const int next=juce::jlimit(0,channels-1,routeCh+direction); if(next!=routeCh) {lastRouteChannel=next;focus(routeLevels[next]);} return true;}
             if(vertical||page||boundary||code==juce::KeyPress::backspaceKey) {
                 auto& c=routeLevels[routeCh]; const int old=juce::roundToInt(c.getValue());
                 const int next=code==juce::KeyPress::backspaceKey?0:code==juce::KeyPress::homeKey?0:code==juce::KeyPress::endKey?stereoBuses-1:juce::jlimit(0,stereoBuses-1,old+direction*(page?4:1));
-                if(next!=old) {c.setValue(next,juce::sendNotificationSync);speak(c,routingValue(next));} return true;
+                if(next!=old) {c.setValue(next,juce::sendNotificationSync);speak(c,routingValue(next,routeCh));} return true;
             }
         }
         if(outputCh>=0) {
-            if(horizontal) {const int next=juce::jlimit(0,cached.isSfz?0:channels-1,outputCh+direction); if(next!=outputCh) {lastGainChannel=next;focus(channelLevels[next]);} return true;}
+            if(horizontal) {const int next=juce::jlimit(0,channels-1,outputCh+direction); if(next!=outputCh) {lastGainChannel=next;focus(channelLevels[next]);} return true;}
             if(vertical||page||boundary) {changeChannelLevel(outputCh,direction,page,boundary);return true;}
             if(code==juce::KeyPress::backspaceKey) {if(channelLevels[outputCh].getValue()!=0) {channelLevels[outputCh].setValue(0,juce::sendNotificationSync);speak(*origin,"0.0 dB");}return true;}
         }
@@ -1580,11 +1899,11 @@ private:
         if(panelMode!=Panel::none||chooser||cached.loading||cached.revision==missingPromptRevision||!cached.status.startsWith("SoundFont not found: ")) return;
         if(!isShowing()||getPeer()==nullptr||!getPeer()->isFocused()||!hasKeyboardFocus(true)) return;
         missingPromptRevision=cached.revision;
-        const auto missing=cached.path;
+        const auto missing=cached.status.fromFirstOccurrenceOf("SoundFont not found: ",false,false);
         showConfirmation("Instrument file not found: "+missing+". Connect the drive, then Retry or Cancel.","Retry",[this,missing]{
             if(!juce::File(missing).existsAsFile()) {announce("Instrument file still not found: "+missing);return;}
             // Do not retry a stale request if the host changed state while the panel was open.
-            if(proc.getView().path==missing) {proc.retryFile();announceLoaded=true;}
+            if(proc.getView().status=="SoundFont not found: "+missing) {proc.retryFile();announceLoaded=true;}
             closePanel(&open);refresh(true);
         },[this]{closePanel(&open);},true);
     }
@@ -1688,13 +2007,36 @@ private:
         if(panelMode==Panel::confirm) return true;
         return false;
     }
+    void requestInitialize(juce::Component* origin) {
+        juce::Component::SafePointer<juce::Component> previous(origin);
+        const bool wasGrid=gridOpen;
+        showConfirmation("Initialize LSFX? All instruments and unsaved changes will be cleared.","Initialize",[this]{closePanel(&open);initializeInstance();},[this,previous,wasGrid]{
+            closePanel(&open);
+            if(wasGrid) {rebuildGrid();showGrid(true);}
+            if(auto* c=previous.getComponent();c&&c->isShowing()&&c->isEnabled()) focus(*c);
+            else if(wasGrid) focus(grid);
+        });
+    }
+    void initializeInstance() {
+        if(chooser) return;
+        pendingBrowserPreset=juce::File{};
+        announceLoaded=false; initialFocusPending=false; returnFromChooser=false;
+        stepIndex=0; lastGainChannel=0; lastRouteChannel=0;
+        lastSf2Row=rowGain; lastSfzRow=rowGain; shownCode=-1;
+        search.reset();
+        proc.initializeInstance();
+        if(gridOpen) showGrid(false,&open);
+        refresh(true);
+        focus(open);
+        announce("Initialized. All instruments cleared.");
+    }
     void showStatus() {
         const auto text=proc.getView().status+". "+proc.diagnostic();
         if(auto* current=juce::Component::getCurrentlyFocusedComponent(); current!=nullptr&&isParentOf(current)) speak(*current,text);
         else juce::AccessibilityHandler::postAnnouncement(text,juce::AccessibilityHandler::AnnouncementPriority::high);
     }
     void browse() {
-        if(chooser) return;
+        if(chooser||catalogBusy) return;
         initialFocusPending=false; returnFromChooser=false; announceLoaded=false;
         focus(open);
         auto start=cached.path.isNotEmpty()?juce::File(cached.path).getParentDirectory():juce::File{};
@@ -1714,9 +2056,70 @@ private:
             }
         });
     }
+    static juce::String number(int n) {return juce::String(n).paddedLeft('0',3);}
+    void browseImport(bool single) {
+        if(chooser||catalogBusy||cached.loading) return;
+        const int ch=selectedChannel(),code=proc.current(ch),destBank=bank.getSelectedId()>0?bank.getSelectedId()-1:code>>7,destProgram=program.getSelectedId()>0?program.getSelectedId()-1:code&127;
+        auto start=juce::File::getSpecialLocation(juce::File::userDocumentsDirectory);
+        const auto previous=setting("instrumentPath");
+        if(juce::File::isAbsolutePath(previous)&&juce::File(previous).getParentDirectory().isDirectory()) start=juce::File(previous).getParentDirectory();
+        chooser=std::make_unique<juce::FileChooser>(single?"Import SF2 or SFZ program":"Import SF2 bank",start,single?"*.sf2;*.sfz":"*.sf2",true);
+        juce::Component::SafePointer<Editor> safe(this);
+        chooser->launchAsync(juce::FileBrowserComponent::openMode|juce::FileBrowserComponent::canSelectFiles,[safe,single,ch,destBank,destProgram](const juce::FileChooser& fc){
+            const auto file=fc.getResult();
+            juce::MessageManager::callAsync([safe,single,ch,destBank,destProgram,file]{if(auto* e=safe.getComponent()) {
+                e->chooser.reset(); e->focus(single?static_cast<juce::Component&>(e->program):static_cast<juce::Component&>(e->bank));
+                if(file==juce::File{}) return;
+                rememberSetting("instrumentPath",file.getFullPathName());
+                if(single&&file.hasFileExtension("sfz")) {e->finishImport(e->proc.importSFZ(file,pack(destBank,destProgram),ch));return;}
+                if(!file.hasFileExtension("sf2;sf3")) {e->announce("Unsupported file format");return;}
+                e->scanImport(file,single,ch,destBank,destProgram);
+            }});
+        });
+    }
+    void finishImport(const juce::Result& result) {
+        if(result.failed()) {announce(result.getErrorMessage());return;}
+        refresh(true);announceLoaded=true;announce("Loading assignment");
+    }
+    void scanImport(juce::File file,bool single,int ch,int destBank,int destProgram) {
+        if(catalogThread.joinable()) catalogThread.join();
+        catalogBusy=true; announce("Reading SoundFont banks");
+        juce::Component::SafePointer<Editor> safe(this);
+        const auto startRevision=proc.getRevision();
+        catalogThread=std::thread([safe,file,single,ch,destBank,destProgram,startRevision]{
+            auto data=std::make_shared<CatalogResult>(inspectSF2(file));
+            juce::MessageManager::callAsync([safe,file,single,ch,destBank,destProgram,data,startRevision]{if(auto* e=safe.getComponent()) {
+                e->catalogBusy=false; if(e->catalogThread.joinable()) e->catalogThread.join(); e->refresh(true);
+                if(e->proc.getRevision()!=startRevision) {e->announce("Instrument changed; import cancelled");return;}
+                if(data->error.isNotEmpty()) {e->announce(data->error);return;}
+                e->chooseSourceBank(file,single,ch,destBank,destProgram,data);
+            }});
+        });
+    }
+    void chooseSourceBank(const juce::File& file,bool single,int ch,int destBank,int destProgram,std::shared_ptr<CatalogResult> data) {
+        juce::PopupMenu menu; int last=-1;
+        for(const auto& p:data->presets) if(p.bank!=last) {last=p.bank;menu.addItem(p.bank+1,"Bank "+number(p.bank)+", "+sourceName(p.path));}
+        juce::Component::SafePointer<Editor> safe(this);
+        const auto startRevision=proc.getRevision();
+        menu.showMenuAsync(juce::PopupMenu::Options().withTargetComponent(single?static_cast<juce::Component*>(&program):static_cast<juce::Component*>(&bank)),[safe,file,single,ch,destBank,destProgram,data,startRevision](int id){if(auto* e=safe.getComponent();e&&id>0) {
+            if(e->proc.getRevision()!=startRevision) {e->announce("Instrument changed; import cancelled");return;}
+            if(single) e->chooseSourceProgram(file,ch,destBank,destProgram,id-1,data);
+            else e->finishImport(e->proc.importSF2(file,destBank,-1,id-1,0,ch));
+        }});
+    }
+    void chooseSourceProgram(const juce::File& file,int ch,int destBank,int destProgram,int sourceBank,std::shared_ptr<CatalogResult> data) {
+        juce::PopupMenu menu;
+        for(const auto& p:data->presets) if(p.bank==sourceBank) menu.addItem(p.program+1,"Program "+number(p.program)+", "+p.name+", "+sourceName(p.path));
+        juce::Component::SafePointer<Editor> safe(this);
+        const auto startRevision=proc.getRevision();
+        menu.showMenuAsync(juce::PopupMenu::Options().withTargetComponent(&program),[safe,file,ch,destBank,destProgram,sourceBank,startRevision](int id){if(auto* e=safe.getComponent();e&&id>0) {if(e->proc.getRevision()!=startRevision) {e->announce("Instrument changed; import cancelled");return;} e->finishImport(e->proc.importSF2(file,destBank,destProgram,sourceBank,id-1,ch));}});
+    }
     void rebuildPrograms(int b,int p) {
         program.clear(juce::dontSendNotification);
-        for(const auto& item:cached.presets) if(item.bank==b) program.addItem(juce::String(item.program)+" - "+item.name,item.program+1);
+        for(int i=0;i<lsfx::programCount;++i) {
+            const auto* item=findPreset(cached.presets,pack(b,i));
+            program.addItem("Program "+number(i)+", "+(item?item->name+", "+sourceName(item->path):juce::String("Empty")),i+1);
+        }
         if(p>=0) program.setSelectedId(p+1,juce::dontSendNotification);
     }
     void apply() {
@@ -1733,33 +2136,37 @@ private:
         }
         if(announceLoaded&&!cached.loading&&!chooser&&!returnFromChooser) {
             announceLoaded=false;
-            if(open.hasKeyboardFocus(true)) speak(open,cached.status);
+            if(open.hasKeyboardFocus(true)) speak(open,cached.status); else if(program.hasKeyboardFocus(true)) speak(program,cached.status); else if(bank.hasKeyboardFocus(true)) speak(bank,cached.status);
         }
         if(channel.getSelectedId()!=proc.uiChannel()+1&&!channel.isPopupActive()) {channel.setSelectedId(proc.uiChannel()+1,juce::dontSendNotification);shownCode=-1;}
-        const int code=proc.current(selectedChannel());
+        const int code=proc.current(selectedChannel()); const int previousCode=shownCode;
         if(force||changed||code!=shownCode) {
             if(!force&&!changed&&(bank.isPopupActive()||program.isPopupActive())) return;
             updating=true;
-            if(changed||force) {
-                bank.clear(juce::dontSendNotification); int last=-1;
-                for(const auto& p:cached.presets) if(p.bank!=last) {bank.addItem("Bank "+juce::String(p.bank),p.bank+1);last=p.bank;}
+            if(changed||force||(code>>7)>lsfx::percussionBank) {
+                bank.clear(juce::dontSendNotification);
+                std::map<int,juce::StringArray> names;
+                for(int i=0;i<=lsfx::percussionBank;++i) names[i];
+                for(const auto& p:cached.presets) names[p.bank].addIfNotAlreadyThere(sourceName(p.path));
+                names[code>>7]; // retain existing extended MIDI bank addresses
+                for(const auto& item:names) bank.addItem("Bank "+number(item.first)+", "+(item.second.isEmpty()?juce::String("Empty"):item.second.joinIntoString(", ")),item.first+1);
             }
             bank.setSelectedId((code>>7)+1,juce::dontSendNotification); rebuildPrograms(code>>7,code&127); shownCode=code;
             updating=false;
         }
-        routingLabel.setText(!sf2MultiOutput&&!cached.isSfz?"Stereo output routing - stored only for SF2 (Main 1/2) - Alt+R":"Stereo output routing - Alt+R",juce::dontSendNotification);
-        if(changed) for(auto& c:routeLevels) c.updateText();
-        const bool ready=cached.ready&&!cached.loading&&!cached.presets.empty(); bank.setEnabled(ready);program.setEnabled(ready);channel.setEnabled(!cached.isSfz&&!cached.loading);
+        routingLabel.setText(!sf2MultiOutput?"Stereo output routing - SFZ active, SF2 Main 1/2 only - Alt+R":"Stereo output routing - Alt+R",juce::dontSendNotification);
+        if(changed||force||code!=previousCode) for(auto& c:routeLevels) c.updateText();
+        const bool ready=!cached.loading&&!catalogBusy; bank.setEnabled(ready);program.setEnabled(ready);channel.setEnabled(!cached.loading);
         if(!dragging) { const auto gain=proc.gainParameter().get(); if(std::abs(level.getValue()-gain)>0.000001) level.setValue(gain,juce::dontSendNotification); const auto text=juce::String(gain,1)+" dB"; if(levelReadout.getText()!=text) levelReadout.setText(text,juce::dontSendNotification); }
         for(int ch=0;ch<channels;++ch) {
             auto& c=channelLevels[ch];
-            const bool enabled=!cached.isSfz||ch==0;
+            const bool enabled=true;
             if(c.isEnabled()!=enabled) c.setEnabled(enabled);
             auto& routing=routeLevels[ch]; if(routing.isEnabled()!=enabled) routing.setEnabled(enabled);
             if(!routeDragging[ch]&&routing.getValue()!=proc.routeParameter(ch).getIndex()) {routing.setValue(proc.routeParameter(ch).getIndex(),juce::dontSendNotification);repaint();}
             if(!channelDragging[ch]) {const auto v=proc.channelGainParameter(ch).get(); if(std::abs(c.getValue()-v)>0.000001) {c.setValue(v,juce::dontSendNotification);repaint();}}
         }
-        if(gridOpen) {if(changed) rebuildGrid(); else refreshGridValues();}
+        if(gridOpen) {if(changed||code!=gridShownCode) {gridShownCode=code;rebuildGrid();} else refreshGridValues();}
     }
     void timerCallback() override {if(returnFromChooser&&juce::Time::getMillisecondCounter()-chooserReturnedAt>2000u) returnFromChooser=false; refresh(false); maybePromptMissing(); if(panelMode==Panel::none&&(initialFocusPending||returnFromChooser)&&isShowing()&&getPeer()!=nullptr&&getPeer()->isFocused()) scheduleInitialFocus();}
 };

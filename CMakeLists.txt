@@ -62,3 +62,28 @@ target_link_libraries(LSFXFluidSmoke PRIVATE FluidSynth::libfluidsynth)
 if(WIN32)
     target_compile_definitions(LSFXFluidSmoke PRIVATE NOMINMAX)
 endif()
+
+add_executable(LSFXFluidMapSmoke Tests/FluidMapSmoke.cpp)
+target_link_libraries(LSFXFluidMapSmoke PRIVATE FluidSynth::libfluidsynth)
+add_executable(LSFXVirtualProgramMapTest Tests/VirtualProgramMapTest.cpp)
+if(WIN32)
+    target_compile_definitions(LSFXFluidMapSmoke PRIVATE NOMINMAX)
+endif()
+# Keep the assertion checks active in Release CI.
+if(MSVC)
+    target_compile_options(LSFXVirtualProgramMapTest PRIVATE /UNDEBUG)
+else()
+    target_compile_options(LSFXVirtualProgramMapTest PRIVATE -UNDEBUG)
+endif()
+
+# Compile the same processor implementation into a separate console process.
+# This exercises mixed playback/state without risking a DAW session.
+juce_add_console_app(LSFXHybridSmoke PRODUCT_NAME "LSFXHybridSmoke")
+juce_generate_juce_header(LSFXHybridSmoke)
+target_sources(LSFXHybridSmoke PRIVATE Tests/HybridProcessorSmoke.cpp)
+target_compile_definitions(LSFXHybridSmoke PRIVATE JUCE_WEB_BROWSER=0 JUCE_USE_CURL=0 JUCE_VST3_CAN_REPLACE_VST2=0 JUCE_VST3_EMULATE_MIDI_CC_WITH_PARAMETERS=1)
+target_link_libraries(LSFXHybridSmoke PRIVATE sfizz::static FluidSynth::libfluidsynth juce::juce_audio_utils juce::juce_gui_basics juce::juce_recommended_config_flags)
+if(WIN32)
+    target_compile_definitions(LSFXHybridSmoke PRIVATE NOMINMAX)
+    target_link_libraries(LSFXHybridSmoke PRIVATE Uiautomationcore OleAut32)
+endif()

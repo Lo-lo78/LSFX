@@ -1,0 +1,35 @@
+#include "../Source/VirtualProgramMap.h"
+#include <cassert>
+#include <string>
+struct P {int bank,program,sourceBank,sourceProgram;std::string source;};
+int main() {
+    using namespace lsfx;
+    static_assert(melodicBankCount==128&&programCount==128&&percussionBank==128);
+    static_assert(validAddress(128,127)&&!validAddress(0,128)&&!validAddress(-1,0));
+    std::map<int,P> map;
+    std::vector<P> a{{0,0,0,0,"A"},{0,3,0,3,"A"},{128,0,128,0,"A"}};
+    std::vector<P> b{{4,10,4,10,"B"},{4,20,4,20,"B"}};
+    for(auto p:a) assignProgram(map,p,p.bank,p.program);
+    assignProgram(map,b[0],0,3);
+    assert(map.at(address(0,3)).source=="B"&&map.at(address(0,3)).sourceProgram==10);
+    assert(map.at(address(0,0)).source=="A"&&map.at(address(128,0)).source=="A");
+    assert(replaceBank(map,b,0,4));
+    assert(map.count(address(0,0))==0&&map.count(address(0,3))==0);
+    assert(map.at(address(0,10)).sourceBank==4&&map.at(address(0,20)).source=="B");
+    assert(map.at(address(128,0)).source=="A");
+    assert(!replaceBank(map,b,0,99)&&map.size()==3);
+    assignProgram(map,a[0],127,127);
+    assert(map.at(address(127,127)).sourceProgram==0);
+    P sfz{0,0,0,0,"Piano.sfz"};
+    assignProgram(map,sfz,0,10);
+    assignProgram(map,P{0,0,0,0,"Bass.sfz"},1,3);
+    assert(map.at(address(0,10)).source=="Piano.sfz");
+    assert(map.at(address(0,20)).source=="B");
+    assert(map.at(address(1,3)).source=="Bass.sfz");
+    assignProgram(map,b[0],0,10);
+    assert(map.at(address(0,10)).source=="B");
+    assert(replaceBank(map,b,1,4));
+    assert(map.count(address(1,3))==0);
+    assert(map.at(address(1,10)).source=="B");
+    assert(map.at(address(128,0)).source=="A");
+}
