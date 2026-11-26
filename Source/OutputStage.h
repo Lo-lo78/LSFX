@@ -19,12 +19,31 @@ struct OutputStage {
         if(a<=0.90f) return x;
         return std::copysign(0.90f+0.099f*(1.0f-0.099f/(0.099f+a-0.90f)),x);
     }
-    void process(float& l,float& r,float gain,float trim) noexcept {
+    // SF2 uses unity engine gain and one transparent master fader. Keep the
+    // LJuno attack/release/ratio and soft knee as an explicit artistic option,
+    // but remove the historical fixed gain factors from this path.
+    // IDs 0/1 retain their names; reference is appended at index 2.
+    void processSoundFont(float& l,float& r,float gain,float trim,int mode) noexcept {
+        l=std::isfinite(l)?l*trim:0.0f; r=std::isfinite(r)?r*trim:0.0f;
+        if(mode==0) {
+            const float detector=(std::max)(std::abs(l),std::abs(r));
+            envelope+=(detector-envelope)*(envelope<detector?attack:release);
+            // Translate the LJuno threshold from its old 0.2 engine scale
+            // to unity. The quiet-signal slope is 1, not an extra gain stage.
+            constexpr float threshold=0.275f;
+            const float scale=envelope>threshold?(threshold+(envelope-threshold)*0.5f)/envelope:1.0f;
+            l=limit(l*scale); r=limit(r*scale);
+        } else envelope=0.0f;
+        l*=gain; r*=gain;
+        if(mode!=2) { l=ceiling(l); r=ceiling(r); }
+        else { if(!std::isfinite(l)) l=0.0f; if(!std::isfinite(r)) r=0.0f; }
+    }
+    void process(float& l,float& r,float gain,float trim,bool linear=false) noexcept {
         l=std::isfinite(l)?l*trim:0; r=std::isfinite(r)?r*trim:0;
         const float detector=std::sqrt((std::max)(l*l,r*r)+0.000000000001f);
         envelope+=(detector-envelope)*(envelope<detector?attack:release);
-        const float scale=0.4f*(envelope>0.055f?(0.055f+(envelope-0.055f)*0.5f)/envelope:1.0f);
-        l=ceiling(limit(l*scale)*gain*4.0f); r=ceiling(limit(r*scale)*gain*4.0f);
+        const float scale=0.4f*(!linear&&envelope>0.055f?(0.055f+(envelope-0.055f)*0.5f)/envelope:1.0f);
+        l=ceiling((linear?l*scale:limit(l*scale))*gain*4.0f); r=ceiling((linear?r*scale:limit(r*scale))*gain*4.0f);
     }
 };
 // Allocation only during loading. Reset is O(1), stale samples are inaccessible.

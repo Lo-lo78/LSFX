@@ -8,7 +8,7 @@ namespace lsfx {
 // The caller owns effect state. GS/XG parameters are translated, not emulated bit-for-bit.
 enum class MidiFx { reset, reverbType, chorusType, reverbLevel, reverbTime, reverbFeedback,
                     chorusLevel, chorusRate, chorusDepth, chorusFeedback, delayLevel,
-                    delayTime, delayFeedback, delayMode, reverbEnable, chorusEnable, send, masterVolume };
+                    delayTime, delayFeedback, delayMode, reverbEnable, chorusEnable, send, masterVolume, partVolume };
 inline int percent(int v) { return (v*100+63)/127; }
 inline int feedback(int v) { return (v*85+63)/127; }
 inline int gsDelayMs(int v) {
@@ -65,9 +65,10 @@ template<class Emit> bool decodeMidiEffects(const std::uint8_t* d,int n,Emit&& e
                 default: break;
             }
             // GS default part order: part 0 is MIDI channel 10; 1..9 are ch1..9.
-            else if((mid&0x70)==0x10 && (addr==0x21||addr==0x22)) {
+            else if((mid&0x70)==0x10 && (addr==0x19||addr==0x21||addr==0x22)) {
                 const int part=mid&15, ch=part==0?9:part<=9?part-1:part;
-                put(MidiFx::send,v,ch,addr==0x21?93:91);
+                if(addr==0x19) put(MidiFx::partVolume,v,ch,7);
+                else put(MidiFx::send,v,ch,addr==0x21?93:91);
             }
         }
     } else if(n>=8 && d[1]==0x43 && (d[2]&0x70)==0x10 && d[3]==0x4c) {
@@ -87,7 +88,8 @@ template<class Emit> bool decodeMidiEffects(const std::uint8_t* d,int n,Emit&& e
                 }
             } else if(addr==0x0c) put(MidiFx::reverbLevel,percent(v));
             else if(addr==0x2c) put(MidiFx::chorusLevel,percent(v));
-        } else if(high==8 && mid<16 && (addr==0x12||addr==0x13)) put(MidiFx::send,v,mid,addr==0x12?93:91);
+        } else if(high==8 && mid<16 && addr==0x0b) put(MidiFx::partVolume,v,mid,7);
+        else if(high==8 && mid<16 && (addr==0x12||addr==0x13)) put(MidiFx::send,v,mid,addr==0x12?93:91);
     }
     return handled;
 }
