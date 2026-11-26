@@ -20,3 +20,22 @@ else()
     file(WRITE "${path}" "${patched}")
     message(STATUS "Patched duplicate sfizz cxxopts alias")
 endif()
+
+# The Windows vcpkg static-md triplet and JUCE use the DLL CRT (/MD).
+# sfizz 1.2.3 overrides the inherited setting to /MT in SfizzConfig.
+# Patch the pinned source before any of its targets or vendor dependencies exist.
+set(config "${SFIZZ_SOURCE_DIR}/cmake/SfizzConfig.cmake")
+file(READ "${config}" original_config)
+set(old_crt [=[set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")]=])
+set(new_crt [=[set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL")]=])
+string(FIND "${original_config}" "${old_crt}" old_pos)
+string(FIND "${original_config}" "${new_crt}" new_pos)
+if(NOT old_pos EQUAL -1)
+    string(REPLACE "${old_crt}" "${new_crt}" patched_config "${original_config}")
+    file(WRITE "${config}" "${patched_config}")
+    message(STATUS "Patched sfizz MSVC runtime to dynamic CRT (/MD, /MDd)")
+elseif(NOT new_pos EQUAL -1)
+    message(STATUS "sfizz MSVC runtime patch already applied")
+else()
+    message(FATAL_ERROR "Unexpected sfizz MSVC runtime declaration; inspect pinned dependency")
+endif()

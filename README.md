@@ -1,8 +1,8 @@
-# LSFX 0.0.1 TEST3
+# LSFX 0.0.1 TEST4
 Experimental accessible VST3 instrument for REAPER. SF2 uses FluidSynth; SFZ uses sfizz 1.2.3. One file per instance, no conversion. SF2 supports 16 MIDI channels; SFZ currently accepts channel 1 only. SF3 is not a target. The existing plugin identifier and XML state tag are retained for TEST1 project compatibility; remove the old VST3 bundle before installing LSFX.
 
 Open SF2 or SFZ using the existing editor. SFZ samples must remain in their original relative locations. Bank and Program controls apply only to SF2. In REAPER's generic parameter UI, SF2 interpolation is Linear / Fourth order (default) / Seventh order; SF2 effects are Off (default) / Reverb / Chorus / Both. These settings and the instrument path persist in state. Existing TEST1 states without the new fields use the lighter defaults. SFZ uses 128 voices, SF2 256; no redesign of editor yet. SF2 dry idle bypass waits for inactive voices and at least 256 samples of rendering before skipping. Effects enabled: no idle bypass so tails remain intact. CPU improvement is not measured yet.
 
-Build: push to main and download TEST3 Windows x64 artifact from Actions. The workflow uses JUCE, FluidSynth via vcpkg and recursively fetched sfizz sources. See TESTING.md and THIRD_PARTY.md. Experimental build, not verified on Windows in the authoring environment.
+Build: push to main and download TEST4 Windows x64 artifact from Actions. The workflow uses JUCE, FluidSynth via vcpkg and recursively fetched sfizz sources. See TESTING.md and THIRD_PARTY.md. Experimental build, not verified on Windows in the authoring environment.
 
-TEST3: applies an idempotent CMake patch to sfizz 1.2.3 before configuration to prevent duplicate cxxopts alias declarations. DSP and editor behavior are unchanged from TEST2.
+TEST4: retains the TEST3 duplicate cxxopts alias fix and patches the pinned sfizz MSVC runtime to /MD (and /MDd in Debug), matching JUCE and vcpkg static-md. Also normalizes nested sfizz targets and saves build logs even on failure. DSP and editor behavior are unchanged from TEST2.

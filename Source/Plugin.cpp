@@ -285,7 +285,7 @@ class Editor final : public juce::AudioProcessorEditor, private juce::Timer {
 public:
     explicit Editor(Processor& p) : AudioProcessorEditor(p), proc(p) {
         setWantsKeyboardFocus(true);
-        title.setText("LSFX 0.0.1 TEST3",juce::dontSendNotification); title.setFont(juce::FontOptions(21.0f)); addAndMakeVisible(title);
+        title.setText("LSFX 0.0.1 TEST4",juce::dontSendNotification); title.setFont(juce::FontOptions(21.0f)); addAndMakeVisible(title);
         status.setText("No SoundFont loaded",juce::dontSendNotification); status.setTitle("SoundFont status"); addAndMakeVisible(status);
         setup(open,"Open SF2 or SFZ",1); setup(channel,"MIDI channel",2); setup(bank,"Bank",3); setup(program,"Program",4); setup(level,"Output gain",5); setup(stop,"Panic - all sounds off",6); setup(readStatus,"Read status",7);
         channelLabel.setText("MIDI channel",juce::dontSendNotification); bankLabel.setText("Bank",juce::dontSendNotification); programLabel.setText("Program",juce::dontSendNotification); levelLabel.setText("Output gain (dB)",juce::dontSendNotification);

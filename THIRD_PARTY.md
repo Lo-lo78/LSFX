@@ -10,4 +10,4 @@ TEST1 uses static linkage with the dynamic Microsoft CRT (x64-windows-static-md)
 
 TEST2 adds sfizz 1.2.3 (BSD-2-Clause), https://github.com/sfztools/sfizz/tree/1.2.3, plus its bundled dependencies. Review their licenses and include required notices before public distribution. The workflow includes the sfizz top-level license; this alone is not a complete compliance review.
 
-TEST3 applies cmake/PatchSfizz.cmake to the pinned sfizz dependency to guard duplicate cxxopts alias declarations.
+TEST3 guards duplicate cxxopts alias declarations in the pinned sfizz dependency. TEST4 additionally patches SfizzConfig.cmake to use the dynamic Microsoft CRT and normalizes the runtime property across sfizz and bundled targets. Static library linkage is retained.
