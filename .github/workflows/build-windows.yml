@@ -24,17 +24,15 @@ jobs:
         run: |
           $root = $env:VCPKG_INSTALLATION_ROOT
           if (-not $root) { throw 'VCPKG_INSTALLATION_ROOT is not set on the runner' }
-          & "$root/vcpkg.exe" install 'fluidsynth[sndfile]:x64-windows-static-md' --classic 2>&1 | Tee-Object -FilePath logs/vcpkg.txt
+          $overlay = Join-Path $PWD.Path 'build-vcpkg-overlay'
+          python Tools/PrepareFluidSynthOverlay.py "$root" "$overlay" 2>&1 | Tee-Object -FilePath logs/fluid-overlay.txt
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & "$root/vcpkg.exe" install 'fluidsynth[sndfile]:x64-windows-static-md' --classic "--overlay-ports=$overlay" 2>&1 | Tee-Object -FilePath logs/vcpkg.txt
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Configure
         shell: pwsh
         run: |
           cmake -S . -B build -G 'Visual Studio 17 2022' -A x64 "-DCMAKE_TOOLCHAIN_FILE=$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake" -DVCPKG_TARGET_TRIPLET=x64-windows-static-md -DVCPKG_MANIFEST_MODE=OFF "-DLSFX_EXPERIMENTAL_SF2_MULTIGROUP=${{ (github.event_name != 'workflow_dispatch' || inputs.experimental_sf2_multigroup) && 'ON' || 'OFF' }}" 2>&1 | Tee-Object -FilePath logs/configure.txt
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-      - name: Build VST3
-        shell: pwsh
-        run: |
-          cmake --build build --config Release --target LSFX_VST3 --parallel 2 2>&1 | Tee-Object -FilePath logs/build.txt
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Build native FluidSynth smoke test
         shell: pwsh
@@ -70,6 +68,11 @@ jobs:
         run: |
           & ./build/Release/LSFXFluidSmoke.exe build/smoke.sf2 multi 2>&1 | Tee-Object -FilePath logs/fluid-multi-smoke.txt
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Build VST3
+        shell: pwsh
+        run: |
+          cmake --build build --config Release --target LSFX_VST3 --parallel 2 2>&1 | Tee-Object -FilePath logs/build.txt
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Build and test the hybrid LSFX processor outside REAPER
         timeout-minutes: 20
         shell: pwsh
@@ -80,7 +83,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           & ./build/LSFXHybridSmoke_artefacts/Release/LSFXHybridSmoke.exe build/smoke.sf2 build/sfz-one.sfz build/sfz-two.sfz 2>&1 | Tee-Object -FilePath logs/hybrid-smoke.txt
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-      - name: Package TEST26
+      - name: Package TEST26.1
         shell: pwsh
         run: |
           Start-Transcript -Path logs/package.txt -Force | Out-Null
@@ -90,6 +93,7 @@ jobs:
             New-Item -ItemType Directory -Force package,package/ThirdParty | Out-Null
             Copy-Item -Recurse $bundle package/
             Copy-Item README.md,THIRD_PARTY.md,TESTING.md package/
+            Copy-Item Tools/fluidsynth-vla-size.patch package/ThirdParty/
             Copy-Item Doc/LJuno-116-LICENSE.md package/ThirdParty/LJuno-116-LICENSE.md
             Copy-Item build/_deps/juce-src/LICENSE.md package/ThirdParty/JUCE-LICENSE.md
             Copy-Item build/_deps/sfizz-src/LICENSE package/ThirdParty/sfizz-LICENSE.txt
@@ -101,7 +105,7 @@ jobs:
             & "$root/vcpkg.exe" list | Out-File -Encoding utf8 package/ThirdParty/vcpkg-versions.txt
             git -C $root rev-parse HEAD | Out-File -Encoding utf8 package/ThirdParty/vcpkg-commit.txt
             git rev-parse HEAD | Out-File -Encoding utf8 package/source-commit.txt
-            Compress-Archive -Path package/* -DestinationPath LSFX.0.0.1.TEST26${{ (github.event_name == 'workflow_dispatch' && !inputs.experimental_sf2_multigroup) && '-SF2-stereo' || '' }}.Windows.x64.VST3.zip -Force
+            Compress-Archive -Path package/* -DestinationPath LSFX.0.0.1.TEST26.1${{ (github.event_name == 'workflow_dispatch' && !inputs.experimental_sf2_multigroup) && '-SF2-stereo' || '' }}.Windows.x64.VST3.zip -Force
           } catch {
             $_ | Out-String | Add-Content -Path logs/package-error.txt
             throw
@@ -110,13 +114,13 @@ jobs:
           }
       - uses: actions/upload-artifact@v4
         with:
-          name: LSFX-0.0.1-TEST26${{ (github.event_name == 'workflow_dispatch' && !inputs.experimental_sf2_multigroup) && '-SF2-stereo' || '' }}-Windows-x64
-          path: LSFX.0.0.1.TEST26${{ (github.event_name == 'workflow_dispatch' && !inputs.experimental_sf2_multigroup) && '-SF2-stereo' || '' }}.Windows.x64.VST3.zip
+          name: LSFX-0.0.1-TEST26.1${{ (github.event_name == 'workflow_dispatch' && !inputs.experimental_sf2_multigroup) && '-SF2-stereo' || '' }}-Windows-x64
+          path: LSFX.0.0.1.TEST26.1${{ (github.event_name == 'workflow_dispatch' && !inputs.experimental_sf2_multigroup) && '-SF2-stereo' || '' }}.Windows.x64.VST3.zip
           if-no-files-found: error
       - name: Upload build logs (also on failure)
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: LSFX-TEST26-build-logs
+          name: LSFX-TEST26.1-build-logs
           path: logs/*.txt
           if-no-files-found: warn

@@ -1,4 +1,6 @@
-# TEST26 — current acceptance checks
+# TEST26.1 — current acceptance checks
+
+TEST26 compiled successfully on Windows, but the standalone FluidSynth 2.6.2 multigroup smoke test stopped at the first silent rendering. TEST26.1 patches the non-VLA allocation macro in the vcpkg dependency. Verify fluid-overlay.txt and vcpkg.txt show the overlay/patch, then confirm all stereo, multigroup and hybrid smoke tests pass. The exact crash stack was not available; the allocation defect is confirmed by source inspection, not by a Windows debugger.
 
 1. Use a disposable REAPER project with a single LSFX instance. The normal TEST26 has SF2 multigroup enabled; older TEST25 normal builds were stereo-only for SF2. Verify GitHub `fluid-multi-smoke.txt` and `hybrid-smoke.txt` passed before installing. Previous Windows crashes on SF2 load are not yet diagnosed; if a crash recurs, report whether it is before Loaded or first note and the Windows Event Viewer faulting module/exception code. Manual workflow with multigroup unchecked produces the recovery package.
 2. Load an SF2, press Alt+L and search Compressor. Six controls must appear for the selected channel; set Mix 100%, threshold -60 dB, gain 0, then compare with Mix 0%. Change MIDI channel and check its compressor is independent. Test routing from Main to 3/4 and 5/6 (enable pins/tracks in REAPER), shared destinations, all pairs up to 33/34, no duplicated Main, and return to Main. Repeat with SFZ and hybrid map. Native wet tails already generated before changing route may decay on Main.

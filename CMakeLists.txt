@@ -89,7 +89,7 @@ if(WIN32)
     target_link_libraries(LSFXHybridSmoke PRIVATE Uiautomationcore OleAut32)
 endif()
 
-# TEST26 defaults to multigroup; configure OFF for the stereo recovery build.
+# TEST26.1 defaults to multigroup; configure OFF for the stereo recovery build.
 if(LSFX_EXPERIMENTAL_SF2_MULTIGROUP)
     target_compile_definitions(LSFX PRIVATE LSFX_EXPERIMENTAL_SF2_MULTIGROUP=1)
     target_compile_definitions(LSFXHybridSmoke PRIVATE LSFX_EXPERIMENTAL_SF2_MULTIGROUP=1)

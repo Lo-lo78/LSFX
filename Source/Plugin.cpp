@@ -38,7 +38,7 @@ bool insideLibrary(const juce::File& f) { const auto root=presetRoot(); return f
 juce::File savedDirectory() { const auto path=setting("saveDirectory"); if(juce::File::isAbsolutePath(path)) { juce::File f(path); if(insideLibrary(f)&&f.isDirectory()) return f; } return presetRoot(); }
 
 constexpr int stereoBuses=17, renderChunk=1024;
-// TEST26: multigroup is the default validation build. The stereo-only
+// TEST26.1: multigroup is the default validation build. The stereo-only
 // recovery build remains selectable at configure time. Windows host stability
 // is not established by the standalone tests.
 #ifndef LSFX_EXPERIMENTAL_SF2_MULTIGROUP
@@ -1313,7 +1313,7 @@ public:
     explicit Editor(Processor& p) : AudioProcessorEditor(p), proc(p) {
         setWantsKeyboardFocus(true);
         setFocusContainerType(juce::Component::FocusContainerType::keyboardFocusContainer);
-        title.setText(sf2MultiOutput?"LSFX 0.0.1 TEST26":"LSFX 0.0.1 TEST26 SF2 stereo recovery",juce::dontSendNotification); title.setFont(juce::FontOptions(21.0f)); title.setAccessible(false); addAndMakeVisible(title);
+        title.setText(sf2MultiOutput?"LSFX 0.0.1 TEST26.1":"LSFX 0.0.1 TEST26.1 SF2 stereo recovery",juce::dontSendNotification); title.setFont(juce::FontOptions(21.0f)); title.setAccessible(false); addAndMakeVisible(title);
         status.setText("No SoundFont loaded",juce::dontSendNotification); status.setTitle("Instrument status"); addAndMakeVisible(status);
         setup(open,"Open SF2 or SFZ",1); setup(parameters,"Parameters",2); setup(channel,"MIDI channel",3); setup(bank,"Bank",37); setup(program,"Program",38); setup(level,"Master output gain",36);
         setup(grid,"Parameter grid",1); setup(value,"Parameter value",2); setup(closeGrid,"Close parameters",3);

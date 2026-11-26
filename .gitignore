@@ -9,3 +9,5 @@
 *.SF3
 *.vst3
 *.zip
+
+/build-vcpkg-overlay/

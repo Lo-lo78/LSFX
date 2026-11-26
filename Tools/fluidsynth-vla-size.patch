@@ -1,0 +1,10 @@
+diff --git a/src/utils/fluidsynth_priv.h b/src/utils/fluidsynth_priv.h
+--- a/src/utils/fluidsynth_priv.h
++++ b/src/utils/fluidsynth_priv.h
+@@ -66,5 +66,5 @@
+ #    define alloca _alloca
+ #  endif
+ #  define FLUID_DECLARE_VLA(_type, _name, _len) \
+-     _type *_name = (_type *)alloca(_len * sizeof(_type))
++     _type *_name = (_type *)alloca((_len) * sizeof(_type))
+ #endif

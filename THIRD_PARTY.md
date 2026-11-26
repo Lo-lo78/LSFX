@@ -19,3 +19,7 @@ TEST9 reuses the incremental parameter search and search-key mapping from the us
 TEST19 also copies the LJuno-116 PresetBrowserMemory.h helper (AGPL-3.0-or-later) and adapts its folder browser workflow. See Doc/LJuno-116-LICENSE.md.
 
 TEST25 adapts the LJuno-116 0.99.67 stereo compressor detector and control ranges (see Doc/LJuno-116-LICENSE.md), with independent channel states and a zero-mix default.
+
+## FluidSynth 2.6.2 Windows patch (TEST26.1)
+
+Upstream source: https://github.com/FluidSynth/fluidsynth/tree/v2.6.2 (LGPL-2.1-or-later). LSFX applies `Tools/fluidsynth-vla-size.patch` using a vcpkg overlay; the patch is included in the Windows distribution. It parenthesizes the length expression of the non-VLA fallback in `src/utils/fluidsynth_priv.h`, preventing an undersized stack allocation for compound expressions. No other dependency source changes are introduced by this patch.

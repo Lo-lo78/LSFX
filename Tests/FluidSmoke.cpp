@@ -71,7 +71,10 @@ void run(const char* path, bool multi, double rate) {
         require(fluid_synth_set_chorus_group_speed(sy,-1,.36)==FLUID_OK,"chorus speed");
         require(fluid_synth_set_chorus_group_depth(sy,-1,3.6)==FLUID_OK,"chorus depth");
         stage("first silent rendering");
-        for(int n:{1,63,64,65,127,512,1024,2049}) render(n);
+        for(int n:{1,63,64,65,127,512,1024,2049}) {
+            std::cout << "  silent frames=" << n << std::endl;
+            render(n);
+        }
         stage("MIDI notes and rendering");
         for(int ch=0;ch<channels;++ch) {
             require(fluid_synth_cc(sy,ch,91,40)==FLUID_OK,"CC91");
