@@ -29,7 +29,7 @@ constexpr FXSpec fxSpecs[] = {
     {"reverbType","Reverb type",0,7,2,""}, {"reverbLevel","Reverb level",0,100,70," %"}, {"reverbTime","Reverb time scale",0,100,50," %"}, {"reverbDamp","Reverb damping",0,100,30," %"}, {"reverbWidth","Reverb width",0,100,80," %"},
     {"chorusType","Chorus type",0,7,1,""}, {"chorusLevel","Chorus level",0,100,55," %"}, {"chorusRate","Chorus rate",10,500,36," x 0.01 Hz"}, {"chorusDepth","Chorus depth scale",0,100,45," %"}, {"chorusFeedback","Chorus feedback",0,85,25," %"},
     {"delayMode","Delay mode",0,1,0,""}, {"delayTime","Delay time",1,1000,250," ms"}, {"delayFeedback","Delay feedback",0,85,30," %"}, {"delayMix","Delay level",0,100,0," %"}, {"inputTrim","Output stage input trim",0,24,0," dB"},
-    {"drumTrim","SF2 channel 10 trim",-12,12,0," dB"}, {"sf2Dynamics","SF2 master dynamics",0,2,2,""},
+    {"drumTrim","Legacy channel 10 trim (inactive)",-12,12,0," dB"}, {"sf2Dynamics","SF2 master dynamics",0,2,2,""},
     {"sf2Ambience","SF2 initial ambience",0,1,0,""}
 };
 static_assert(sizeof(fxSpecs)/sizeof(fxSpecs[0])==fxCount);
@@ -80,16 +80,12 @@ struct Engine {
     float midiMaster=1.0f;
     FXValues lastFx{};
     lsfx::OutputStage output;
-    // Separate dry channel 10; native sends remain untouched. Fixed scratch storage.
-    std::array<float,1024> drumLeft{},drumRight{};
-    juce::SmoothedValue<float,juce::ValueSmoothingTypes::Linear> drumGain;
-    bool drumGainReady=false;
     // Ambience defaults apply only to channels without an explicit CC91.
     std::array<bool,channels> reverbSendExplicit{};
-    int ambienceApplied=-1;
+    int ambienceApplied=0;
     lsfx::StereoDelay reverbDelay, modulation, delay;
     juce::Reverb sfzReverb;
-    void prepareFX() { lastFx.fill(-1); output.prepare(rate); drumGain.reset(rate,0.01); drumGainReady=false; reverbDelay.prepare(rate); modulation.prepare(rate); delay.prepare(rate); sfzReverb.setSampleRate(rate); }
+    void prepareFX() { lastFx.fill(-1); output.prepare(rate); reverbDelay.prepare(rate); modulation.prepare(rate); delay.prepare(rate); sfzReverb.setSampleRate(rate); }
     void resetFX() { output.reset(); reverbDelay.reset(); modulation.reset(); delay.reset(); sfzReverb.reset(); quietSamples=0; }
 
     int sfzDefaultQuality=0, sfzAppliedQuality=-1;
@@ -260,28 +256,12 @@ public:
         float rawPeak=0, wetPeak=0;
         auto render = [&](int start,int count) {
             if(count<=0) return;
-            // One synth and one shared FX bus. Only the channel-10 dry pair is split.
-            // The other 15 channels and native FX accumulate directly in the host buffer.
-            const float target=juce::Decibels::decibelsToGain(float(f[drumTrim]));
-            if(!engine->drumGainReady) { engine->drumGain.setCurrentAndTargetValue(target); engine->drumGainReady=true; }
-            else engine->drumGain.setTargetValue(target);
-            for(int offset=0;offset<count;) {
-                const int n=juce::jmin(1024,count-offset);
-                auto* l=b.getWritePointer(0,start+offset); auto* r=b.getWritePointer(1,start+offset);
-                if(!engine->drumGain.isSmoothing()&&engine->drumGain.getCurrentValue()==1.0f) {
-                    float* mix[]={l,r};
-                    fluid_synth_process(s,n,2,mix,2,mix);
-                } else {
-                    auto* dl=engine->drumLeft.data(); auto* dr=engine->drumRight.data();
-                    juce::FloatVectorOperations::clear(dl,n); juce::FloatVectorOperations::clear(dr,n);
-                    std::array<float*,channels*2> out{};
-                    for(int ch=0;ch<channels;++ch) { out[2*ch]=ch==9?dl:l; out[2*ch+1]=ch==9?dr:r; }
-                    float* wet[]={l,r};
-                    fluid_synth_process(s,n,2,wet,static_cast<int>(out.size()),out.data());
-                    if(engine->drumGain.isSmoothing()) for(int i=0;i<n;++i) { const float g=engine->drumGain.getNextValue(); l[i]+=dl[i]*g; r[i]+=dr[i]*g; }
-                    else { const float g=engine->drumGain.getCurrentValue(); juce::FloatVectorOperations::addWithMultiply(l,dl,g,n); juce::FloatVectorOperations::addWithMultiply(r,dr,g,n); }
-                }
-                offset+=n;
+            // TEST14: use the original TEST11 single-stereo render path.
+            // All sixteen MIDI channels and the native FX are mixed by FluidSynth.
+            // No per-channel gain compensation or aliased multi-output arrays.
+            if(fluid_synth_write_float(s,count,b.getWritePointer(0,start),0,1,b.getWritePointer(1,start),0,1)!=FLUID_OK) {
+                b.clear(0,start,count); b.clear(1,start,count);
+                return;
             }
             rawPeak=juce::jmax(rawPeak,juce::jmax(b.getMagnitude(0,start,count),b.getMagnitude(1,start,count)));
             wetPeak=juce::jmax(wetPeak,processMaster(*engine,b,f,fx,start,count));
@@ -350,7 +330,7 @@ public:
     void getStateInformation(juce::MemoryBlock& dest) override {
         juce::String path; Programs p; Controls c; stateForSave(path,p,&c);
         juce::XmlElement x("LSoundFontState");
-        x.setAttribute("version",7); x.setAttribute("midiFX",midiFX->getIndex()); for(int i=0;i<fxCount;++i) x.setAttribute(fxSpecs[i].key,readFXValue(i)); x.setAttribute("sfzQuality",sfzQuality->getIndex()); x.setAttribute("quality",quality->getIndex()); x.setAttribute("effects",effects->getIndex()); x.setAttribute("file",path); x.setAttribute("gain",static_cast<double>(gain->get()));
+        x.setAttribute("version",7); x.setAttribute("midiFX",midiFX->getIndex()); for(int i=0;i<fxCount;++i) x.setAttribute(fxSpecs[i].key,i==drumTrim?0:readFXValue(i)); x.setAttribute("sfzQuality",sfzQuality->getIndex()); x.setAttribute("quality",quality->getIndex()); x.setAttribute("effects",effects->getIndex()); x.setAttribute("file",path); x.setAttribute("gain",static_cast<double>(gain->get()));
         for(int i=0;i<channels;++i) x.setAttribute("ch"+juce::String(i+1),p[i]);
         for(int i=0;i<controlCount;++i) if(c[i]!=unset) {
             auto* entry=x.createNewChildElement("Control"); entry->setAttribute("index",i); entry->setAttribute("value",c[i]);
@@ -366,7 +346,7 @@ public:
             quality->setValueNotifyingHost(quality->convertTo0to1(static_cast<float>(juce::jlimit(0,2,x->getIntAttribute("quality",1)))));
             effects->setValueNotifyingHost(effects->convertTo0to1(static_cast<float>(juce::jlimit(0,3,x->getIntAttribute("effects",0)))));
             sfzQuality->setValueNotifyingHost(sfzQuality->convertTo0to1(static_cast<float>(juce::jlimit(0,11,x->getIntAttribute("sfzQuality",0)))));
-            for(int i=0;i<fxCount;++i) { const auto& f=fxSpecs[i]; fxParams[i]->setValueNotifyingHost(fxParams[i]->convertTo0to1(float(juce::jlimit(f.lo,f.hi,x->getIntAttribute(f.key,f.initial))))); }
+            for(int i=0;i<fxCount;++i) { const auto& f=fxSpecs[i]; fxParams[i]->setValueNotifyingHost(fxParams[i]->convertTo0to1(float(i==drumTrim?0:juce::jlimit(f.lo,f.hi,x->getIntAttribute(f.key,f.initial))))); }
             auto c=emptyControls();
             for(auto* entry=x->getFirstChildElement();entry;entry=entry->getNextElement()) if(entry->hasTagName("Control")) {
                 const int i=entry->getIntAttribute("index",-1), v=entry->getIntAttribute("value",unset);
@@ -645,8 +625,8 @@ private:
                         // Unity native gain, as in Scoring Synth. No artificial per-voice boost.
                         fluid_settings_setnum(fresh->settings,"synth.gain",1.0);
                         fluid_settings_setint(fresh->settings,"synth.midi-channels",16);
-                        fluid_settings_setint(fresh->settings,"synth.audio-channels",16);
-                        fluid_settings_setint(fresh->settings,"synth.audio-groups",16);
+                        fluid_settings_setint(fresh->settings,"synth.audio-channels",1);
+                        fluid_settings_setint(fresh->settings,"synth.audio-groups",1);
                         fluid_settings_setint(fresh->settings,"synth.effects-groups",1);
                         fluid_settings_setint(fresh->settings,"synth.polyphony",256);
                         fluid_settings_setint(fresh->settings,"synth.reverb.active",0);
@@ -749,7 +729,7 @@ public:
     explicit Editor(Processor& p) : AudioProcessorEditor(p), proc(p) {
         setWantsKeyboardFocus(true);
         setFocusContainerType(juce::Component::FocusContainerType::keyboardFocusContainer);
-        title.setText("LSFX 0.0.1 TEST13",juce::dontSendNotification); title.setFont(juce::FontOptions(21.0f)); title.setAccessible(false); addAndMakeVisible(title);
+        title.setText("LSFX 0.0.1 TEST14",juce::dontSendNotification); title.setFont(juce::FontOptions(21.0f)); title.setAccessible(false); addAndMakeVisible(title);
         status.setText("No SoundFont loaded",juce::dontSendNotification); status.setTitle("Instrument status"); addAndMakeVisible(status);
         setup(open,"Open SF2 or SFZ",1); setup(parameters,"Parameters",2); setup(channel,"MIDI channel",3); setup(bank,"Bank",4); setup(program,"Program",5); setup(level,"Output gain",6);
         setup(grid,"Parameter grid",1); setup(value,"Parameter value",2); setup(closeGrid,"Close parameters",3);
@@ -939,7 +919,7 @@ private:
         if(cached.ready&&!cached.loading) {
             rows.push_back({rowEffects,"Effects",0,3,1,true,{}});
             if(!cached.isSfz) rows.push_back({rowMidiFX,"MIDI effects reception",0,1,1,true,{}});
-            for(int i=0;i<fxCount;++i) { if(cached.isSfz&&(i==drumTrim||i==sf2Dynamics||i==sf2Ambience)) continue; const auto& f=fxSpecs[i]; rows.push_back({fxRow(i),f.label,double(f.lo),double(f.hi),1,i==rvType||i==chType||i==delayMode||i==sf2Dynamics||i==sf2Ambience,f.unit}); }
+            for(int i=0;i<fxCount;++i) { if(i==drumTrim||(cached.isSfz&&(i==sf2Dynamics||i==sf2Ambience))) continue; const auto& f=fxSpecs[i]; rows.push_back({fxRow(i),f.label,double(f.lo),double(f.hi),1,i==rvType||i==chType||i==delayMode||i==sf2Dynamics||i==sf2Ambience,f.unit}); }
         }
         gridTitle.setText(cached.ready&&!cached.loading?(cached.isSfz?"SFZ parameters":"SF2 parameters - channel "+juce::String(selectedChannel()+1)):"Parameters",juce::dontSendNotification);
         updatingGrid=true; grid.clear(juce::dontSendNotification);
