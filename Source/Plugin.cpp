@@ -23,6 +23,10 @@
 
 namespace {
 constexpr int channels = 16;
+constexpr int stereoBuses=17, renderChunk=1024;
+juce::String routeName(int bus) { return bus==0?juce::String("Main 1/2"):juce::String(2*bus+1)+"/"+juce::String(2*bus+2); }
+juce::String routeId(int ch) { return "channelRoute"+juce::String(ch+1); }
+juce::StringArray routeChoices() { juce::StringArray a; for(int i=0;i<stereoBuses;++i) a.add(routeName(i)); return a; }
 constexpr float channelGainMin=-60.0f, channelGainMax=6.0f;
 juce::String channelGainId(int ch) { return "channelGain"+juce::String(ch+1); }
 // Stable indices for global host parameters and XML attributes.
@@ -83,7 +87,13 @@ struct Engine {
     float midiMaster=1.0f;
     FXValues lastFx{};
     lsfx::OutputStage output;
-    // SF2 stays on the TEST14 stereo path. SFZ still uses its audio gain.
+    // Distinct audio/FX planes; never alias pointers passed to FluidSynth.
+    std::array<std::array<float,renderChunk>,2*channels> dry{};
+    std::array<std::array<float,renderChunk>,4> wet{};
+    std::array<int,channels> routes{};
+    struct SendOffset { float original=0, written=0; bool engaged=false; };
+    std::array<std::array<SendOffset,2>,channels> sendOffsets{};
+    // Preserve native voice trim and its MIDI semantics.
     std::array<lsfx::SF2ChannelTrim,channels> sf2Trims;
     std::array<juce::SmoothedValue<float,juce::ValueSmoothingTypes::Linear>,channels> channelGains;
     void prepareMixer() {
@@ -110,10 +120,16 @@ struct View { juce::String path, status = "No SoundFont loaded"; std::vector<Pre
 
 class Processor final : public juce::AudioProcessor {
 public:
-    Processor() : AudioProcessor(BusesProperties().withOutput("Stereo", juce::AudioChannelSet::stereo(), true)) {
+    static BusesProperties makeBuses() {
+        BusesProperties p;
+        p=p.withOutput("Main 1/2",juce::AudioChannelSet::stereo(),true);
+        for(int i=1;i<stereoBuses;++i) p=p.withOutput("Output "+routeName(i),juce::AudioChannelSet::stereo(),true);
+        return p;
+    }
+    Processor() : AudioProcessor(makeBuses()) {
         auto p = defaults();
         for (int i=0; i<channels; ++i) { selected[i].store(p[i]); commands[i].store(-1); }
-        addParameter(gain = new juce::AudioParameterFloat({"gain",1}, "Output gain", juce::NormalisableRange<float>(-60.0f, 6.0f, 0.1f), 0.0f, juce::AudioParameterFloatAttributes().withLabel("dB")));
+        addParameter(gain = new juce::AudioParameterFloat({"gain",1}, "Master output gain", juce::NormalisableRange<float>(-60.0f, 6.0f, 0.1f), 0.0f, juce::AudioParameterFloatAttributes().withLabel("dB")));
         addParameter(quality = new juce::AudioParameterChoice({"quality",1}, "SF2 interpolation", {"Linear", "Fourth order", "Seventh order"}, 1));
         addParameter(effects = new juce::AudioParameterChoice({"effects",1}, "Effects", {"Off", "Reverb", "Chorus", "Both"}, 0));
         addParameter(sfzQuality = new juce::AudioParameterChoice({"sfzQuality",1}, "SFZ live sample quality", {"Engine default","0","1","2","3","4","5","6","7","8","9","10"},0));
@@ -131,6 +147,7 @@ public:
         addParameter(fxParams[sf2Ambience]=new juce::AudioParameterChoice({"sf2Ambience",1}, "SF2 initial ambience", {"Native MIDI", "Scoring ambience (CC91 40)"},0));
         // Append, preserving all existing parameter identifiers and ordering.
         for(int ch=0;ch<channels;++ch) addParameter(channelGain[ch]=new juce::AudioParameterFloat({channelGainId(ch),1}, "Output gain CH "+juce::String(ch+1), juce::NormalisableRange<float>(channelGainMin,channelGainMax,0.1f),0.0f,juce::AudioParameterFloatAttributes().withLabel("dB")));
+        for(int ch=0;ch<channels;++ch) addParameter(channelRoute[ch]=new juce::AudioParameterChoice({routeId(ch),1}, "Output routing CH "+juce::String(ch+1),routeChoices(),0));
         for(int i=0;i<controlCount;++i) { controlValues[i].store(unset); controlCommands[i].store(unset); }
         worker = std::thread([this]{ work(); });
     }
@@ -157,7 +174,11 @@ public:
     void changeProgramName(int,const juce::String&) override {}
     bool hasEditor() const override { return true; }
     juce::AudioProcessorEditor* createEditor() override;
-    bool isBusesLayoutSupported(const BusesLayout& l) const override { return l.getMainOutputChannelSet()==juce::AudioChannelSet::stereo(); }
+    bool isBusesLayoutSupported(const BusesLayout& l) const override {
+        if(l.getMainOutputChannelSet()!=juce::AudioChannelSet::stereo()) return false;
+        for(const auto& set:l.outputBuses) if(!set.isDisabled()&&set!=juce::AudioChannelSet::stereo()) return false;
+        return true;
+    }
     void prepareToPlay(double rate, int) override {
         const auto old = hostRate.exchange(rate);
         if (std::abs(old-rate)>0.01) {
@@ -180,6 +201,7 @@ public:
     }
     juce::AudioParameterFloat& gainParameter() { return *gain; }
     juce::AudioParameterFloat& channelGainParameter(int ch) { return *channelGain[static_cast<size_t>(ch)]; }
+    juce::AudioParameterChoice& routeParameter(int ch) { return *channelRoute[static_cast<size_t>(ch)]; }
     juce::AudioParameterChoice& qualityParameter() { return *quality; }
     juce::AudioParameterChoice& effectsParameter() { return *effects; }
     juce::AudioParameterChoice& midiFXParameter() { return *midiFX; }
@@ -208,11 +230,25 @@ public:
         if (!lock.owns_lock()) { ++droppedBlocks; for(const auto m:midi) if(m.numBytes>0&&m.data[0]<0xf8) { panic.store(true); break; } midi.clear(); return; }
         if (!engine || std::abs(engine->rate-hostRate.load())>0.01 || b.getNumChannels()<2) { activeVoices.store(0); sleeping.store(false); midi.clear(); return; }
         if(engine->sfz) engine->channelGains[0].setTargetValue(juce::Decibels::decibelsToGain(channelGain[0]->get(),channelGainMin-1.0f));
+        bool routingChanged=false;
+        for(int ch=0;ch<channels;++ch) {
+            const int next=channelRoute[ch]->getIndex();
+            routingChanged=routingChanged||engine->routes[ch]!=next;
+            engine->routes[ch]=next;
+        }
+        std::array<int,stereoBuses> dest{}; dest.fill(-1);
+        for(int bus=0;bus<stereoBuses;++bus) if(auto* outputBus=getBus(false,bus)) {
+            if(outputBus->isEnabled()&&outputBus->getNumberOfChannels()==2) {
+                const int index=getChannelIndexInProcessBlockBuffer(false,bus,0);
+                if(index>=0&&index+1<b.getNumChannels()) dest[bus]=index;
+            }
+        }
         auto f=readFX(); int fx=effects->getIndex();
         const int followMode=midiFX->getIndex();
         if(engine->lastMidiFxMode!=followMode) {engine->midiDisabledFx=0; engine->lastMidiFxMode=followMode;}
         const bool settingsChanged=configureFX(*engine,f,fx);
         if (engine->sfz) {
+            if(routingChanged) engine->resetFX();
             auto* z=engine->sfz;
             const int sq=sfzQuality->getIndex();
             if(sq!=engine->sfzAppliedQuality) {
@@ -247,11 +283,17 @@ public:
                 start+=count;
             }
             activeVoices.store(sfizz_get_num_active_voices(z)); sleeping.store(false);
-            processMaster(*engine,b,f,fx); midi.clear(); return;
+            const int route=engine->routes[0];
+            if(route==0) processMaster(*engine,b,f,fx);
+            else {
+                if(dest[route]>=0) { b.copyFrom(dest[route],0,b,0,0,b.getNumSamples()); b.copyFrom(dest[route]+1,0,b,1,0,b.getNumSamples()); }
+                b.clear(0,0,b.getNumSamples()); b.clear(1,0,b.getNumSamples());
+            }
+            midi.clear(); return;
         }
         auto* s = engine->synth;
         const int q=quality->getIndex();
-        bool controlChanged = q!=engine->quality || settingsChanged;
+        bool controlChanged = q!=engine->quality || settingsChanged || routingChanged;
         if(applyControls(*engine)) controlChanged=true;
         if(updateSF2Trims(*engine)) controlChanged=true;
         if(applyInitialAmbience(*engine,f[sf2Ambience])) controlChanged=true;
@@ -263,6 +305,7 @@ public:
         }
         // A manual program change must also retain the user trim.
         if(controlChanged) updateSF2Trims(*engine);
+        if(updateRouteSends(*engine)) controlChanged=true;
         // MIDI clock / sensing do not need to wake the synthesizer.
         bool relevantMidi=false;
         for(const auto m:midi) if(m.numBytes>0&&m.data[0]<0xf8) { relevantMidi=true; break; }
@@ -276,15 +319,25 @@ public:
         float rawPeak=0, wetPeak=0;
         auto render = [&](int start,int count) {
             if(count<=0) return;
-            // TEST14: use the original TEST11 single-stereo render path.
-            // All sixteen MIDI channels and the native FX are mixed by FluidSynth.
-            // Optional channel trim is applied to voice attenuation before mixing.
-            if(fluid_synth_write_float(s,count,b.getWritePointer(0,start),0,1,b.getWritePointer(1,start),0,1)!=FLUID_OK) {
-                b.clear(0,start,count); b.clear(1,start,count);
-                return;
+            for(int offset=0;offset<count;) {
+                const int n=juce::jmin(renderChunk,count-offset), pos=start+offset;
+                std::array<float*,2*channels> dryPtrs{};
+                std::array<float*,4> wetPtrs{};
+                for(size_t i=0;i<dryPtrs.size();++i) { dryPtrs[i]=engine->dry[i].data(); std::fill_n(dryPtrs[i],n,0.0f); }
+                for(size_t i=0;i<wetPtrs.size();++i) { wetPtrs[i]=engine->wet[i].data(); std::fill_n(wetPtrs[i],n,0.0f); }
+                if(fluid_synth_process(s,n,int(wetPtrs.size()),wetPtrs.data(),int(dryPtrs.size()),dryPtrs.data())!=FLUID_OK) { offset+=n; continue; }
+                for(int ch=0;ch<channels;++ch) {
+                    const int index=dest[engine->routes[ch]];
+                    if(index<0) continue; // inactive host bus: never leak to Main
+                    b.addFrom(index,pos,dryPtrs[2*ch],n);
+                    b.addFrom(index+1,pos,dryPtrs[2*ch+1],n);
+                }
+                // One shared native reverb/chorus group; only Main receives returns.
+                for(int i=0;i<4;++i) b.addFrom(i%2,pos,wetPtrs[i],n);
+                rawPeak=juce::jmax(rawPeak,juce::jmax(b.getMagnitude(0,pos,n),b.getMagnitude(1,pos,n)));
+                wetPeak=juce::jmax(wetPeak,processMaster(*engine,b,f,fx,pos,n));
+                offset+=n;
             }
-            rawPeak=juce::jmax(rawPeak,juce::jmax(b.getMagnitude(0,start,count),b.getMagnitude(1,start,count)));
-            wetPeak=juce::jmax(wetPeak,processMaster(*engine,b,f,fx,start,count));
         };
         int cursor=0;
         // VST3 delivers controllers in separate queues and SysEx/notes in an event list.
@@ -303,14 +356,16 @@ public:
                 for(int c=0;c<channels;++c) { updateProgram(s,c); refreshFluidControls(s,c); }
                 applyMidiSysEx(*engine,d,n,f,fx);
                 updateSF2Trims(*engine);
+                updateRouteSends(*engine);
             } else if(status<0xf0 && status>=0x80 && n>=2) {
                 const int a=d[1]&127, v=n>=3 ? d[2]&127 : 0;
+                if((status&0xf0)==0x90) updateRouteSend(*engine,ch);
                 switch(status&0xf0) {
                     case 0x80: if(n>=3) fluid_synth_noteoff(s,ch,a); break;
                     case 0x90: if(n>=3) { if(v) fluid_synth_noteon(s,ch,a,v); else fluid_synth_noteoff(s,ch,a); } break;
                     case 0xa0: if(n>=3) fluid_synth_key_pressure(s,ch,a,v); break;
-                    case 0xb0: if(n>=3) { receiveFluidCC(*engine,ch,a,v,f,fx); if(a==121||a==6||a==38||a==96||a==97) { refreshFluidControls(s,ch); updateSF2Trim(*engine,ch); } } break;
-                    case 0xc0: receiveProgram(ch,a); fluid_synth_program_change(s,ch,a); updateProgram(s,ch); updateSF2Trim(*engine,ch); break;
+                    case 0xb0: if(n>=3) { receiveFluidCC(*engine,ch,a,v,f,fx); if(a==121||a==6||a==38||a==96||a==97) { refreshFluidControls(s,ch); updateSF2Trim(*engine,ch); } updateRouteSend(*engine,ch); } break;
+                    case 0xc0: receiveProgram(ch,a); fluid_synth_program_change(s,ch,a); updateProgram(s,ch); updateSF2Trim(*engine,ch); updateRouteSend(*engine,ch); break;
                     case 0xd0: fluid_synth_channel_pressure(s,ch,a); break;
                     case 0xe0: if(n>=3) fluid_synth_pitch_bend(s,ch,a|(v<<7)); break;
                     default: break;
@@ -351,8 +406,8 @@ public:
     void getStateInformation(juce::MemoryBlock& dest) override {
         juce::String path; Programs p; Controls c; stateForSave(path,p,&c);
         juce::XmlElement x("LSoundFontState");
-        x.setAttribute("version",8); x.setAttribute("midiFX",midiFX->getIndex()); for(int i=0;i<fxCount;++i) x.setAttribute(fxSpecs[i].key,i==drumTrim?0:readFXValue(i)); x.setAttribute("sfzQuality",sfzQuality->getIndex()); x.setAttribute("quality",quality->getIndex()); x.setAttribute("effects",effects->getIndex()); x.setAttribute("file",path); x.setAttribute("gain",static_cast<double>(gain->get()));
-        for(int i=0;i<channels;++i) { x.setAttribute("ch"+juce::String(i+1),p[i]); x.setAttribute(channelGainId(i),double(channelGain[i]->get())); }
+        x.setAttribute("version",9); x.setAttribute("midiFX",midiFX->getIndex()); for(int i=0;i<fxCount;++i) x.setAttribute(fxSpecs[i].key,i==drumTrim?0:readFXValue(i)); x.setAttribute("sfzQuality",sfzQuality->getIndex()); x.setAttribute("quality",quality->getIndex()); x.setAttribute("effects",effects->getIndex()); x.setAttribute("file",path); x.setAttribute("gain",static_cast<double>(gain->get()));
+        for(int i=0;i<channels;++i) { x.setAttribute("ch"+juce::String(i+1),p[i]); x.setAttribute(channelGainId(i),double(channelGain[i]->get())); x.setAttribute(routeId(i),channelRoute[i]->getIndex()); }
         for(int i=0;i<controlCount;++i) if(c[i]!=unset) {
             auto* entry=x.createNewChildElement("Control"); entry->setAttribute("index",i); entry->setAttribute("value",c[i]);
         }
@@ -367,6 +422,7 @@ public:
             for(int ch=0;ch<channels;++ch) {
                 const auto v=static_cast<float>(x->getDoubleAttribute(channelGainId(ch),0.0));
                 auto& a=*channelGain[ch]; a.setValueNotifyingHost(a.convertTo0to1(std::isfinite(v)?juce::jlimit(channelGainMin,channelGainMax,v):0.0f));
+                auto& routing=*channelRoute[ch]; routing.setValueNotifyingHost(routing.convertTo0to1(float(juce::jlimit(0,stereoBuses-1,x->getIntAttribute(routeId(ch),0)))));
             }
             quality->setValueNotifyingHost(quality->convertTo0to1(static_cast<float>(juce::jlimit(0,2,x->getIntAttribute("quality",1)))));
             effects->setValueNotifyingHost(effects->convertTo0to1(static_cast<float>(juce::jlimit(0,3,x->getIntAttribute("effects",0)))));
@@ -410,7 +466,7 @@ private:
         if(cc==91||cc==93) {
             if(cc==91) ++reverbCC; else ++chorusCC;
             const int bit=cc==91?1:2;
-            if(v>0 && midiFX->getIndex()==1 && !(e.midiDisabledFx&bit) && !(fx&bit)) {
+            if(e.routes[ch]==0 && v>0 && midiFX->getIndex()==1 && !(e.midiDisabledFx&bit) && !(fx&bit)) {
                 midiEffectMask(fx|bit,fx); configureFX(e,f,fx);
             }
         }
@@ -533,6 +589,30 @@ private:
     }
     juce::AudioParameterFloat* gain = nullptr;
     std::array<juce::AudioParameterFloat*,channels> channelGain{};
+    std::array<juce::AudioParameterChoice*,channels> channelRoute{};
+    static bool updateRouteSend(Engine& e,int ch) {
+        bool changed=false;
+        const int generators[]={GEN_REVERBSEND,GEN_CHORUSSEND};
+        for(int i=0;i<2;++i) {
+            auto& state=e.sendOffsets[ch][i]; const int gen=generators[i];
+            const bool bypass=e.routes[ch]!=0;
+            if(!bypass&&!state.engaged) continue;
+            const float current=fluid_synth_get_gen(e.synth,ch,gen);
+            if(!std::isfinite(current)) continue;
+            if(!state.engaged||std::abs(current-state.written)>0.001f) state.original=current;
+            // Negative absolute offset suppresses SF2 preset, instrument and CC sends.
+            const float next=bypass?-10000.0f:state.original;
+            if(std::abs(current-next)>0.001f) {
+                if(fluid_synth_set_gen(e.synth,ch,gen,next)!=FLUID_OK) continue;
+                changed=true;
+            }
+            state.written=next; state.engaged=bypass;
+        }
+        return changed;
+    }
+    static bool updateRouteSends(Engine& e) {
+        bool changed=false; for(int ch=0;ch<channels;++ch) changed=updateRouteSend(e,ch)||changed; return changed;
+    }
     juce::AudioParameterChoice* quality = nullptr;
     juce::AudioParameterChoice* effects = nullptr;
     juce::AudioParameterChoice* midiFX = nullptr;
@@ -661,8 +741,8 @@ private:
                         // Unity native gain, as in Scoring Synth. No artificial per-voice boost.
                         fluid_settings_setnum(fresh->settings,"synth.gain",1.0);
                         fluid_settings_setint(fresh->settings,"synth.midi-channels",16);
-                        fluid_settings_setint(fresh->settings,"synth.audio-channels",1);
-                        fluid_settings_setint(fresh->settings,"synth.audio-groups",1);
+                        fluid_settings_setint(fresh->settings,"synth.audio-channels",16);
+                        fluid_settings_setint(fresh->settings,"synth.audio-groups",16);
                         fluid_settings_setint(fresh->settings,"synth.effects-groups",1);
                         fluid_settings_setint(fresh->settings,"synth.polyphony",256);
                         fluid_settings_setint(fresh->settings,"synth.reverb.active",0);
@@ -766,13 +846,13 @@ public:
     explicit Editor(Processor& p) : AudioProcessorEditor(p), proc(p) {
         setWantsKeyboardFocus(true);
         setFocusContainerType(juce::Component::FocusContainerType::keyboardFocusContainer);
-        title.setText("LSFX 0.0.1 TEST17.1",juce::dontSendNotification); title.setFont(juce::FontOptions(21.0f)); title.setAccessible(false); addAndMakeVisible(title);
+        title.setText("LSFX 0.0.1 TEST18",juce::dontSendNotification); title.setFont(juce::FontOptions(21.0f)); title.setAccessible(false); addAndMakeVisible(title);
         status.setText("No SoundFont loaded",juce::dontSendNotification); status.setTitle("Instrument status"); addAndMakeVisible(status);
-        setup(open,"Open SF2 or SFZ",1); setup(parameters,"Parameters",2); setup(channel,"MIDI channel",3); setup(bank,"Bank",21); setup(program,"Program",22); setup(level,"Output gain",20);
+        setup(open,"Open SF2 or SFZ",1); setup(parameters,"Parameters",2); setup(channel,"MIDI channel",3); setup(bank,"Bank",37); setup(program,"Program",38); setup(level,"Master output gain",36);
         setup(grid,"Parameter grid",1); setup(value,"Parameter value",2); setup(closeGrid,"Close parameters",3);
         open.setDescription("Alt+O"); parameters.setDescription("Alt+L"); channel.setDescription("Alt+M"); bank.setDescription("Alt+B"); program.setDescription("Alt+P"); level.setDescription("Alt+G");
         grid.setDescription("Alt+L. Home/End: column boundaries. Ctrl+Home/End: grid boundaries. Enter or Tab edits the selected parameter. Escape closes parameters.");
-        channelLabel.setText("MIDI channel",juce::dontSendNotification); bankLabel.setText("Bank",juce::dontSendNotification); programLabel.setText("Program",juce::dontSendNotification); levelLabel.setText("Output gain (dB)",juce::dontSendNotification);
+        channelLabel.setText("MIDI channel",juce::dontSendNotification); bankLabel.setText("Bank",juce::dontSendNotification); programLabel.setText("Program",juce::dontSendNotification); levelLabel.setText("Master output gain (dB)",juce::dontSendNotification);
         gridTitle.setText("Parameters",juce::dontSendNotification); hint.setText("Arrows: grid or value. Type to search. Enter: edit / browse. Esc: close.",juce::dontSendNotification);
         for(auto* l:{&channelLabel,&bankLabel,&programLabel,&levelLabel,&gridTitle,&hint}) addAndMakeVisible(*l);
         for(int i=1;i<=16;++i) channel.addItem("Channel "+juce::String(i),i);
@@ -799,6 +879,19 @@ public:
             c.onDragEnd=[this,ch]{channelDragging[ch]=false;proc.channelGainParameter(ch).endChangeGesture();};
             c.onValueChange=[this,ch]{auto& a=proc.channelGainParameter(ch);if(!channelDragging[ch]) a.beginChangeGesture(); a.setValueNotifyingHost(a.convertTo0to1(float(channelLevels[ch].getValue())));if(!channelDragging[ch]) a.endChangeGesture(); repaint();};
         }
+        routingLabel.setText("Stereo output routing - Alt+R",juce::dontSendNotification);
+        routingLabel.setAccessible(false); addAndMakeVisible(routingLabel);
+        for(int ch=0;ch<channels;++ch) {
+            auto& c=routeLevels[ch];
+            setup(c,"Output routing channel "+juce::String(ch+1),20+ch);
+            c.setDescription("Alt+R. Left/right selects MIDI channel; up/down selects stereo output. Tab leaves the routing strip.");
+            c.setSliderStyle(juce::Slider::LinearVertical); c.setTextBoxStyle(juce::Slider::NoTextBox,true,0,0);
+            c.setRange(0,stereoBuses-1,1); c.textFromValueFunction=[](double v){return routeName(juce::roundToInt(v));};
+            c.setValue(proc.routeParameter(ch).getIndex(),juce::dontSendNotification);
+            c.onDragStart=[this,ch]{proc.routeParameter(ch).beginChangeGesture();routeDragging[ch]=true;lastRouteChannel=ch;};
+            c.onDragEnd=[this,ch]{routeDragging[ch]=false;proc.routeParameter(ch).endChangeGesture();};
+            c.onValueChange=[this,ch]{auto& a=proc.routeParameter(ch);if(!routeDragging[ch]) a.beginChangeGesture();a.setValueNotifyingHost(a.convertTo0to1(float(routeLevels[ch].getValue())));if(!routeDragging[ch]) a.endChangeGesture();repaint();};
+        }
         value.setSliderStyle(juce::Slider::LinearHorizontal); value.setTextBoxStyle(juce::Slider::NoTextBox,true,0,0);
         for(auto* l:{&levelReadout,&valueReadout}) {l->setJustificationType(juce::Justification::centredRight); l->setAccessible(false); addAndMakeVisible(*l);}
         grid.onChange=[this]{ if(!updatingGrid) {search.reset(); syncValue(); repaint();} };
@@ -806,7 +899,7 @@ public:
         // Keyed controls intercept their own arrows before JUCE's native behavior;
         // the editor listener also handles Alt accelerators bubbling from children.
         addKeyListener(this);
-        showGrid(false); setSize(760,570); refresh(true); startTimerHz(5);
+        showGrid(false); setSize(900,690); refresh(true); startTimerHz(5);
         scheduleInitialFocus();
     }
     ~Editor() override { stopTimer(); removeKeyListener(this); chooser.reset(); }
@@ -818,6 +911,9 @@ public:
                 const auto cell=channelLevels[ch].getBounds();
                 g.drawText(juce::String(ch+1),cell.withY(cell.getY()-15).withHeight(15),juce::Justification::centred,false);
                 g.drawText(juce::String(channelLevels[ch].getValue(),1),cell.withY(cell.getBottom()).withHeight(15),juce::Justification::centred,false);
+                const auto routing=routeLevels[ch].getBounds();
+                g.drawText(juce::String(ch+1),routing.withY(routing.getY()-15).withHeight(15),juce::Justification::centred,false);
+                g.drawText(routeName(juce::roundToInt(routeLevels[ch].getValue())),routing.withY(routing.getBottom()).withHeight(15),juce::Justification::centred,false);
             }
             return;
         }
@@ -869,7 +965,10 @@ public:
         auto strip=r.removeFromTop(104).reduced(0,15);
         const int cellWidth=strip.getWidth()/channels;
         for(int ch=0;ch<channels;++ch) channelLevels[ch].setBounds(strip.getX()+ch*cellWidth,strip.getY(),cellWidth,strip.getHeight());
-        auto lv=r.removeFromTop(38); levelLabel.setBounds(lv.removeFromLeft(150)); levelReadout.setBounds(lv.removeFromRight(100)); level.setBounds(lv.reduced(0,3));
+        routingLabel.setBounds(r.removeFromTop(24));
+        auto routes=r.removeFromTop(104).reduced(0,15);
+        for(int ch=0;ch<channels;++ch) routeLevels[ch].setBounds(routes.getX()+ch*cellWidth,routes.getY(),cellWidth,routes.getHeight());
+        auto lv=r.removeFromTop(38); levelLabel.setBounds(lv.removeFromLeft(200)); levelReadout.setBounds(lv.removeFromRight(100)); level.setBounds(lv.reduced(0,3));
         line(bankLabel,bank);line(programLabel,program);
     }
 private:
@@ -882,7 +981,10 @@ private:
     Keyed<juce::Slider> level,value;
     std::array<Keyed<juce::Slider>,channels> channelLevels;
     std::array<bool,channels> channelDragging{};
-    juce::Label channelGainLabel;
+    juce::Label channelGainLabel,routingLabel;
+    std::array<Keyed<juce::Slider>,channels> routeLevels;
+    std::array<bool,channels> routeDragging{};
+    int lastRouteChannel=0;
     int lastGainChannel=0;
     std::unique_ptr<juce::FileChooser> chooser;
     View cached;
@@ -951,13 +1053,13 @@ private:
     }
     void showGrid(bool show,juce::Component* destination=nullptr) {
         gridOpen=show; search.reset();
-        const auto main=std::array<juce::Component*,12>{&open,&parameters,&channel,&bank,&program,&level,&channelLabel,&bankLabel,&programLabel,&levelLabel,&levelReadout,&channelGainLabel};
+        const auto main=std::array<juce::Component*,13>{&open,&parameters,&channel,&bank,&program,&level,&channelLabel,&bankLabel,&programLabel,&levelLabel,&levelReadout,&channelGainLabel,&routingLabel};
         const auto panel=std::array<juce::Component*,6>{&grid,&value,&closeGrid,&gridTitle,&hint,&valueReadout};
         // Reveal the destination before hiding the old focused controls.
         if(show) for(auto* c:panel) c->setVisible(true);
-        else { for(auto* c:main) c->setVisible(true); for(auto& c:channelLevels) c.setVisible(true); }
+        else { for(auto* c:main) c->setVisible(true); for(auto& c:channelLevels) c.setVisible(true); for(auto& c:routeLevels) c.setVisible(true); }
         resized();
-        if(show) { if(hasKeyboardFocus(true)) focus(grid); for(auto* c:main) c->setVisible(false); for(auto& c:channelLevels) c.setVisible(false); }
+        if(show) { if(hasKeyboardFocus(true)) focus(grid); for(auto* c:main) c->setVisible(false); for(auto& c:channelLevels) c.setVisible(false); for(auto& c:routeLevels) c.setVisible(false); }
         else { if(grid.hasKeyboardFocus(true)||value.hasKeyboardFocus(true)||closeGrid.hasKeyboardFocus(true)) focus(destination!=nullptr?*destination:static_cast<juce::Component&>(parameters)); for(auto* c:panel) c->setVisible(false); }
         repaint();
     }
@@ -996,7 +1098,7 @@ private:
     }
     double readRow(const GridRow& r) const {
         if(const int i=fxIndex(r.id);i>=0) { auto& p=proc.fxParameter(i); return p.convertFrom0to1(p.getValue()); }
-        if(r.id==rowGain) return proc.gainParameter().get();
+        if(r.id==rowGain) return proc.channelGainParameter(selectedChannel()).get();
         if(r.id==rowInterpolation) return proc.qualityParameter().getIndex();
         if(r.id==rowEffects) return proc.effectsParameter().getIndex();
         if(r.id==rowMidiFX) return proc.midiFXParameter().getIndex();
@@ -1025,7 +1127,7 @@ private:
         v=juce::jlimit(r.low,r.high,r.low+std::round((v-r.low)/r.step)*r.step);
         auto set=[v](juce::RangedAudioParameter& p){ p.beginChangeGesture(); p.setValueNotifyingHost(p.convertTo0to1(static_cast<float>(v))); p.endChangeGesture(); };
         if(const int i=fxIndex(r.id);i>=0) set(proc.fxParameter(i));
-        else if(r.id==rowGain) set(proc.gainParameter());
+        else if(r.id==rowGain) set(proc.channelGainParameter(selectedChannel()));
         else if(r.id==rowInterpolation) set(proc.qualityParameter());
         else if(r.id==rowEffects) set(proc.effectsParameter());
         else if(r.id==rowMidiFX) set(proc.midiFXParameter());
@@ -1084,6 +1186,7 @@ private:
         // than the slider/combobox itself. Treat both routes identically.
         for(auto* c=origin;c!=nullptr&&c!=this;c=c->getParentComponent()) {
             for(auto& gainControl:channelLevels) if(c==&gainControl) return c;
+            for(auto& routeControl:routeLevels) if(c==&routeControl) return c;
             for(auto* target:std::array<juce::Component*,9>{&grid,&value,&level,&open,&parameters,&channel,&bank,&program,&closeGrid}) if(c==target) return target;
         }
         return origin;
@@ -1130,6 +1233,8 @@ private:
         const bool boundary=code==juce::KeyPress::homeKey||code==juce::KeyPress::endKey;
         const int direction=code==juce::KeyPress::upKey||code==juce::KeyPress::pageUpKey||code==juce::KeyPress::homeKey||code==juce::KeyPress::rightKey?1:-1;
         const int outputCh=outputChannel(origin);
+        int routeCh=-1; for(int i=0;i<channels;++i) if(origin==&routeLevels[i]) routeCh=i;
+        if(routeCh>=0) lastRouteChannel=routeCh;
         if(outputCh>=0) lastGainChannel=outputCh;
         // Leave the host and the native combo popup in control of their own keys.
         if(chooser||grid.isPopupActive()||bank.isPopupActive()||program.isPopupActive()||channel.isPopupActive()) return false;
@@ -1140,10 +1245,12 @@ private:
             auto& remembered=channelLevels[cached.isSfz?0:lastGainChannel];
             if(outputCh>=0) {
                 if(backwards) focus(channel.isEnabled()?static_cast<juce::Component&>(channel):static_cast<juce::Component&>(parameters));
-                else focus(level);
+                else focus(routeLevels[cached.isSfz?0:lastRouteChannel]);
                 return true;
             }
-            if((!backwards&&(origin==&channel||(origin==&parameters&&!channel.isEnabled())))||(backwards&&origin==&level)) {
+            if(routeCh>=0) { if(backwards) focus(remembered); else focus(level); return true; }
+            if(backwards&&origin==&level) { focus(routeLevels[cached.isSfz?0:lastRouteChannel]); return true; }
+            if(!backwards&&(origin==&channel||(origin==&parameters&&!channel.isEnabled()))) {
                 focus(remembered);
                 return true;
             }
@@ -1169,7 +1276,7 @@ private:
             if(ch=='v'&&gridOpen) {focus(value);return true;}
             if(ch=='c'&&gridOpen) {closeParameters();return true;}
             juce::Component* target=nullptr;
-            if(ch=='o') target=&open; else if(ch=='m') target=&channel; else if(ch=='b') target=&bank; else if(ch=='p') target=&program; else if(ch=='g') target=&level; else if(ch=='u') target=&channelLevels[cached.isSfz?0:lastGainChannel];
+            if(ch=='o') target=&open; else if(ch=='m') target=&channel; else if(ch=='b') target=&bank; else if(ch=='p') target=&program; else if(ch=='g') target=&level; else if(ch=='u') target=&channelLevels[cached.isSfz?0:lastGainChannel]; else if(ch=='r') target=&routeLevels[cached.isSfz?0:lastRouteChannel];
             if(target) {if(target->isEnabled()) {if(gridOpen) showGrid(false,target); focus(*target);} return true;}
         }
         if(gridOpen&&!alt&&!ctrl&&code==juce::KeyPress::escapeKey) {closeParameters();return true;}
@@ -1207,6 +1314,14 @@ private:
                     if(supported) {const auto before=readRow(copy); if(std::abs(before-reset)>0.000001) {writeRow(copy,reset);refreshGridValues(); const auto after=readRow(copy); if(after!=before) speak(*origin,formatValue(copy,after));}}
                 }
                 return true;
+            }
+        }
+        if(routeCh>=0) {
+            if(horizontal) {const int next=juce::jlimit(0,cached.isSfz?0:channels-1,routeCh+direction); if(next!=routeCh) {lastRouteChannel=next;focus(routeLevels[next]);} return true;}
+            if(vertical||page||boundary||code==juce::KeyPress::backspaceKey) {
+                auto& c=routeLevels[routeCh]; const int old=juce::roundToInt(c.getValue());
+                const int next=code==juce::KeyPress::backspaceKey?0:code==juce::KeyPress::homeKey?0:code==juce::KeyPress::endKey?stereoBuses-1:juce::jlimit(0,stereoBuses-1,old+direction*(page?4:1));
+                if(next!=old) {c.setValue(next,juce::sendNotificationSync);speak(c,routeName(next));} return true;
             }
         }
         if(outputCh>=0) {
@@ -1279,6 +1394,8 @@ private:
             auto& c=channelLevels[ch];
             const bool enabled=!cached.isSfz||ch==0;
             if(c.isEnabled()!=enabled) c.setEnabled(enabled);
+            auto& routing=routeLevels[ch]; if(routing.isEnabled()!=enabled) routing.setEnabled(enabled);
+            if(!routeDragging[ch]&&routing.getValue()!=proc.routeParameter(ch).getIndex()) {routing.setValue(proc.routeParameter(ch).getIndex(),juce::dontSendNotification);repaint();}
             if(!channelDragging[ch]) {const auto v=proc.channelGainParameter(ch).get(); if(std::abs(c.getValue()-v)>0.000001) {c.setValue(v,juce::dontSendNotification);repaint();}}
         }
         if(gridOpen) {if(changed) rebuildGrid(); else refreshGridValues();}

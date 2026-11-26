@@ -1,4 +1,4 @@
-# TEST17.1
+# TEST18
 1. Remove old LSoundFont VST3 from scan paths (same plugin ID); install LSFX. Scan REAPER.
 2. Open FluidR3 GM.sf2. Play same MIDI, host sample rate and block size as TEST1. Compare REAPER Performance Meter at rest, 1 note, 4 notes, and full MIDI arrangement. Use generic UI to compare Fourth order / Seventh order and effects Off / Both. Compare dry sound separately from effects; no claim of equal wet sound.
 3. Check sustain, note-off, program changes, channel 10 drums, panic and release. Verify silence after release with effects off; verify effects tails with effects on.
@@ -38,3 +38,12 @@
 Local native trim check: `python Tests/FluidStereoTrimTest.py /path/to/FluidR3.sf2` checks zero trim, -6 dB on channels 1 and 10, independence from the adjacent channel, and unchanged CC7/11. Local tests use FluidSynth 2.4.4; earlier Windows build logs show 2.6.2, so these tests cannot certify Windows stability.
 
 25. TEST17.1: with an SF2 loaded, Tab from MIDI channel into the output strip, select output 8 using Right, then Tab once to master Output gain. Shift+Tab returns to output 8; Shift+Tab again returns to MIDI channel. Check Tab from MIDI returns to output 8; Left/Right stop at output 1/16. Repeat with SFZ (only output 1; MIDI disabled) and check Parameters is the previous stop. In Alt+L, select a middle cell in a later column: Home/End go to that column's first/last actual parameter; Ctrl+Home/End go to the entire grid's first/last parameter. Repeat on the partially filled final column, and verify Alt+Home/End and Value mode still edit maximum/minimum. At an already selected boundary, no repeated announcement.
+
+## TEST18 routing validation
+- First open an SF2 without changing routing: verify loading, all 16 channels, identical perceived balance and no crash. Previous TEST15 multigroup Windows crash is unresolved.
+- Alt+U then Tab reaches routing; Tab again reaches Master output gain, Shift+Tab reverses. Alt+R focuses routing. Left/right changes MIDI channel; up/down changes destination.
+- Edit Output gain in Alt+L for MIDI channels 1 and 2 independently; verify Alt+U matches, and Alt+G remains unchanged.
+- In REAPER enable 34 track channels and inspect VST3 output pins. Assign channels 1 and 2 to 3/4, 3/5/6 to 5/6, drums (CH10) to 7/8 and another channel to 33/34. Verify no doubling in Main and correct stereo channels.
+- Set CC91 and CC93 to 127, activate reverb/chorus/delay, route an individual channel away from Main before playing. Compare Main and auxiliary output; no new native send from that channel, and no LSFX master effects on the aux. Old shared FX tails may decay. Return to Main and verify sends restored.
+- Save/reopen project, test automation and disabled aux buses (must not redirect to Main). Test SFZ CH1 routing, effects programmed inside SFZ are outside LSFX bypass.
+- Local native regression: `python Tests/FluidMultiOutputTest.py /path/to/GM.sf2` (requires installed FluidSynth). Uses distinct dry and wet planes, irregular block sizes and one native FX group, compares with single-group native stereo. This is not a JUCE or Windows test.
