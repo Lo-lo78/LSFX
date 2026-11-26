@@ -48,5 +48,6 @@ target_compile_definitions(LSFX PUBLIC JUCE_WEB_BROWSER=0 JUCE_USE_CURL=0 JUCE_V
 target_link_libraries(LSFX PRIVATE sfizz::static FluidSynth::libfluidsynth juce::juce_audio_utils juce::juce_gui_basics PUBLIC juce::juce_recommended_config_flags juce::juce_recommended_warning_flags)
 
 if(WIN32)
+    target_compile_definitions(LSFX PRIVATE NOMINMAX)
     target_link_libraries(LSFX PRIVATE Uiautomationcore OleAut32)
 endif()

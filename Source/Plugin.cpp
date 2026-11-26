@@ -34,7 +34,7 @@ int fxRow(int i) { return globalRowBase-i; }
 int fxIndex(int row) { const int i=globalRowBase-row; return i>=0&&i<fxCount?i:-1; }
 const char* const reverbNames[]={"Room 1","Room 2","Room 3","Hall 1","Hall 2","Plate","Delay","Panning Delay"};
 const char* const chorusNames[]={"Chorus 1","Chorus 2","Chorus 3","Chorus 4","Feedback Chorus","Flanger","Short Delay","Short Delay with Feedback"};
-float roomSize(const FXValues& f) { constexpr float rooms[]={.22f,.36f,.49f,.62f,.76f,.57f}; return std::clamp(rooms[std::min(f[rvType],5)]*(.5f+.01f*f[rvTime]),.02f,.88f); }
+float roomSize(const FXValues& f) { constexpr float rooms[]={.22f,.36f,.49f,.62f,.76f,.57f}; return std::clamp(rooms[(std::min)(f[rvType],5)]*(.5f+.01f*f[rvTime]),.02f,.88f); }
 float chorusDepthMs(const FXValues& f) { constexpr float depths[]={2,4,6,9,3,1.5f,0,0}; return depths[f[chType]]*(.01f*f[chDepth]*2); }
 
 constexpr int pack(int bank, int program) { return (bank << 7) | program; }
@@ -122,7 +122,7 @@ public:
         if(f[delayMix]==0&&(!(effects->getIndex()&1)||f[rvType]<6)) return 10.0;
         const double fb=f[delayFeedback]*.01;
         const double repeats=fb>0?std::ceil(std::log(0.00001)/std::log(fb)):1.0;
-        return std::max(10.0, f[delayTime]*.001*(repeats+1.0));
+        return (std::max)(10.0, f[delayTime]*.001*(repeats+1.0));
     }
     int getNumPrograms() override { return 1; }
     int getCurrentProgram() override { return 0; }
@@ -359,7 +359,7 @@ private:
                 e.delay.process(dryL,dryR,float(f[delayTime]),0,0,f[delayFeedback]*.01f,f[delayMode]!=0,wl,wr);
                 l[i]+=wl*f[delayMix]*.01f; r[i]+=wr*f[delayMix]*.01f;
             }
-            peak=std::max(peak,std::max(std::abs(l[i]),std::abs(r[i])));
+            peak=(std::max)(peak,(std::max)(std::abs(l[i]),std::abs(r[i])));
             e.output.process(l[i],r[i],g,trim);
         }
         return peak;
@@ -579,7 +579,7 @@ public:
     explicit Editor(Processor& p) : AudioProcessorEditor(p), proc(p) {
         setWantsKeyboardFocus(true);
         setFocusContainerType(juce::Component::FocusContainerType::keyboardFocusContainer);
-        title.setText("LSFX 0.0.1 TEST7",juce::dontSendNotification); title.setFont(juce::FontOptions(21.0f)); addAndMakeVisible(title);
+        title.setText("LSFX 0.0.1 TEST8",juce::dontSendNotification); title.setFont(juce::FontOptions(21.0f)); addAndMakeVisible(title);
         status.setText("No SoundFont loaded",juce::dontSendNotification); status.setTitle("Instrument status"); addAndMakeVisible(status);
         setup(open,"Open SF2 or SFZ",1); setup(parameters,"Parameters",2); setup(channel,"MIDI channel",3); setup(bank,"Bank",4); setup(program,"Program",5); setup(level,"Output gain",6); setup(stop,"Panic - all sounds off",7); setup(readStatus,"Read status",8);
         setup(grid,"Parameter grid",1); setup(value,"Parameter value",2); setup(closeGrid,"Close parameters",3);

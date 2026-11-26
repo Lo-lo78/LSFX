@@ -1,4 +1,4 @@
-# TEST7
+# TEST8
 1. Remove old LSoundFont VST3 from scan paths (same plugin ID); install LSFX. Scan REAPER.
 2. Open FluidR3 GM.sf2. Play same MIDI, host sample rate and block size as TEST1. Compare REAPER Performance Meter at rest, 1 note, 4 notes, and full MIDI arrangement. Use generic UI to compare Fourth order / Seventh order and effects Off / Both. Compare dry sound separately from effects; no claim of equal wet sound.
 3. Check sustain, note-off, program changes, channel 10 drums, panic and release. Verify silence after release with effects off; verify effects tails with effects on.
@@ -10,6 +10,6 @@
 8. SF2: test filter cutoff, resonance, attack/release, tuning on a single channel; compare other channels and reset with Backspace. Confirm bank/program and effects still work. Save/reopen and check explicit edits.
 9. SFZ: use an instrument containing label_ccN and set_ccN opcodes; check names, current values and MIDI response, including saving and restoring changes. Test an SFZ without CC labels. Check no effect on unedited sound and CPU at rest/playing.
 
-10. TEST7 CPU: with Effects Both, play notes, release sustain, wait for tails then at least two seconds of silence. Alt+S then activate Read status: Active voices should be 0, SF2 idle sleep yes. If the persistent spike returns, record the numbers BEFORE pressing Panic, then compare after Panic; note whether SF2 or SFZ was active and the effect type.
+10. TEST8 CPU: with Effects Both, play notes, release sustain, wait for tails then at least two seconds of silence. Alt+S then activate Read status: Active voices should be 0, SF2 idle sleep yes. If the persistent spike returns, record the numbers BEFORE pressing Panic, then compare after Panic; note whether SF2 or SFZ was active and the effect type.
 11. Test all 8 reverb and chorus types, independent stereo/ping-pong delay, parameter reset and state restore. Verify SF2 native CC91/93 sends on Room/Hall/Plate and Chorus 1-4; master variants are not channel sends. Compare SFZ without FX and with FX. Check for stale echoes after mode changes; test 1-second delay and feedback.
 12. Compare output level against TEST6 at same preset/gain, try trim 0/12/24 dB and ensure loud chords do not overload downstream FX. Run standalone DSP test: g++ -std=c++17 -O2 Tests/OutputStageTest.cpp -o test_output && ./test_output. This does not compile the VST3.

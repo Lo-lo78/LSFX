@@ -1,9 +1,9 @@
-# LSFX 0.0.1 TEST7
+# LSFX 0.0.1 TEST8
 Experimental accessible VST3 instrument for REAPER. SF2 uses FluidSynth; SFZ uses sfizz 1.2.3. One file per instance, no conversion. SF2 supports 16 MIDI channels; SFZ currently accepts channel 1 only. SF3 is not a target. The existing plugin identifier and XML state tag are retained for TEST1 project compatibility; remove the old VST3 bundle before installing LSFX.
 
 Open SF2 or SFZ using the existing editor. SFZ samples must remain in their original relative locations. Bank and Program controls apply only to SF2. In REAPER's generic parameter UI, SF2 interpolation is Linear / Fourth order (default) / Seventh order; SF2 effects are Off (default) / Reverb / Chorus / Both. These settings and the instrument path persist in state. Existing TEST1 states without the new fields use the lighter defaults. SFZ uses 128 voices, SF2 256; see TEST6 controls below. SF2 idle bypass now waits for no active voices and two seconds below -100 dBFS on both pre-master dry/native-wet and final effects signals; it works with effects enabled and ignores MIDI clock/active sensing. CPU improvement is not measured yet.
 
-Build: push to main and download TEST7 Windows x64 artifact from Actions. The workflow uses JUCE, FluidSynth via vcpkg and recursively fetched sfizz sources. See TESTING.md and THIRD_PARTY.md. Experimental build, not verified on Windows in the authoring environment.
+Build: push to main and download TEST8 Windows x64 artifact from Actions. The workflow uses JUCE, FluidSynth via vcpkg and recursively fetched sfizz sources. See TESTING.md and THIRD_PARTY.md. Experimental build, not verified on Windows in the authoring environment.
 
 TEST4: retains the TEST3 duplicate cxxopts alias fix and patches the pinned sfizz MSVC runtime to /MD (and /MDd in Debug), matching JUCE and vcpkg static-md. Also normalizes nested sfizz targets and saves build logs even on failure. DSP and editor behavior are unchanged from TEST2.
 
@@ -21,6 +21,10 @@ SF2: output gain, selected channel, interpolation, effects, MIDI volume/pan/expr
 SFZ: output gain, live sample quality and CCs explicitly labeled by the instrument. The loader queries the initial CC values through sfizz's read-only OSC interface before publishing the synth. If a query is unavailable the value is shown as Instrument default (not read), not guessed. An explicit edit sends MIDI CC, and the file is never rewritten. Unlabeled opcodes and keyswitches are not yet a complete instrument editor. SFZ remains single instrument on MIDI channel 1.
 
 State version 3 retains old gain, quality, effects, file and programs. Explicit grid CC and generator edits are saved in the project/preset and restored on load or sample-rate change. Incoming MIDI changes update display; only explicit editor overrides are saved, so MIDI sequences continue to drive their own events. Opening another file starts with its own defaults. No change to tested dependency/packaging fixes; no extra scan of all controls each audio block unless an edit is pending. Dynamic CCs/generator offsets are internal controls, not individual host automation parameters yet.
+
+## TEST8 - Windows compile fix
+
+Defines NOMINMAX and protects standard min/max calls from Windows macros. No DSP or UI behavior changes from TEST7.
 
 ## TEST7 - GS-style effects, output stage and CPU diagnostics
 

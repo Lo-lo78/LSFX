@@ -8,12 +8,12 @@ namespace lsfx {
 // Adapted from LJuno-116 0.99.67 SynthEngine.cpp finalizer (stereo master).
 struct OutputStage {
     float envelope=0, attack=1, release=1;
-    void prepare(double rate) noexcept { attack=1.0f/std::max(1.0f,float(rate*.001)); release=1.0f/std::max(1.0f,float(rate*.004)); reset(); }
+    void prepare(double rate) noexcept { attack=1.0f/(std::max)(1.0f,float(rate*.001)); release=1.0f/(std::max)(1.0f,float(rate*.004)); reset(); }
     void reset() noexcept { envelope=0; }
     static float limit(float x) noexcept { const auto a=std::abs(x); return a>0.98f?std::copysign(0.98f+(a-0.98f)*0.15f,x):x; }
     void process(float& l,float& r,float gain,float trim) noexcept {
         l=std::isfinite(l)?l*trim:0; r=std::isfinite(r)?r*trim:0;
-        const float detector=std::sqrt(std::max(l*l,r*r)+0.000000000001f);
+        const float detector=std::sqrt((std::max)(l*l,r*r)+0.000000000001f);
         envelope+=(detector-envelope)*(envelope<detector?attack:release);
         const float scale=0.4f*(envelope>0.055f?(0.055f+(envelope-0.055f)*0.5f)/envelope:1.0f);
         l=limit(l*scale)*gain*2.0f; r=limit(r*scale)*gain*2.0f;
@@ -41,7 +41,7 @@ struct StereoDelay {
         auto clean=[](float x){return std::abs(x)<1.0e-15f?0.0f:x;};
         left[head]=clean(inL+feedback*(pingPong?wetR:wetL)); right[head]=clean(inR+feedback*(pingPong?wetL:wetR));
         if(++head==int(left.size())) head=0;
-        valid=std::min(valid+1,int(left.size())-1);
+        valid=(std::min)(valid+1,int(left.size())-1);
         phase+=hz*6.283185307f/float(rate); if(phase>=6.283185307f) phase-=6.283185307f;
     }
 };
