@@ -1,6 +1,15 @@
-# TEST5
+# TEST7
 1. Remove old LSoundFont VST3 from scan paths (same plugin ID); install LSFX. Scan REAPER.
 2. Open FluidR3 GM.sf2. Play same MIDI, host sample rate and block size as TEST1. Compare REAPER Performance Meter at rest, 1 note, 4 notes, and full MIDI arrangement. Use generic UI to compare Fourth order / Seventh order and effects Off / Both. Compare dry sound separately from effects; no claim of equal wet sound.
 3. Check sustain, note-off, program changes, channel 10 drums, panic and release. Verify silence after release with effects off; verify effects tails with effects on.
 4. Open an SFZ with samples in its original relative directory. Play MIDI channel 1; test velocity layers, sustain, release, pitch wheel, CC, and sample offsets. Test switching from SF2 to SFZ and back, missing samples, save/reopen project. SFZ is single instrument, not 16 independent channels yet; aftertouch and complete SFZ opcode coverage not validated.
 5. Test realtime and offline render, sample rate changes, host blocks larger than 1024. Confirm TEST1 state restoration and keyboard accessibility. No Windows compile or REAPER runtime tests performed here.
+
+6. On editor entry NVDA should focus Open SF2 or SFZ (button). Alt+L opens Parameters; Esc returns to the Parameters button. Verify each accelerator focuses rather than invokes.
+7. Grid navigation: Home/End first/last, Up/Down adjacent, Page Up/Down five rows, Enter to value. Left/Right changes step (1/5/10/15/20); Up/Down and Page Up/Down change value, Enter goes back. Verify value and step announcements and that REAPER does not steal the arrows.
+8. SF2: test filter cutoff, resonance, attack/release, tuning on a single channel; compare other channels and reset with Backspace. Confirm bank/program and effects still work. Save/reopen and check explicit edits.
+9. SFZ: use an instrument containing label_ccN and set_ccN opcodes; check names, current values and MIDI response, including saving and restoring changes. Test an SFZ without CC labels. Check no effect on unedited sound and CPU at rest/playing.
+
+10. TEST7 CPU: with Effects Both, play notes, release sustain, wait for tails then at least two seconds of silence. Alt+S then activate Read status: Active voices should be 0, SF2 idle sleep yes. If the persistent spike returns, record the numbers BEFORE pressing Panic, then compare after Panic; note whether SF2 or SFZ was active and the effect type.
+11. Test all 8 reverb and chorus types, independent stereo/ping-pong delay, parameter reset and state restore. Verify SF2 native CC91/93 sends on Room/Hall/Plate and Chorus 1-4; master variants are not channel sends. Compare SFZ without FX and with FX. Check for stale echoes after mode changes; test 1-second delay and feedback.
+12. Compare output level against TEST6 at same preset/gain, try trim 0/12/24 dB and ensure loud chords do not overload downstream FX. Run standalone DSP test: g++ -std=c++17 -O2 Tests/OutputStageTest.cpp -o test_output && ./test_output. This does not compile the VST3.
