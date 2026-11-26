@@ -2,6 +2,7 @@
 #include <fluidsynth.h>
 #include <sfizz.h>
 #include "OutputStage.h"
+#include "SF2ChannelTrim.h"
 #include "MidiEffects.h"
 #include "ParameterSearchKey.h"
 #include <array>
@@ -22,7 +23,6 @@
 
 namespace {
 constexpr int channels = 16;
-constexpr int mixChunk=1024, dryBuffers=channels*2, wetBuffers=4;
 constexpr float channelGainMin=-60.0f, channelGainMax=6.0f;
 juce::String channelGainId(int ch) { return "channelGain"+juce::String(ch+1); }
 // Stable indices for global host parameters and XML attributes.
@@ -83,11 +83,10 @@ struct Engine {
     float midiMaster=1.0f;
     FXValues lastFx{};
     lsfx::OutputStage output;
-    // Each dry and wet output has its own storage. Never alias process() buffers.
-    juce::AudioBuffer<float> mixerScratch;
+    // SF2 stays on the TEST14 stereo path. SFZ still uses its audio gain.
+    std::array<lsfx::SF2ChannelTrim,channels> sf2Trims;
     std::array<juce::SmoothedValue<float,juce::ValueSmoothingTypes::Linear>,channels> channelGains;
     void prepareMixer() {
-        mixerScratch.setSize(dryBuffers+wetBuffers,mixChunk);
         for(auto& g:channelGains) { g.reset(rate,0.005); g.setCurrentAndTargetValue(1.0f); }
     }
     // Ambience defaults apply only to channels without an explicit CC91.
@@ -208,7 +207,7 @@ public:
         std::unique_lock<std::mutex> lock(engineMutex, std::try_to_lock);
         if (!lock.owns_lock()) { ++droppedBlocks; for(const auto m:midi) if(m.numBytes>0&&m.data[0]<0xf8) { panic.store(true); break; } midi.clear(); return; }
         if (!engine || std::abs(engine->rate-hostRate.load())>0.01 || b.getNumChannels()<2) { activeVoices.store(0); sleeping.store(false); midi.clear(); return; }
-        for(int ch=0;ch<channels;++ch) engine->channelGains[ch].setTargetValue(juce::Decibels::decibelsToGain(channelGain[ch]->get(),channelGainMin-1.0f));
+        if(engine->sfz) engine->channelGains[0].setTargetValue(juce::Decibels::decibelsToGain(channelGain[0]->get(),channelGainMin-1.0f));
         auto f=readFX(); int fx=effects->getIndex();
         const int followMode=midiFX->getIndex();
         if(engine->lastMidiFxMode!=followMode) {engine->midiDisabledFx=0; engine->lastMidiFxMode=followMode;}
@@ -254,6 +253,7 @@ public:
         const int q=quality->getIndex();
         bool controlChanged = q!=engine->quality || settingsChanged;
         if(applyControls(*engine)) controlChanged=true;
+        if(updateSF2Trims(*engine)) controlChanged=true;
         if(applyInitialAmbience(*engine,f[sf2Ambience])) controlChanged=true;
         if(q!=engine->quality) { const int methods[]={FLUID_INTERP_LINEAR,FLUID_INTERP_4THORDER,FLUID_INTERP_7THORDER}; fluid_synth_set_interp_method(s,-1,methods[q]); engine->quality=q; }
         if (panic.exchange(false)) { controlChanged=true; engine->resetFX(); for (int ch=0;ch<channels;++ch) { fluid_synth_cc(s,ch,64,0); fluid_synth_cc(s,ch,66,0); controlValues[controlIndex(ch,64)].store(0); controlValues[controlIndex(ch,66)].store(0); fluid_synth_all_sounds_off(s,ch); } }
@@ -261,6 +261,8 @@ public:
             const int cmd = commands[ch].exchange(-1);
             if (cmd>=0) { controlChanged=true; if(fluid_synth_program_select(s,ch,engine->font,cmd>>7,cmd&127)==FLUID_OK) selected[ch].store(cmd); }
         }
+        // A manual program change must also retain the user trim.
+        if(controlChanged) updateSF2Trims(*engine);
         // MIDI clock / sensing do not need to wake the synthesizer.
         bool relevantMidi=false;
         for(const auto m:midi) if(m.numBytes>0&&m.data[0]<0xf8) { relevantMidi=true; break; }
@@ -274,36 +276,12 @@ public:
         float rawPeak=0, wetPeak=0;
         auto render = [&](int start,int count) {
             if(count<=0) return;
-            // Dedicated non-overlapping dry and shared native FX buffers. Fixed
-            // chunks handle arbitrary host block lengths without allocations.
-            for(int offset=0;offset<count;) {
-                const int n=juce::jmin(mixChunk,count-offset);
-                auto& scratch=engine->mixerScratch;
-                scratch.clear(0,n);
-                std::array<float*,dryBuffers> dry{};
-                std::array<float*,wetBuffers> wet{};
-                for(int i=0;i<dryBuffers;++i) dry[i]=scratch.getWritePointer(i);
-                for(int i=0;i<wetBuffers;++i) wet[i]=scratch.getWritePointer(dryBuffers+i);
-                const int dst=start+offset;
-                if(fluid_synth_process(s,n,wetBuffers,wet.data(),dryBuffers,dry.data())!=FLUID_OK) {
-                    b.clear(0,dst,n); b.clear(1,dst,n);
-                    offset+=n; continue;
-                }
-                b.clear(0,dst,n); b.clear(1,dst,n);
-                auto* left=b.getWritePointer(0,dst); auto* right=b.getWritePointer(1,dst);
-                for(int ch=0;ch<channels;++ch) {
-                    auto& g=engine->channelGains[ch];
-                    if(g.isSmoothing()) {
-                        for(int i=0;i<n;++i) { const float v=g.getNextValue(); left[i]+=dry[ch*2][i]*v; right[i]+=dry[ch*2+1][i]*v; }
-                    } else {
-                        const float v=g.getCurrentValue();
-                        b.addFrom(0,dst,dry[ch*2],n,v); b.addFrom(1,dst,dry[ch*2+1],n,v);
-                    }
-                }
-                // Preserve original MIDI FX sends and shared native tails.
-                b.addFrom(0,dst,wet[0],n); b.addFrom(1,dst,wet[1],n);
-                b.addFrom(0,dst,wet[2],n); b.addFrom(1,dst,wet[3],n);
-                offset+=n;
+            // TEST14: use the original TEST11 single-stereo render path.
+            // All sixteen MIDI channels and the native FX are mixed by FluidSynth.
+            // Optional channel trim is applied to voice attenuation before mixing.
+            if(fluid_synth_write_float(s,count,b.getWritePointer(0,start),0,1,b.getWritePointer(1,start),0,1)!=FLUID_OK) {
+                b.clear(0,start,count); b.clear(1,start,count);
+                return;
             }
             rawPeak=juce::jmax(rawPeak,juce::jmax(b.getMagnitude(0,start,count),b.getMagnitude(1,start,count)));
             wetPeak=juce::jmax(wetPeak,processMaster(*engine,b,f,fx,start,count));
@@ -324,14 +302,15 @@ public:
                 if(len>0) fluid_synth_sysex(s,reinterpret_cast<const char*>(d+1),len,nullptr,nullptr,nullptr,0);
                 for(int c=0;c<channels;++c) { updateProgram(s,c); refreshFluidControls(s,c); }
                 applyMidiSysEx(*engine,d,n,f,fx);
+                updateSF2Trims(*engine);
             } else if(status<0xf0 && status>=0x80 && n>=2) {
                 const int a=d[1]&127, v=n>=3 ? d[2]&127 : 0;
                 switch(status&0xf0) {
                     case 0x80: if(n>=3) fluid_synth_noteoff(s,ch,a); break;
                     case 0x90: if(n>=3) { if(v) fluid_synth_noteon(s,ch,a,v); else fluid_synth_noteoff(s,ch,a); } break;
                     case 0xa0: if(n>=3) fluid_synth_key_pressure(s,ch,a,v); break;
-                    case 0xb0: if(n>=3) { receiveFluidCC(*engine,ch,a,v,f,fx); if(a==121||a==6||a==38||a==96||a==97) refreshFluidControls(s,ch); } break;
-                    case 0xc0: receiveProgram(ch,a); fluid_synth_program_change(s,ch,a); updateProgram(s,ch); break;
+                    case 0xb0: if(n>=3) { receiveFluidCC(*engine,ch,a,v,f,fx); if(a==121||a==6||a==38||a==96||a==97) { refreshFluidControls(s,ch); updateSF2Trim(*engine,ch); } } break;
+                    case 0xc0: receiveProgram(ch,a); fluid_synth_program_change(s,ch,a); updateProgram(s,ch); updateSF2Trim(*engine,ch); break;
                     case 0xd0: fluid_synth_channel_pressure(s,ch,a); break;
                     case 0xe0: if(n>=3) fluid_synth_pitch_bend(s,ch,a|(v<<7)); break;
                     default: break;
@@ -576,6 +555,16 @@ private:
         }
         return true;
     }
+    bool updateSF2Trim(Engine& e,int ch) {
+        return e.sf2Trims[ch].update(channelGain[ch]->get(),
+            [&]{return fluid_synth_get_gen(e.synth,ch,GEN_ATTENUATION);},
+            [&](float value){return fluid_synth_set_gen(e.synth,ch,GEN_ATTENUATION,value)==FLUID_OK;});
+    }
+    bool updateSF2Trims(Engine& e) {
+        bool changed=false;
+        for(int ch=0;ch<channels;++ch) changed=updateSF2Trim(e,ch)||changed;
+        return changed;
+    }
     void refreshFluidControls(fluid_synth_t* synth,int ch) {
         for(const auto& spec:sf2Controls) {
             int v=0;
@@ -665,15 +654,15 @@ private:
                         }
                     }
                 } else {
-                    fresh=std::make_unique<Engine>(); fresh->rate=r.rate; fresh->prepareFX(); fresh->prepareMixer();
+                    fresh=std::make_unique<Engine>(); fresh->rate=r.rate; fresh->prepareFX();
                     fresh->settings=new_fluid_settings();
                     if(fresh->settings) {
                         fluid_settings_setnum(fresh->settings,"synth.sample-rate",r.rate);
                         // Unity native gain, as in Scoring Synth. No artificial per-voice boost.
                         fluid_settings_setnum(fresh->settings,"synth.gain",1.0);
                         fluid_settings_setint(fresh->settings,"synth.midi-channels",16);
-                        fluid_settings_setint(fresh->settings,"synth.audio-channels",channels);
-                        fluid_settings_setint(fresh->settings,"synth.audio-groups",channels);
+                        fluid_settings_setint(fresh->settings,"synth.audio-channels",1);
+                        fluid_settings_setint(fresh->settings,"synth.audio-groups",1);
                         fluid_settings_setint(fresh->settings,"synth.effects-groups",1);
                         fluid_settings_setint(fresh->settings,"synth.polyphony",256);
                         fluid_settings_setint(fresh->settings,"synth.reverb.active",0);
@@ -683,8 +672,7 @@ private:
                         fluid_settings_setint(fresh->settings,"synth.cpu-cores",1);
                         fresh->synth=new_fluid_synth(fresh->settings);
                     }
-                    if(fresh->synth && fluid_synth_count_audio_channels(fresh->synth)==channels && fluid_synth_count_audio_groups(fresh->synth)==channels && fluid_synth_count_effects_channels(fresh->synth)*fluid_synth_count_effects_groups(fresh->synth)*2==wetBuffers)
-                        fresh->font=fluid_synth_sfload(fresh->synth,r.path.toRawUTF8(),1);
+                    if(fresh->synth) fresh->font=fluid_synth_sfload(fresh->synth,r.path.toRawUTF8(),1);
                     if(fresh->font<0) error="Unable to load SoundFont: "+r.path;
                     else {
                         fluid_synth_set_interp_method(fresh->synth,-1,FLUID_INTERP_4THORDER);
@@ -711,7 +699,7 @@ private:
                 overrides=r.controls; controlDirty.store(false);
                 for(int i=0;i<controlCount;++i) { controlValues[i].store(unset); controlCommands[i].store(unset); }
                 if(engine) {
-                    for(int ch=0;ch<channels;++ch) engine->channelGains[ch].setCurrentAndTargetValue(juce::Decibels::decibelsToGain(channelGain[ch]->get(),channelGainMin-1.0f));
+                    if(engine->sfz) engine->channelGains[0].setCurrentAndTargetValue(juce::Decibels::decibelsToGain(channelGain[0]->get(),channelGainMin-1.0f));
                     // Restore explicit overrides on the first audio callback, not the loader thread.
                     if(engine->synth) for(int ch=0;ch<channels;++ch) refreshFluidControls(engine->synth,ch);
                     else if(engine->sfz) for(const auto& cc:labels) controlValues[controlIndex(0,cc.cc)].store(cc.initial);
@@ -778,7 +766,7 @@ public:
     explicit Editor(Processor& p) : AudioProcessorEditor(p), proc(p) {
         setWantsKeyboardFocus(true);
         setFocusContainerType(juce::Component::FocusContainerType::keyboardFocusContainer);
-        title.setText("LSFX 0.0.1 TEST15",juce::dontSendNotification); title.setFont(juce::FontOptions(21.0f)); title.setAccessible(false); addAndMakeVisible(title);
+        title.setText("LSFX 0.0.1 TEST16",juce::dontSendNotification); title.setFont(juce::FontOptions(21.0f)); title.setAccessible(false); addAndMakeVisible(title);
         status.setText("No SoundFont loaded",juce::dontSendNotification); status.setTitle("Instrument status"); addAndMakeVisible(status);
         setup(open,"Open SF2 or SFZ",1); setup(parameters,"Parameters",2); setup(channel,"MIDI channel",3); setup(bank,"Bank",21); setup(program,"Program",22); setup(level,"Output gain",20);
         setup(grid,"Parameter grid",1); setup(value,"Parameter value",2); setup(closeGrid,"Close parameters",3);
@@ -798,12 +786,12 @@ public:
         level.onDragStart=[this]{proc.gainParameter().beginChangeGesture(); dragging=true;};
         level.onDragEnd=[this]{dragging=false;proc.gainParameter().endChangeGesture();};
         level.onValueChange=[this]{ auto& a=proc.gainParameter(); if(!dragging) a.beginChangeGesture(); a.setValueNotifyingHost(a.convertTo0to1(static_cast<float>(level.getValue()))); if(!dragging) a.endChangeGesture(); levelReadout.setText(juce::String(level.getValue(),1)+" dB",juce::dontSendNotification); };
-        channelGainLabel.setText("Channel output gains (dB) - Alt+U",juce::dontSendNotification);
+        channelGainLabel.setText("Channel gains / SF2 voice trims (dB) - Alt+U",juce::dontSendNotification);
         channelGainLabel.setAccessible(false); addAndMakeVisible(channelGainLabel);
         for(int ch=0;ch<channels;++ch) {
             auto& c=channelLevels[ch];
             setup(c,"Output gain channel "+juce::String(ch+1),4+ch);
-            c.setDescription("Left/right selects channel; up/down changes audio gain. Alt+left/right changes step.");
+            c.setDescription("Left/right selects channel; up/down changes level. SF2 uses a voice attenuation offset; SFZ uses audio gain. Alt+left/right changes step.");
             c.setSliderStyle(juce::Slider::LinearVertical); c.setTextBoxStyle(juce::Slider::NoTextBox,true,0,0);
             c.setRange(channelGainMin,channelGainMax,0.1); c.textFromValueFunction=[](double v){return juce::String(v,1)+" dB";};
             c.setValue(proc.channelGainParameter(ch).get(),juce::dontSendNotification);
