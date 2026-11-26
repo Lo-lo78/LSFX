@@ -1,3 +1,9 @@
+# LSFX 0.99.1 — release acceptance checks
+
+The user confirmed TEST26.1 working in REAPER. The release retains its audio implementation and dependency patch. Before release, compile the standard multigroup build and verify that the existing native and hybrid tests pass. With NVDA/JAWS: press Alt+A from Bank, Program, gain strip, grid and value. Verify read-only text contains LSFX, 0.99.1, 26 November 2026, license, project and contact; arrows, Home/End, Ctrl+Home/End, Shift selection and Ctrl+C work without double speech. Verify Tab/Shift+Tab cycle text/Project/Contact/Close; Enter, Esc and Alt+C behave as documented. Verify focus returns to the original control. Verify Alt+Enter stops notes without clearing map and Alt+A does not stop audio. Check no SAPI fallback and that the two HTML guides are in the package. Verify saved hybrid maps and routing from TEST26.1 still work. No full Windows build was performed in the authoring environment for this release.
+
+## Historical test records (commands may differ from 0.99.1)
+
 # TEST26.1 — current acceptance checks
 
 TEST26 compiled successfully on Windows, but the standalone FluidSynth 2.6.2 multigroup smoke test stopped at the first silent rendering. TEST26.1 patches the non-VLA allocation macro in the vcpkg dependency. Verify fluid-overlay.txt and vcpkg.txt show the overlay/patch, then confirm all stereo, multigroup and hybrid smoke tests pass. The exact crash stack was not available; the allocation defect is confirmed by source inspection, not by a Windows debugger.

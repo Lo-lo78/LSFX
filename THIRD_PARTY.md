@@ -23,3 +23,7 @@ TEST25 adapts the LJuno-116 0.99.67 stereo compressor detector and control range
 ## FluidSynth 2.6.2 Windows patch (TEST26.1)
 
 Upstream source: https://github.com/FluidSynth/fluidsynth/tree/v2.6.2 (LGPL-2.1-or-later). LSFX applies `Tools/fluidsynth-vla-size.patch` using a vcpkg overlay; the patch is included in the Windows distribution. It parenthesizes the length expression of the non-VLA fallback in `src/utils/fluidsynth_priv.h`, preventing an undersized stack allocation for compound expressions. No other dependency source changes are introduced by this patch.
+
+## 0.99.1
+
+About panel and caret navigation adapted from LJuno-116 0.99.67 (AGPL-3.0-or-later). The public release candidate keeps the existing static linkage and vcpkg overlay. Complete the distribution-compliance checklist above before distributing binaries; the provided notices alone do not establish compliance.

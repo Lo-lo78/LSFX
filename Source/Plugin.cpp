@@ -30,6 +30,11 @@
 
 namespace {
 constexpr int channels = 16;
+constexpr auto lsfxVersion="0.99.1";
+constexpr auto lsfxReleaseDate="26 November 2026";
+constexpr auto lsfxProjectUrl="https://github.com/Lo-lo78/LSFX";
+constexpr auto lsfxContactEmail="vmanolo301@gmail.com";
+constexpr auto lsfxLicense="GNU Affero General Public License v3 or later (AGPL-3.0-or-later)";
 const juce::String settingsName="LSFX";
 juce::File presetRoot() { return juce::File::getSpecialLocation(juce::File::userDocumentsDirectory).getChildFile("LSFX"); }
 juce::String setting(const juce::String& key) { juce::PropertiesFile f(preset_browser_memory::options(settingsName)); return f.getValue(key); }
@@ -1313,7 +1318,7 @@ public:
     explicit Editor(Processor& p) : AudioProcessorEditor(p), proc(p) {
         setWantsKeyboardFocus(true);
         setFocusContainerType(juce::Component::FocusContainerType::keyboardFocusContainer);
-        title.setText(sf2MultiOutput?"LSFX 0.0.1 TEST26.1":"LSFX 0.0.1 TEST26.1 SF2 stereo recovery",juce::dontSendNotification); title.setFont(juce::FontOptions(21.0f)); title.setAccessible(false); addAndMakeVisible(title);
+        title.setText(sf2MultiOutput?"LSFX 0.99.1":"LSFX 0.99.1 SF2 stereo recovery",juce::dontSendNotification); title.setFont(juce::FontOptions(21.0f)); title.setAccessible(false); addAndMakeVisible(title);
         status.setText("No SoundFont loaded",juce::dontSendNotification); status.setTitle("Instrument status"); addAndMakeVisible(status);
         setup(open,"Open SF2 or SFZ",1); setup(parameters,"Parameters",2); setup(channel,"MIDI channel",3); setup(bank,"Bank",37); setup(program,"Program",38); setup(level,"Master output gain",36);
         setup(grid,"Parameter grid",1); setup(value,"Parameter value",2); setup(closeGrid,"Close parameters",3);
@@ -1377,6 +1382,23 @@ public:
         panelText.onReturnKey=[this]{if(panelMode==Panel::name&&panelAction) {auto action=panelAction;action();}};
         panelText.onEscapeKey=[this]{cancelPanel();};
         panelLabel.setTitle("Preset information"); panelLabel.setJustificationType(juce::Justification::centredLeft); addAndMakeVisible(panelLabel);
+        setup(aboutButton,"About",42); aboutButton.setDescription("Alt+A"); aboutButton.onClick=[this]{openAbout();};
+        const auto aboutText=juce::String("LSFX\nVersion: ")+lsfxVersion+"\nRelease date: "+lsfxReleaseDate+"\nLicense: "+lsfxLicense+"\nProject: "+lsfxProjectUrl+"\nContact: "+lsfxContactEmail;
+        setup(aboutInfo,"About LSFX",1);
+        aboutInfo.setMultiLine(true,true); aboutInfo.setReturnKeyStartsNewLine(false); aboutInfo.setReadOnly(true);
+        aboutInfo.setScrollbarsShown(true); aboutInfo.setCaretVisible(true); aboutInfo.setPopupMenuEnabled(false);
+        aboutInfo.setTabKeyUsedAsCharacter(false); aboutInfo.setText(aboutText,false); aboutInfo.setDescription(aboutText);
+        aboutInfo.setJustification(juce::Justification::centredLeft); aboutInfo.setFont(juce::Font(juce::FontOptions(18.0f)));
+        aboutInfo.setBorder(juce::BorderSize<int>(12)); aboutInfo.onEscapeKey=[this]{closePanel();};
+        setup(aboutProject,juce::String("Project: ")+lsfxProjectUrl,2);
+        aboutProject.setButtonText(juce::String("Project: ")+lsfxProjectUrl);
+        aboutProject.setDescription("LSFX GitHub project URL. Press Enter to open in the default browser.");
+        aboutProject.onClick=[this]{openAboutLink(false);};
+        setup(aboutContact,juce::String("Contact: ")+lsfxContactEmail,3);
+        aboutContact.setButtonText(juce::String("Contact: ")+lsfxContactEmail);
+        aboutContact.setDescription("LSFX contact email. Press Enter to open the default email application.");
+        aboutContact.onClick=[this]{openAboutLink(true);};
+        setup(aboutClose,"Close",4); aboutClose.setDescription("Closes About. Shortcut Alt C"); aboutClose.onClick=[this]{closePanel();};
         hidePanelControls();
         presetRoot().createDirectory();
         lastGainChannel=proc.editorMemory.gainChannel; lastRouteChannel=proc.editorMemory.routeChannel;
@@ -1438,6 +1460,14 @@ public:
     }
     void resized() override {
         auto r=getLocalBounds().reduced(16); title.setBounds(r.removeFromTop(30)); status.setBounds(r.removeFromTop(30));
+        if(panelMode==Panel::about) {
+            auto a=r.withSizeKeepingCentre(juce::jmin(700,r.getWidth()),juce::jmin(430,r.getHeight()));
+            auto close=a.removeFromBottom(42); a.removeFromBottom(10);
+            auto contact=a.removeFromBottom(38); a.removeFromBottom(8);
+            auto project=a.removeFromBottom(38); a.removeFromBottom(10);
+            aboutInfo.setBounds(a); aboutProject.setBounds(project); aboutContact.setBounds(contact);
+            aboutClose.setBounds(close.withSizeKeepingCentre(140,36)); return;
+        }
         if(panelMode!=Panel::none) {
             panelLabel.setBounds(r.removeFromTop(82)); r.removeFromTop(8);
             if(panelMode==Panel::browser||panelMode==Panel::source) { auto buttons=r.removeFromBottom(38); parentButton.setBounds(buttons.removeFromLeft(150)); panelCancel.setBounds(buttons.removeFromRight(150)); presetList.setBounds(r); }
@@ -1462,7 +1492,7 @@ public:
         for(int ch=0;ch<channels;++ch) routeLevels[ch].setBounds(routes.getX()+ch*cellWidth,routes.getY(),cellWidth,routes.getHeight());
         auto lv=r.removeFromTop(38); levelLabel.setBounds(lv.removeFromLeft(200)); levelReadout.setBounds(lv.removeFromRight(100)); level.setBounds(lv.reduced(0,3));
         line(bankLabel,bank);line(programLabel,program);
-        auto buttons=r.removeFromTop(34); presetsButton.setBounds(buttons.removeFromLeft(210)); saveButton.setBounds(buttons.removeFromLeft(210)); saveAsButton.setBounds(buttons.removeFromLeft(210));
+        auto buttons=r.removeFromTop(34); presetsButton.setBounds(buttons.removeFromLeft(210)); saveButton.setBounds(buttons.removeFromLeft(210)); saveAsButton.setBounds(buttons.removeFromLeft(210)); aboutButton.setBounds(buttons.removeFromLeft(150));
     }
 private:
     Processor& proc;
@@ -1477,7 +1507,9 @@ private:
     Keyed<juce::TextButton> parentButton{"Back"},panelOK{"OK"},panelCancel{"Cancel"};
     juce::TextEditor panelText;
     juce::Label panelLabel;
-    enum class Panel {none,browser,name,confirm,source};
+    enum class Panel {none,browser,name,confirm,source,about};
+    Keyed<juce::TextButton> aboutButton{"About"},aboutProject{"Project"},aboutContact{"Contact"},aboutClose{"Close"};
+    Keyed<juce::TextEditor> aboutInfo{"About LSFX"};
     Panel panelMode=Panel::none;
     juce::File browserDirectory;
     juce::String lastRememberedInstrument;
@@ -1522,14 +1554,14 @@ private:
         for(;c&&c!=this;c=c->getParentComponent()) {
             if(c==&open)return 1; if(c==&parameters)return 2; if(c==&channel)return 3;
             if(c==&level)return 36; if(c==&bank)return 37; if(c==&program)return 38;
-            if(c==&presetsButton)return 39; if(c==&saveButton)return 40; if(c==&saveAsButton)return 41;
+            if(c==&presetsButton)return 39; if(c==&saveButton)return 40; if(c==&saveAsButton)return 41; if(c==&aboutButton)return 42;
             if(c==&grid)return 50; if(c==&value)return 51; if(c==&closeGrid)return 52;
             for(int i=0;i<channels;++i) {if(c==&channelLevels[i])return 4+i; if(c==&routeLevels[i])return 20+i;}
         } return 0;
     }
     juce::Component& focusTarget(int id) {
         if(id>=4&&id<20)return channelLevels[id-4]; if(id>=20&&id<36)return routeLevels[id-20];
-        switch(id) {case 2:return parameters;case 3:return channel;case 36:return level;case 37:return bank;case 38:return program;case 39:return presetsButton;case 40:return saveButton;case 41:return saveAsButton;case 50:return grid;case 51:return value;case 52:return closeGrid;default:return open;}
+        switch(id) {case 2:return parameters;case 3:return channel;case 36:return level;case 37:return bank;case 38:return program;case 39:return presetsButton;case 40:return saveButton;case 41:return saveAsButton;case 42:return aboutButton;case 50:return grid;case 51:return value;case 52:return closeGrid;default:return open;}
     }
     void rememberFocus(int id) {
         if(!id)return;
@@ -1623,7 +1655,7 @@ private:
     }
     void showGrid(bool show,juce::Component* destination=nullptr) {
         gridOpen=show; search.reset();
-        const auto main=std::array<juce::Component*,16>{&open,&parameters,&channel,&bank,&program,&level,&channelLabel,&bankLabel,&programLabel,&levelLabel,&levelReadout,&channelGainLabel,&routingLabel,&presetsButton,&saveButton,&saveAsButton};
+        const auto main=std::array<juce::Component*,17>{&open,&parameters,&channel,&bank,&program,&level,&channelLabel,&bankLabel,&programLabel,&levelLabel,&levelReadout,&channelGainLabel,&routingLabel,&presetsButton,&saveButton,&saveAsButton,&aboutButton};
         const auto panel=std::array<juce::Component*,6>{&grid,&value,&closeGrid,&gridTitle,&hint,&valueReadout};
         // Reveal the destination before hiding the old focused controls.
         if(show) for(auto* c:panel) c->setVisible(true);
@@ -1852,6 +1884,7 @@ private:
         if(outputCh>=0) lastGainChannel=outputCh;
         // Leave the host and the native combo popup in control of their own keys.
         if(chooser||catalogBusy) return false;
+        if(panelMode==Panel::about) return handleAboutKey(k,origin);
         if(panelMode!=Panel::none) return handlePanelKey(k,origin);
         if(importInProgress) return true;
         if(cached.loading&&(origin==&bank||origin==&program||origin==&channel)&&!alt&&!ctrl&&(vertical||horizontal||page||boundary||code==juce::KeyPress::returnKey||juce::CharacterFunctions::isLetterOrDigit(k.getTextCharacter()))) return true;
@@ -1897,7 +1930,8 @@ private:
                 if(vertical||page||boundary) {changeMainLevel(direction,page,boundary);return true;}
             }
             if(ch=='i') { requestInitialize(origin); return true; }
-            if(ch=='a') {proc.allOff(); if(origin) speak(*origin,"All sounds off"); return true;}
+            if(code==juce::KeyPress::returnKey) {proc.allOff(); if(origin) speak(*origin,"All sounds off"); return true;}
+            if(ch=='a') {openAbout(); return true;}
             if(ch=='s') {showStatus(); return true;}
             if(ch=='l') {openParameters();return true;}
             if(ch=='o') {browse();return true;}
@@ -1973,14 +2007,136 @@ private:
         if(auto* c=juce::Component::getCurrentlyFocusedComponent(); c!=nullptr&&isParentOf(c)) speak(*c,text);
         // No speech if there is no focused accessible control.
     }
+    // About panel and caret handling adapted from LJuno-116 (AGPL-3.0-or-later).
+    void openAbout() {
+        if(panelMode!=Panel::none) return;
+        hideMainForPanel(); hidePanelControls(); panelMode=Panel::about;
+        for(auto* c:std::array<juce::Component*,4>{&aboutInfo,&aboutProject,&aboutContact,&aboutClose}) {c->setVisible(true);c->toFront(false);}
+        resized(); repaint(); aboutInfo.setCaretPosition(0);
+        juce::AccessibilityHandler::clearCurrentlyFocusedHandler(); aboutInfo.grabKeyboardFocus();
+        if(auto* h=aboutInfo.getAccessibilityHandler()) h->grabFocus();
+    }
+    void openAboutLink(bool email) {
+        auto& control=email?aboutContact:aboutProject;
+        auto url=email?juce::String("mailto:")+lsfxContactEmail:juce::String(lsfxProjectUrl);
+        if(!juce::URL(url).launchInDefaultBrowser()) speak(control,email?"Cannot open the email application":"Cannot open the LSFX GitHub project page");
+    }
+    bool handleAboutKey(const juce::KeyPress& key,juce::Component* origin) {
+        const auto code=key.getKeyCode(); const auto mods=key.getModifiers();
+        const auto ch=juce::CharacterFunctions::toLowerCase(static_cast<juce::juce_wchar>(code));
+        if(code==juce::KeyPress::escapeKey||(mods.isAltDown()&&!mods.isCtrlDown()&&ch=='c')) {closePanel();return true;}
+        if(code==juce::KeyPress::tabKey) {
+            std::array<juce::Component*,4> controls{&aboutInfo,&aboutProject,&aboutContact,&aboutClose};
+            int i=0; for(int k=0;k<4;++k) if(controls[k]->hasKeyboardFocus(true)) {i=k;break;}
+            focus(*controls[(i+(mods.isShiftDown()?3:1))%4]); return true;
+        }
+        if(aboutInfo.hasKeyboardFocus(true)&&navigateAboutText(key)) return true;
+        if(code==juce::KeyPress::returnKey) {
+            if(origin==&aboutProject) openAboutLink(false);
+            else if(origin==&aboutContact) openAboutLink(true);
+            else closePanel(); return true;
+        }
+        if(key.getTextCharacter()==' '&&origin!=&aboutInfo) {
+            if(origin==&aboutProject) openAboutLink(false); else if(origin==&aboutContact) openAboutLink(true); else closePanel(); return true;
+        }
+        return false;
+    }
+    bool navigateAboutText (const juce::KeyPress& key)
+    {
+        const auto keyCode = key.getKeyCode();
+        const auto modifiers = key.getModifiers();
+        const bool selecting = modifiers.isShiftDown();
+        const bool byWordOrDocument = modifiers.isCtrlDown() || modifiers.isCommandDown();
+
+        // TextEditor caret/selection methods already emit the accessibility
+        // selection events used by NVDA, JAWS and Narrator.  Do not add a manual
+        // spoken announcement here: doing both is what caused each character to be
+        // spoken twice in the About panel.
+        if (keyCode == juce::KeyPress::leftKey)
+        {
+            aboutInfo.moveCaretLeft (byWordOrDocument, selecting);
+            return true;
+        }
+
+        if (keyCode == juce::KeyPress::rightKey)
+        {
+            aboutInfo.moveCaretRight (byWordOrDocument, selecting);
+            return true;
+        }
+
+        if (keyCode == juce::KeyPress::upKey)
+        {
+            if (byWordOrDocument && selecting)
+                aboutInfo.moveCaretToTop (true);
+            else
+                aboutInfo.moveCaretUp (selecting);
+            return true;
+        }
+
+        if (keyCode == juce::KeyPress::downKey)
+        {
+            if (byWordOrDocument && selecting)
+                aboutInfo.moveCaretToEnd (true);
+            else
+                aboutInfo.moveCaretDown (selecting);
+            return true;
+        }
+
+        if (keyCode == juce::KeyPress::homeKey)
+        {
+            if (byWordOrDocument)
+                aboutInfo.moveCaretToTop (selecting);
+            else
+                aboutInfo.moveCaretToStartOfLine (selecting);
+            return true;
+        }
+
+        if (keyCode == juce::KeyPress::endKey)
+        {
+            if (byWordOrDocument)
+                aboutInfo.moveCaretToEnd (selecting);
+            else
+                aboutInfo.moveCaretToEndOfLine (selecting);
+            return true;
+        }
+
+        if (keyCode == juce::KeyPress::pageUpKey)
+        {
+            aboutInfo.pageUp (selecting);
+            return true;
+        }
+
+        if (keyCode == juce::KeyPress::pageDownKey)
+        {
+            aboutInfo.pageDown (selecting);
+            return true;
+        }
+
+        const auto lowerKeyCode = juce::CharacterFunctions::toLowerCase (
+            static_cast<juce::juce_wchar> (keyCode));
+
+        if (byWordOrDocument && lowerKeyCode == 'a')
+        {
+            aboutInfo.selectAll();
+            return true;
+        }
+
+        if (byWordOrDocument && lowerKeyCode == 'c')
+        {
+            aboutInfo.copyToClipboard();
+            return true;
+        }
+
+        return false;
+    }
     void hidePanelControls() {
-        for(auto* c:std::array<juce::Component*,6>{&presetList,&parentButton,&panelOK,&panelCancel,&panelText,&panelLabel}) c->setVisible(false);
+        for(auto* c:std::array<juce::Component*,10>{&presetList,&parentButton,&panelOK,&panelCancel,&panelText,&panelLabel,&aboutInfo,&aboutProject,&aboutContact,&aboutClose}) c->setVisible(false);
     }
     void hideMainForPanel() {
         if(panelMode==Panel::none) {const int id=focusId(juce::Component::getCurrentlyFocusedComponent());panelReturn=id?id:proc.editorMemory.focus;}
         juce::ScopedValueSetter<bool> guard(focusTransition,true);
         if(gridOpen) showGrid(false);
-        for(auto* c:std::array<juce::Component*,16>{&open,&parameters,&channel,&bank,&program,&level,&channelLabel,&bankLabel,&programLabel,&levelLabel,&levelReadout,&channelGainLabel,&routingLabel,&presetsButton,&saveButton,&saveAsButton}) c->setVisible(false);
+        for(auto* c:std::array<juce::Component*,17>{&open,&parameters,&channel,&bank,&program,&level,&channelLabel,&bankLabel,&programLabel,&levelLabel,&levelReadout,&channelGainLabel,&routingLabel,&presetsButton,&saveButton,&saveAsButton,&aboutButton}) c->setVisible(false);
         for(auto& c:channelLevels) c.setVisible(false);
         for(auto& c:routeLevels) c.setVisible(false);
         initialFocusPending=false; returnFromChooser=false;
