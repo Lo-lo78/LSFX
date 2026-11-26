@@ -2,6 +2,7 @@
 #include <fluidsynth.h>
 #include <sfizz.h>
 #include "OutputStage.h"
+#include "MidiEffects.h"
 #include "ParameterSearchKey.h"
 #include <array>
 #include <atomic>
@@ -71,6 +72,9 @@ struct Engine {
     sfizz_synth_t* sfz = nullptr;
     int quality = -1, effects = -1;
     int quietSamples = 0;
+    int midiDisabledFx=0;
+    int lastMidiFxMode=-1;
+    float midiMaster=1.0f;
     FXValues lastFx{};
     lsfx::OutputStage output;
     lsfx::StereoDelay reverbDelay, modulation, delay;
@@ -106,6 +110,7 @@ public:
                 addParameter(fxParams[i]=new juce::AudioParameterChoice({f.key,1},f.label,choices,f.initial));
             } else addParameter(fxParams[i]=new juce::AudioParameterInt({f.key,1},f.label,f.lo,f.hi,f.initial));
         }
+        addParameter(midiFX = new juce::AudioParameterChoice({"midiFX",1}, "MIDI effects reception", {"Manual", "Follow MIDI"},1));
         for(int i=0;i<controlCount;++i) { controlValues[i].store(unset); controlCommands[i].store(unset); }
         worker = std::thread([this]{ work(); });
     }
@@ -148,13 +153,18 @@ public:
     int current(int ch) const { const auto cmd=commands[ch].load(); return cmd>=0 ? cmd : selected[ch].load(); }
     void select(int ch,int bank,int prog) { if (ch>=0 && ch<channels && bank>=0 && bank<=16383 && prog>=0 && prog<128) commands[ch].store(pack(bank,prog)); }
     void allOff() { panic.store(true); }
-    void loadFile(const juce::File& f) { load(f.getFullPathName(), defaults()); }
+    void loadFile(const juce::File& f) {
+        if(f.hasFileExtension("sf2;sf3") && midiFX->getIndex()==1 && effects->getIndex()==0)
+            effects->setValueNotifyingHost(effects->convertTo0to1(3.0f));
+        load(f.getFullPathName(), defaults());
+    }
     juce::AudioParameterFloat& gainParameter() { return *gain; }
     juce::AudioParameterChoice& qualityParameter() { return *quality; }
     juce::AudioParameterChoice& effectsParameter() { return *effects; }
+    juce::AudioParameterChoice& midiFXParameter() { return *midiFX; }
     juce::AudioParameterChoice& sfzQualityParameter() { return *sfzQuality; }
     juce::RangedAudioParameter& fxParameter(int i) { return *fxParams[i]; }
-    juce::String diagnostic() const { return "Active voices: "+juce::String(activeVoices.load())+"; SF2 idle sleep: "+(sleeping.load()?juce::String("yes"):juce::String("no"))+"; dropped engine-swap blocks: "+juce::String(droppedBlocks.load())+"; MIDI program changes: "+juce::String(programChanges.load())+"; last program change: "+lastProgramText(); }
+    juce::String diagnostic() const { return "Active voices: "+juce::String(activeVoices.load())+"; SF2 idle sleep: "+(sleeping.load()?juce::String("yes"):juce::String("no"))+"; dropped engine-swap blocks: "+juce::String(droppedBlocks.load())+"; MIDI program changes: "+juce::String(programChanges.load())+"; last program change: "+lastProgramText()+"; MIDI CC91: "+juce::String(reverbCC.load())+"; MIDI CC93: "+juce::String(chorusCC.load())+"; SysEx received: "+juce::String(sysexCount.load())+"; FX SysEx applied: "+juce::String(fxSysexCount.load()); }
     int getControl(int ch,int id) const {
         const int i=controlIndex(ch,id), pendingValue=controlCommands[i].load();
         return pendingValue==unset?controlValues[i].load():pendingValue;
@@ -176,7 +186,9 @@ public:
         std::unique_lock<std::mutex> lock(engineMutex, std::try_to_lock);
         if (!lock.owns_lock()) { ++droppedBlocks; for(const auto m:midi) if(m.numBytes>0&&m.data[0]<0xf8) { panic.store(true); break; } midi.clear(); return; }
         if (!engine || std::abs(engine->rate-hostRate.load())>0.01 || b.getNumChannels()<2) { activeVoices.store(0); sleeping.store(false); midi.clear(); return; }
-        const auto f=readFX(); const int fx=effects->getIndex();
+        auto f=readFX(); int fx=effects->getIndex();
+        const int followMode=midiFX->getIndex();
+        if(engine->lastMidiFxMode!=followMode) {engine->midiDisabledFx=0; engine->lastMidiFxMode=followMode;}
         const bool settingsChanged=configureFX(*engine,f,fx);
         if (engine->sfz) {
             auto* z=engine->sfz;
@@ -231,13 +243,17 @@ public:
         if(controlChanged||relevantMidi||before>0) engine->quietSamples=0;
         // FluidSynth renders each section preceding the corresponding MIDI event.
         // Its internal block size may still quantise event timing slightly.
+        float rawPeak=0, wetPeak=0;
         auto render = [&](int start,int count) {
-            if (count>0) fluid_synth_write_float(s,count,b.getWritePointer(0,start),0,1,b.getWritePointer(1,start),0,1);
+            if(count<=0) return;
+            fluid_synth_write_float(s,count,b.getWritePointer(0,start),0,1,b.getWritePointer(1,start),0,1);
+            rawPeak=juce::jmax(rawPeak,juce::jmax(b.getMagnitude(0,start,count),b.getMagnitude(1,start,count)));
+            wetPeak=juce::jmax(wetPeak,processMaster(*engine,b,f,fx,start,count));
         };
         int cursor=0;
         // VST3 delivers controllers in separate queues and SysEx/notes in an event list.
         // Restore setup ordering within each timestamp: SysEx, Bank Select, Program,
-        // then the other events. No allocation or reordering across timestamps.
+        // then other controls and notes. No allocation or reordering across timestamps.
         auto handleMidi = [&](const auto& meta) {
             if(meta.numBytes<=0||meta.data[0]>=0xf8) return;
             // Avoid allocating a MidiMessage for long SysEx messages.
@@ -245,16 +261,18 @@ public:
             if(n<=0) return;
             const int status=d[0], ch=status&15;
             if(status==0xf0 && n>=2) {
+                ++sysexCount;
                 int len=n-1; if(d[n-1]==0xf7) --len;
                 if(len>0) fluid_synth_sysex(s,reinterpret_cast<const char*>(d+1),len,nullptr,nullptr,nullptr,0);
                 for(int c=0;c<channels;++c) { updateProgram(s,c); refreshFluidControls(s,c); }
+                applyMidiSysEx(*engine,d,n,f,fx);
             } else if(status<0xf0 && status>=0x80 && n>=2) {
                 const int a=d[1]&127, v=n>=3 ? d[2]&127 : 0;
                 switch(status&0xf0) {
                     case 0x80: if(n>=3) fluid_synth_noteoff(s,ch,a); break;
                     case 0x90: if(n>=3) { if(v) fluid_synth_noteon(s,ch,a,v); else fluid_synth_noteoff(s,ch,a); } break;
                     case 0xa0: if(n>=3) fluid_synth_key_pressure(s,ch,a,v); break;
-                    case 0xb0: if(n>=3) { fluid_synth_cc(s,ch,a,v); if(a<120) controlValues[controlIndex(ch,a)].store(v); if(a==121||a==6||a==38||a==96||a==97) refreshFluidControls(s,ch); } break;
+                    case 0xb0: if(n>=3) { receiveFluidCC(*engine,ch,a,v,f,fx); if(a==121||a==6||a==38||a==96||a==97) refreshFluidControls(s,ch); } break;
                     case 0xc0: receiveProgram(ch,a); fluid_synth_program_change(s,ch,a); updateProgram(s,ch); break;
                     case 0xd0: fluid_synth_channel_pressure(s,ch,a); break;
                     case 0xe0: if(n>=3) fluid_synth_pitch_bend(s,ch,a|(v<<7)); break;
@@ -263,11 +281,12 @@ public:
             }
         };
         auto priority=[](const auto& m) {
-            if(m.numBytes<=0) return 3;
+            if(m.numBytes<=0) return 4;
             const int st=m.data[0];
             if(st==0xf0) return 0;
             if((st&0xf0)==0xb0 && m.numBytes>=3 && (m.data[1]==0 || m.data[1]==32)) return 1;
             if((st&0xf0)==0xc0) return 2;
+            if((st&0xf0)==0x80||(st&0xf0)==0x90) return 4;
             return 3;
         };
         for(auto first=midi.begin(), end=midi.end(); first!=end;) {
@@ -281,14 +300,12 @@ public:
             render(cursor,pos-cursor); cursor=pos;
             auto second=first; ++second;
             if(second==next) handleMidi(*first);
-            else for(int pass=0;pass<4;++pass)
+            else for(int pass=0;pass<5;++pass)
                 for(auto it=first;it!=next;++it) { const auto m=*it; if(priority(m)==pass) handleMidi(m); }
             first=next;
         }
         render(cursor,b.getNumSamples()-cursor);
         const int after=fluid_synth_get_active_voice_count(s); activeVoices.store(after);
-        const float rawPeak=juce::jmax(b.getMagnitude(0,0,b.getNumSamples()),b.getMagnitude(1,0,b.getNumSamples()));
-        const float wetPeak=processMaster(*engine,b,f,fx);
         if(after==0&&before==0&&!relevantMidi&&!controlChanged&&rawPeak<0.00001f&&wetPeak<0.00001f)
             engine->quietSamples=juce::jmin(sleepAfter,engine->quietSamples+b.getNumSamples());
         else engine->quietSamples=0;
@@ -297,7 +314,7 @@ public:
     void getStateInformation(juce::MemoryBlock& dest) override {
         juce::String path; Programs p; Controls c; stateForSave(path,p,&c);
         juce::XmlElement x("LSoundFontState");
-        x.setAttribute("version",4); for(int i=0;i<fxCount;++i) x.setAttribute(fxSpecs[i].key,readFXValue(i)); x.setAttribute("sfzQuality",sfzQuality->getIndex()); x.setAttribute("quality",quality->getIndex()); x.setAttribute("effects",effects->getIndex()); x.setAttribute("file",path); x.setAttribute("gain",static_cast<double>(gain->get()));
+        x.setAttribute("version",5); x.setAttribute("midiFX",midiFX->getIndex()); for(int i=0;i<fxCount;++i) x.setAttribute(fxSpecs[i].key,readFXValue(i)); x.setAttribute("sfzQuality",sfzQuality->getIndex()); x.setAttribute("quality",quality->getIndex()); x.setAttribute("effects",effects->getIndex()); x.setAttribute("file",path); x.setAttribute("gain",static_cast<double>(gain->get()));
         for(int i=0;i<channels;++i) x.setAttribute("ch"+juce::String(i+1),p[i]);
         for(int i=0;i<controlCount;++i) if(c[i]!=unset) {
             auto* entry=x.createNewChildElement("Control"); entry->setAttribute("index",i); entry->setAttribute("value",c[i]);
@@ -308,6 +325,7 @@ public:
         if(auto x=getXmlFromBinary(data,size)) if(x->hasTagName("LSoundFontState")) {
             auto p=defaults();
             for(int i=0;i<channels;++i) p[i]=juce::jlimit(0,pack(16383,127),x->getIntAttribute("ch"+juce::String(i+1),p[i]));
+            midiFX->setValueNotifyingHost(midiFX->convertTo0to1(float(juce::jlimit(0,1,x->getIntAttribute("midiFX",1)))));
             gain->setValueNotifyingHost(gain->convertTo0to1(static_cast<float>(x->getDoubleAttribute("gain",-6.0))));
             quality->setValueNotifyingHost(quality->convertTo0to1(static_cast<float>(juce::jlimit(0,2,x->getIntAttribute("quality",1)))));
             effects->setValueNotifyingHost(effects->convertTo0to1(static_cast<float>(juce::jlimit(0,3,x->getIntAttribute("effects",0)))));
@@ -335,8 +353,67 @@ private:
         lastProgram.store(pack(ch,program)); ++programChanges;
     }
     std::atomic<bool> sleeping{false};
+    std::atomic<int> reverbCC{0},chorusCC{0},sysexCount{0},fxSysexCount{0};
     int readFXValue(int i) const { const auto* p=fxParams[i]; return juce::jlimit(fxSpecs[i].lo,fxSpecs[i].hi,juce::roundToInt(p->convertFrom0to1(p->getValue()))); }
     FXValues readFX() const { FXValues f; for(int i=0;i<fxCount;++i) f[i]=readFXValue(i); return f; }
+    // MIDI input updates the underlying atomic parameter values without a host
+    // automation gesture or a UI callback on the audio thread.
+    void midiEffectMask(int next,int& fx) {
+        next=juce::jlimit(0,3,next);
+        if(next!=fx) { fx=next; static_cast<juce::AudioProcessorParameter*>(effects)->setValue(effects->convertTo0to1(float(fx))); }
+    }
+    void receiveFluidCC(Engine& e,int ch,int cc,int v,FXValues& f,int& fx) {
+        fluid_synth_cc(e.synth,ch,cc,v);
+        if(cc<120) controlValues[controlIndex(ch,cc)].store(v);
+        if(cc==91||cc==93) {
+            if(cc==91) ++reverbCC; else ++chorusCC;
+            const int bit=cc==91?1:2;
+            if(v>0 && midiFX->getIndex()==1 && !(e.midiDisabledFx&bit) && !(fx&bit)) {
+                midiEffectMask(fx|bit,fx); configureFX(e,f,fx);
+            }
+        }
+    }
+    void applyMidiSysEx(Engine& e,const std::uint8_t* data,int n,FXValues& f,int& fx) {
+        using K=lsfx::MidiFx;
+        const bool follow=midiFX->getIndex()==1;
+        auto set=[&](int i,int value) {
+            value=juce::jlimit(fxSpecs[i].lo,fxSpecs[i].hi,value);
+            if(f[i]!=value) { f[i]=value; static_cast<juce::AudioProcessorParameter*>(fxParams[i])->setValue(fxParams[i]->convertTo0to1(float(value))); }
+        };
+        bool applied=false;
+        lsfx::decodeMidiEffects(data,n,[&](K k,int v,int ch,int cc) {
+            if(k==K::masterVolume) { e.midiMaster=float(v)/16383.0f; applied=true; return; }
+            if(k==K::send) { receiveFluidCC(e,ch,cc,v,f,fx); applied=true; return; }
+            if(k==K::reset) { e.midiMaster=1.0f; e.midiDisabledFx=0; }
+            if(!follow) return;
+            applied=true;
+            switch(k) {
+                case K::reset:
+                    for(int i=0;i<inputTrim;++i) set(i,fxSpecs[i].initial);
+                    midiEffectMask(3,fx); break;
+                case K::reverbType: set(rvType,v); break;
+                case K::chorusType: set(chType,v); break;
+                case K::reverbLevel: set(rvLevel,v); break;
+                case K::reverbTime: set(rvTime,v); break;
+                case K::reverbFeedback: set(delayFeedback,v); break;
+                case K::chorusLevel: set(chLevel,v); break;
+                case K::chorusRate: set(chRate,v); break;
+                case K::chorusDepth: set(chDepth,v); break;
+                case K::chorusFeedback: set(chFeedback,v); break;
+                case K::delayLevel: set(delayMix,v); break;
+                case K::delayTime: set(delayTime,v); break;
+                case K::delayFeedback: set(delayFeedback,v); break;
+                case K::delayMode: set(delayMode,v); break;
+                case K::reverbEnable: case K::chorusEnable: {
+                    const int bit=k==K::reverbEnable?1:2;
+                    e.midiDisabledFx=v?e.midiDisabledFx&~bit:e.midiDisabledFx|bit;
+                    midiEffectMask(v?fx|bit:fx&~bit,fx); break;
+                }
+                default: break;
+            }
+        });
+        if(applied) { ++fxSysexCount; configureFX(e,f,fx); }
+    }
     static bool configureFX(Engine& e,const FXValues& f,int enabled) {
         if(e.lastFx==f&&e.effects==enabled) return false;
         const auto old=e.lastFx;
@@ -367,13 +444,13 @@ private:
         }
         e.effects=enabled; e.lastFx=f; return true;
     }
-    float processMaster(Engine& e,juce::AudioBuffer<float>& b,const FXValues& f,int enabled) {
+    float processMaster(Engine& e,juce::AudioBuffer<float>& b,const FXValues& f,int enabled,int start=0,int count=-1) {
         const bool reverbEcho=(enabled&1)&&f[rvType]>=6;
         const bool chorusCustom=(enabled&2)&&(e.sfz||f[chType]>=4);
         const bool extraDelay=f[delayMix]>0;
-        auto* l=b.getWritePointer(0); auto* r=b.getWritePointer(1); const int n=b.getNumSamples();
+        auto* l=b.getWritePointer(0,start); auto* r=b.getWritePointer(1,start); const int n=count<0?b.getNumSamples()-start:count;
         if(e.sfz&&(enabled&1)&&f[rvType]<6) e.sfzReverb.processStereo(l,r,n);
-        const float g=juce::Decibels::decibelsToGain(gain->get()), trim=juce::Decibels::decibelsToGain(float(f[inputTrim]));
+        const float g=juce::Decibels::decibelsToGain(gain->get())*e.midiMaster, trim=juce::Decibels::decibelsToGain(float(f[inputTrim]));
         float peak=0;
         for(int i=0;i<n;++i) {
             const float dryL=std::isfinite(l[i])?l[i]:0, dryR=std::isfinite(r[i])?r[i]:0; l[i]=dryL; r[i]=dryR; float wl=0,wr=0;
@@ -399,6 +476,7 @@ private:
     juce::AudioParameterFloat* gain = nullptr;
     juce::AudioParameterChoice* quality = nullptr;
     juce::AudioParameterChoice* effects = nullptr;
+    juce::AudioParameterChoice* midiFX = nullptr;
     juce::AudioParameterChoice* sfzQuality = nullptr;
     std::array<std::atomic<int>,controlCount> controlValues{}, controlCommands{};
     std::atomic<bool> controlDirty{false};
@@ -574,7 +652,7 @@ private:
 constexpr int stepWidths[]={1,5,10,15,20};
 constexpr int pageMultiplier=40;
 constexpr int gridRowsPerColumn=8, gridColumnsPerPage=2, gridPageRows=gridRowsPerColumn*gridColumnsPerPage;
-constexpr int rowGain=-1,rowInterpolation=-2,rowEffects=-3,rowSfzQuality=-4,rowChannel=-5;
+constexpr int rowGain=-1,rowInterpolation=-2,rowEffects=-3,rowSfzQuality=-4,rowChannel=-5,rowMidiFX=-6;
 struct GridRow { int id; juce::String name; double low,high,step; bool choice; juce::String unit; };
 
 template<class C> class Keyed : public C {
@@ -613,7 +691,7 @@ public:
     explicit Editor(Processor& p) : AudioProcessorEditor(p), proc(p) {
         setWantsKeyboardFocus(true);
         setFocusContainerType(juce::Component::FocusContainerType::keyboardFocusContainer);
-        title.setText("LSFX 0.0.1 TEST10",juce::dontSendNotification); title.setFont(juce::FontOptions(21.0f)); title.setAccessible(false); addAndMakeVisible(title);
+        title.setText("LSFX 0.0.1 TEST11",juce::dontSendNotification); title.setFont(juce::FontOptions(21.0f)); title.setAccessible(false); addAndMakeVisible(title);
         status.setText("No SoundFont loaded",juce::dontSendNotification); status.setTitle("Instrument status"); addAndMakeVisible(status);
         setup(open,"Open SF2 or SFZ",1); setup(parameters,"Parameters",2); setup(channel,"MIDI channel",3); setup(bank,"Bank",4); setup(program,"Program",5); setup(level,"Output gain",6); setup(stop,"Panic - all sounds off",7); setup(readStatus,"Read status",8);
         setup(grid,"Parameter grid",1); setup(value,"Parameter value",2); setup(closeGrid,"Close parameters",3);
@@ -788,6 +866,7 @@ private:
         }
         if(cached.ready&&!cached.loading) {
             rows.push_back({rowEffects,"Effects",0,3,1,true,{}});
+            if(!cached.isSfz) rows.push_back({rowMidiFX,"MIDI effects reception",0,1,1,true,{}});
             for(int i=0;i<fxCount;++i) { const auto& f=fxSpecs[i]; rows.push_back({fxRow(i),f.label,double(f.lo),double(f.hi),1,i==rvType||i==chType||i==delayMode,f.unit}); }
         }
         gridTitle.setText(cached.ready&&!cached.loading?(cached.isSfz?"SFZ parameters":"SF2 parameters - channel "+juce::String(selectedChannel()+1)):"Parameters",juce::dontSendNotification);
@@ -801,6 +880,7 @@ private:
         if(r.id==rowGain) return proc.gainParameter().get();
         if(r.id==rowInterpolation) return proc.qualityParameter().getIndex();
         if(r.id==rowEffects) return proc.effectsParameter().getIndex();
+        if(r.id==rowMidiFX) return proc.midiFXParameter().getIndex();
         if(r.id==rowSfzQuality) return proc.sfzQualityParameter().getIndex();
         if(r.id==rowChannel) return selectedChannel()+1;
         return proc.getControl(selectedChannel(),r.id);
@@ -814,6 +894,7 @@ private:
         }
         if(r.id==rowGain) return juce::String(v,1)+r.unit;
         if(r.id==rowInterpolation) return proc.qualityParameter().choices[juce::jlimit(0,2,juce::roundToInt(v))];
+        if(r.id==rowMidiFX) return proc.midiFXParameter().choices[juce::jlimit(0,1,juce::roundToInt(v))];
         if(r.id==rowEffects) return proc.effectsParameter().choices[juce::jlimit(0,3,juce::roundToInt(v))];
         if(r.id==rowSfzQuality) return proc.sfzQualityParameter().choices[juce::jlimit(0,11,juce::roundToInt(v))];
         return juce::String(juce::roundToInt(v))+r.unit;
@@ -826,6 +907,7 @@ private:
         else if(r.id==rowGain) set(proc.gainParameter());
         else if(r.id==rowInterpolation) set(proc.qualityParameter());
         else if(r.id==rowEffects) set(proc.effectsParameter());
+        else if(r.id==rowMidiFX) set(proc.midiFXParameter());
         else if(r.id==rowSfzQuality) set(proc.sfzQualityParameter());
         else if(r.id==rowChannel) { channel.setSelectedId(juce::roundToInt(v),juce::dontSendNotification); shownCode=-1; refresh(true); gridTitle.setText("SF2 parameters - channel "+juce::String(selectedChannel()+1),juce::dontSendNotification); }
         else proc.setControl(selectedChannel(),r.id,juce::roundToInt(v));
@@ -842,8 +924,10 @@ private:
     }
     void refreshGridValues() {
         if(!gridOpen||grid.isPopupActive()) return;
+        const int selectedId=grid.getSelectedId();
         bool changed=false; updatingGrid=true;
         for(size_t i=0;i<rows.size();++i) { const auto text=rowLine(rows[i]); if(grid.getItemText(static_cast<int>(i))!=text) {grid.changeItemText(static_cast<int>(i)+1,text); changed=true;} }
+        if(selectedId>0 && grid.getSelectedId()!=selectedId) grid.setSelectedId(selectedId,juce::dontSendNotification);
         if(auto* r=selectedRow()) {
             const double v=readRow(*r); const auto text=formatValue(*r,v);
             if(!value.isMouseButtonDown()) {
@@ -908,7 +992,7 @@ private:
         const bool horizontal=code==juce::KeyPress::leftKey||code==juce::KeyPress::rightKey;
         const bool page=code==juce::KeyPress::pageUpKey||code==juce::KeyPress::pageDownKey;
         const bool boundary=code==juce::KeyPress::homeKey||code==juce::KeyPress::endKey;
-        const int direction=code==juce::KeyPress::upKey||code==juce::KeyPress::pageUpKey||code==juce::KeyPress::endKey||code==juce::KeyPress::rightKey?1:-1;
+        const int direction=code==juce::KeyPress::upKey||code==juce::KeyPress::pageUpKey||code==juce::KeyPress::homeKey||code==juce::KeyPress::rightKey?1:-1;
         // Leave the host and the native combo popup in control of their own keys.
         if(chooser||grid.isPopupActive()||bank.isPopupActive()||program.isPopupActive()||channel.isPopupActive()) return false;
         if(alt&&!ctrl&&!mods.isShiftDown()) {
@@ -958,6 +1042,7 @@ private:
                     else if(copy.id==rowGain) reset=-6;
                     else if(copy.id==rowInterpolation) reset=1;
                     else if(copy.id==rowEffects||copy.id==rowSfzQuality) reset=0;
+                    else if(copy.id==rowMidiFX) reset=1;
                     else supported=false;
                     if(supported) {writeRow(copy,reset);refreshGridValues();speak(*origin,formatValue(copy,readRow(copy)));}
                 }

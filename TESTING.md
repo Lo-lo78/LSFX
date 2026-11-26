@@ -1,4 +1,4 @@
-# TEST10
+# TEST11
 1. Remove old LSoundFont VST3 from scan paths (same plugin ID); install LSFX. Scan REAPER.
 2. Open FluidR3 GM.sf2. Play same MIDI, host sample rate and block size as TEST1. Compare REAPER Performance Meter at rest, 1 note, 4 notes, and full MIDI arrangement. Use generic UI to compare Fourth order / Seventh order and effects Off / Both. Compare dry sound separately from effects; no claim of equal wet sound.
 3. Check sustain, note-off, program changes, channel 10 drums, panic and release. Verify silence after release with effects off; verify effects tails with effects on.
@@ -20,3 +20,6 @@
 16. Standalone incremental search test: g++ -std=c++17 -O2 Tests/IncrementalParameterSearchTests.cpp -o test_search && LC_ALL=C.UTF-8 ./test_search. Windows compilation and REAPER/NVDA behavior are not verified locally.
 
 17. TEST10: load FluidR3, wait for Loaded, then play from the beginning of a multichannel GM MIDI item with different Program Changes (including channel 10). Inspect Bank/Program for each channel and activate Read status (Alt+S, Enter) to verify received count and last program. Test programs 0, 1, 63, 64, 65, 127, repeated program changes, CC0/32 immediately preceding Program Change, and channels 1 and 16. Test a mid-song program change, restart and project save/reopen. Verify no CC0 misrouting to the next channel and check that existing CC automation still works. The bundled MIDI regression file uses all 16 channels with distinct programs; channel 10 is percussion. The host may cache VST3 mapping: restart REAPER and clear/re-scan if necessary.
+
+18. TEST11: open Parameters, select Reverb level, hold Alt+Up repeatedly, then release Alt and navigate using plain arrows. Verify the selection remains valid and the displayed value follows every edit. Repeat on CC91, a generator, an FX choice, and Value mode. Alt+Home=maximum, Alt+End=minimum. Plain Home/End on Grid=first/last.
+19. Load FluidR3 and play Tests/GM-FX-reception.mid from the start. Confirm Program, CC91 and CC93 counts; GS reset and effect macro changes should appear in the grid. Test Follow MIDI vs Manual: Manual must leave global FX settings unchanged by MIDI macro messages, but receive per-channel CC sends. Test the original MIDI file and check Read status if results differ. Test both engines, idle CPU and panic. A full MIDI device emulation is not implied.
