@@ -1,4 +1,4 @@
-# TEST18
+# TEST19
 1. Remove old LSoundFont VST3 from scan paths (same plugin ID); install LSFX. Scan REAPER.
 2. Open FluidR3 GM.sf2. Play same MIDI, host sample rate and block size as TEST1. Compare REAPER Performance Meter at rest, 1 note, 4 notes, and full MIDI arrangement. Use generic UI to compare Fourth order / Seventh order and effects Off / Both. Compare dry sound separately from effects; no claim of equal wet sound.
 3. Check sustain, note-off, program changes, channel 10 drums, panic and release. Verify silence after release with effects off; verify effects tails with effects on.
@@ -47,3 +47,12 @@ Local native trim check: `python Tests/FluidStereoTrimTest.py /path/to/FluidR3.s
 - Set CC91 and CC93 to 127, activate reverb/chorus/delay, route an individual channel away from Main before playing. Compare Main and auxiliary output; no new native send from that channel, and no LSFX master effects on the aux. Old shared FX tails may decay. Return to Main and verify sends restored.
 - Save/reopen project, test automation and disabled aux buses (must not redirect to Main). Test SFZ CH1 routing, effects programmed inside SFZ are outside LSFX bypass.
 - Local native regression: `python Tests/FluidMultiOutputTest.py /path/to/GM.sf2` (requires installed FluidSynth). Uses distinct dry and wet planes, irregular block sizes and one native FX group, compares with single-group native stereo. This is not a JUCE or Windows test.
+
+
+## TEST19 accessibility and preset checks
+
+1. Load a working SF2 and press Alt+L from main controls. Verify focus reaches the grid, Down selects Output routing channel 1, further arrows reach other parameters, Home/End are column-local, Ctrl+Home/End global. Test with NVDA; no long description. Test Enter/Tab and Escape, Alt+arrow edits and silent boundaries. Change MIDI channel in main or grid, verify gain and route labels and values follow. Test SFZ and an empty instance.
+2. In main, Ctrl+S without an existing preset asks for name; save in Documents/LSFX. Modify programs, gain, routing, CC offsets and FX, Ctrl+S again, then Alt+B and Enter to reload. Ctrl+Shift+S opens name editor, duplicate name asks confirmation, Escape cancels. Check project reopen retains current preset association and all existing state.
+3. Browse folders, initial-letter navigation, Backspace, F2, Ctrl+N, Shift+F10 and Delete (files only, confirmation). Escape from browser does not load selected preset. Reopen browser and verify last successfully loaded selection across plug-in instances; Save As alone does not change browser recall.
+4. Save a preset referencing a removable drive. Disconnect, select preset, Enter: missing absolute path is announced; current instrument is untouched. Retry while absent stays in dialog. Reconnect drive, Retry restores the preset. Escape/Cancel returns without loading. Repeat with a restored host project; missing-file dialog appears when editor is focused.
+5. Standalone navigation regression: g++ -std=c++17 -O2 Tests/GridNavigationTest.cpp -o test_grid && ./test_grid. Existing four standalone C++ tests and native FluidMultiOutputTest.py with TimGM6mb.sf2 also passed locally. These do not compile or exercise the Windows VST3 or the new UI/preset code.

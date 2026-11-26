@@ -15,3 +15,5 @@ TEST3 guards duplicate cxxopts alias declarations in the pinned sfizz dependency
 TEST5 fixes the sfizz 1.2.3 license path to LICENSE and records packaging logs.
 
 TEST9 reuses the incremental parameter search and search-key mapping from the user's LJuno-116 0.99.67 source, licensed AGPL-3.0-or-later. Preserve attribution and the applicable licence terms. The licence notice from that source is included in Doc/LJuno-116-LICENSE.md.
+
+TEST19 also copies the LJuno-116 PresetBrowserMemory.h helper (AGPL-3.0-or-later) and adapts its folder browser workflow. See Doc/LJuno-116-LICENSE.md.
