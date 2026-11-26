@@ -2,6 +2,7 @@
 #include <fluidsynth.h>
 #include <sfizz.h>
 #include "OutputStage.h"
+#include "ChannelCompressor.h"
 #include "SF2ChannelTrim.h"
 #include "MidiEffects.h"
 #include "ParameterSearchKey.h"
@@ -40,11 +41,17 @@ constexpr int stereoBuses=17, renderChunk=1024;
 // TEST20: repeated Windows host crashes on multigroup SF2. Keep the
 // routing implementation and state for later investigation, but ship only
 // the previously validated single-stereo native path for SF2.
-constexpr bool sf2MultiOutput=false;
+#ifndef LSFX_EXPERIMENTAL_SF2_MULTIGROUP
+ #define LSFX_EXPERIMENTAL_SF2_MULTIGROUP 0
+#endif
+constexpr bool sf2MultiOutput=LSFX_EXPERIMENTAL_SF2_MULTIGROUP!=0;
+juce::String compressorId(int ch,int param) {return "channelCompressor_"+juce::String(ch+1)+"_"+lsfx::compSpecs[param].key;}
 juce::String routeName(int bus) { return bus==0?juce::String("Main 1/2"):juce::String(2*bus+1)+"/"+juce::String(2*bus+2); }
 juce::String routeId(int ch) { return "channelRoute"+juce::String(ch+1); }
 juce::StringArray routeChoices() { juce::StringArray a; for(int i=0;i<stereoBuses;++i) a.add(routeName(i)); return a; }
 constexpr float channelGainMin=-60.0f, channelGainMax=6.0f;
+constexpr float sfzGainMin=-60.0f, sfzGainMax=24.0f;
+using InstrumentGains=std::map<int,float>;
 juce::String channelGainId(int ch) { return "channelGain"+juce::String(ch+1); }
 // Stable indices for global host parameters and XML attributes.
 enum FXParam { rvType, rvLevel, rvTime, rvDamp, rvWidth, chType, chLevel, chRate, chDepth, chFeedback, delayMode, delayTime, delayFeedback, delayMix, inputTrim, drumTrim, sf2Dynamics, sf2Ambience, fxCount };
@@ -141,6 +148,8 @@ struct SfzSlot {
     sfizz_synth_t* synth=nullptr;
     int owner=-1, defaultQuality=0, appliedQuality=-1;
     bool used=false;
+    juce::SmoothedValue<float> instrumentGain;
+    bool gainPrimed=false;
     ~SfzSlot() { if(synth) sfizz_free(synth); }
     void stop() {
         sfizz_send_cc(synth,0,64,0); sfizz_send_cc(synth,0,123,0);
@@ -223,7 +232,7 @@ struct Engine {
         if(!p||p->sfzIndex<0) return true;
         auto& source=sfzSources[static_cast<size_t>(p->sfzIndex)];
         for(auto& candidate:source.pool) if(candidate&&candidate->owner<0) {
-            auto& slot=*candidate; slot.owner=ch;
+            auto& slot=*candidate; slot.owner=ch; slot.gainPrimed=false;
             sfzActive[ch]=&slot; sfzAddress[ch]=code;
             if(slot.used) {
                 // Restore instrument defaults when reusing an instance on another channel.
@@ -253,9 +262,11 @@ struct Engine {
     std::array<std::array<SendOffset,2>,channels> sendOffsets{};
     // Preserve native voice trim and its MIDI semantics.
     std::array<lsfx::SF2ChannelTrim,channels> sf2Trims;
+    std::array<lsfx::ChannelCompressor,channels> compressors;
     std::array<juce::SmoothedValue<float,juce::ValueSmoothingTypes::Linear>,channels> channelGains;
     void prepareMixer() {
         for(auto& g:channelGains) { g.reset(rate,0.005); g.setCurrentAndTargetValue(1.0f); }
+        for(auto& c:compressors) c.prepare(rate);
     }
     // Ambience defaults apply only to channels without an explicit CC91.
     std::array<bool,channels> reverbSendExplicit{};
@@ -263,7 +274,7 @@ struct Engine {
     lsfx::StereoDelay reverbDelay, modulation, delay;
     juce::Reverb sfzReverb;
     void prepareFX() { lastFx.fill(-1); output.prepare(rate); reverbDelay.prepare(rate); modulation.prepare(rate); delay.prepare(rate); sfzReverb.setSampleRate(rate); sfzModulation.prepare(rate); sfzAddress.fill(-1); }
-    void resetFX() { output.reset(); reverbDelay.reset(); modulation.reset(); delay.reset(); sfzReverb.reset(); sfzModulation.reset(); quietSamples=0; }
+    void resetFX() { for(auto& c:compressors) c.reset(); output.reset(); reverbDelay.reset(); modulation.reset(); delay.reset(); sfzReverb.reset(); sfzModulation.reset(); quietSamples=0; }
 
     int font = -1;
     std::vector<Preset> map;
@@ -272,7 +283,7 @@ struct Engine {
 };
 using Programs = std::array<int, channels>;
 Programs defaults() { Programs p{}; p[9] = pack(128, 0); return p; }
-struct Request { juce::String path; double rate = 44100; Programs programs = defaults(); uint64_t serial = 0; Controls controls=emptyControls(); MapEdits edits; int sfzCode=0; };
+struct Request { juce::String path; double rate = 44100; Programs programs = defaults(); uint64_t serial = 0; Controls controls=emptyControls(); MapEdits edits; int sfzCode=0; std::optional<InstrumentGains> restoredGains; int resetGainBank=-1,resetGainProgram=-1; };
 struct View { juce::String path, status = "No SoundFont loaded"; std::vector<Preset> presets; uint64_t revision = 0; bool loading = false; bool ready=false; std::map<juce::String,std::vector<CCLabel>> labels; };
 }
 
@@ -306,6 +317,15 @@ public:
         // Append, preserving all existing parameter identifiers and ordering.
         for(int ch=0;ch<channels;++ch) addParameter(channelGain[ch]=new juce::AudioParameterFloat({channelGainId(ch),1}, "Output gain CH "+juce::String(ch+1), juce::NormalisableRange<float>(channelGainMin,channelGainMax,0.1f),0.0f,juce::AudioParameterFloatAttributes().withLabel("dB")));
         for(int ch=0;ch<channels;++ch) addParameter(channelRoute[ch]=new juce::AudioParameterChoice({routeId(ch),1}, "Output routing CH "+juce::String(ch+1),routeChoices(),0));
+        // Append new automation parameters: preserve all existing IDs/order.
+        for(int ch=0;ch<channels;++ch) for(int i=0;i<lsfx::compCount;++i) {
+            const auto& spec=lsfx::compSpecs[i];
+            const auto name=juce::String(spec.name)+" CH "+juce::String(ch+1);
+            if(i==lsfx::compRatio) {
+                juce::StringArray choices; for(auto* item:lsfx::compRatioNames) choices.add(item);
+                addParameter(compParams[ch][i]=new juce::AudioParameterChoice({compressorId(ch,i),1},name,choices,int(spec.initial)));
+            } else addParameter(compParams[ch][i]=new juce::AudioParameterFloat({compressorId(ch,i),1},name,juce::NormalisableRange<float>(spec.lo,spec.hi,spec.step),spec.initial,juce::AudioParameterFloatAttributes().withLabel(juce::String(spec.unit).trim())));
+        }
         for(int i=0;i<controlCount;++i) { controlValues[i].store(unset); controlCommands[i].store(unset); }
         worker = std::thread([this]{ work(); });
     }
@@ -341,8 +361,8 @@ public:
         const auto old = hostRate.exchange(rate);
         if (std::abs(old-rate)>0.01) {
             juce::String path; Programs p; Controls c; MapEdits edits; int sfzCode=0;
-            stateForSave(path,p,&c,&edits,&sfzCode);
-            if (path.isNotEmpty()||!edits.empty()) load(path,p,c,std::move(edits),sfzCode);
+            InstrumentGains savedGains; stateForSave(path,p,&c,&edits,&sfzCode,&savedGains);
+            if (path.isNotEmpty()||!edits.empty()) load(path,p,c,std::move(edits),sfzCode,false,std::move(savedGains));
         }
     }
     void releaseResources() override { panic.store(true); }
@@ -359,7 +379,7 @@ public:
         panic.store(true);
         setCurrentPresetFile(juce::File{});
         setUiChannel(0);
-        load({},defaults(),emptyControls());
+        load({},defaults(),emptyControls(),{},0,false,InstrumentGains{});
         for(auto* parameter:getParameters()) {
             if(parameter->getValue()!=parameter->getDefaultValue()) {
                 parameter->beginChangeGesture();
@@ -367,6 +387,21 @@ public:
                 parameter->endChangeGesture();
             }
         }
+    }
+    // Editor-only state belongs to this processor instance, not to the temporary editor.
+    struct EditorMemory { int focus=1,gridReturn=2,gainChannel=0,routeChannel=0,sf2Row=-1,sfzRow=-1,emptyRow=-1,step=0; };
+    EditorMemory editorMemory;
+    float instrumentGain(int code) {
+        std::lock_guard<std::mutex> audio(engineMutex);
+        const auto it=instrumentGains.find(code); return it==instrumentGains.end()?0.0f:it->second;
+    }
+    void setInstrumentGain(int code,float db) {
+        std::lock_guard<std::mutex> audio(engineMutex);
+        if(!engine||!std::isfinite(db)) return;
+        const auto* preset=findPreset(engine->map,code);
+        if(!preset||preset->sfzIndex<0) return;
+        db=juce::jlimit(sfzGainMin,sfzGainMax,db);
+        if(std::abs(db)<0.00001f) instrumentGains.erase(code); else instrumentGains[code]=db;
     }
     int uiChannel() const { return editorChannel.load(); }
     void setUiChannel(int ch) { editorChannel.store(juce::jlimit(0,channels-1,ch)); }
@@ -379,7 +414,7 @@ public:
         edits.push_back({destBank,destProgram,sourceBank,sourceProgram,file.getFullPathName()});
         p[ch]=pack(destBank,destProgram<0?(p[ch]&127):destProgram);
         if(midiFX->getIndex()==1&&effects->getIndex()==0) effects->setValueNotifyingHost(effects->convertTo0to1(3.0f));
-        load(path,p,c,std::move(edits),sfzCode,true); return juce::Result::ok();
+        load(path,p,c,std::move(edits),sfzCode,true,std::nullopt,destBank,destProgram); return juce::Result::ok();
     }
     juce::Result importSFZ(const juce::File& file,int code,int ch) {
         if(!lsfx::validAddress(code>>7,code&127)||ch<0||ch>=channels||!file.hasFileExtension("sfz")||!file.existsAsFile()) return juce::Result::fail("Invalid SFZ assignment");
@@ -390,7 +425,7 @@ public:
         // Preserve the single-SFZ opening convention on a completely empty map.
         // Explicit assignments in a populated map keep their addresses unchanged.
         if(path.isEmpty()&&edits.size()==1) for(int i=0;i<channels;++i) if(i!=ch&&p[i]==code) p[i]=pack(code>>7,(code+1)&127);
-        p[ch]=code; load(path,p,c,std::move(edits),sfzCode,true); return juce::Result::ok();
+        p[ch]=code; load(path,p,c,std::move(edits),sfzCode,true,std::nullopt,code>>7,code&127); return juce::Result::ok();
     }
     juce::File currentPresetFile() { std::lock_guard<std::mutex> lock(presetMutex); return currentPreset; }
     void setCurrentPresetFile(const juce::File& f) { std::lock_guard<std::mutex> lock(presetMutex); currentPreset=f; }
@@ -428,11 +463,13 @@ public:
             effects->setValueNotifyingHost(effects->convertTo0to1(3.0f));
         auto p=defaults();
         if(f.hasFileExtension("sfz")) for(int ch=1;ch<channels;++ch) if(p[ch]==0) p[ch]=pack(0,1);
-        load(f.getFullPathName(), p);
+        load(f.getFullPathName(),p,emptyControls(),{},0,false,InstrumentGains{});
     }
     juce::AudioParameterFloat& gainParameter() { return *gain; }
     juce::AudioParameterFloat& channelGainParameter(int ch) { return *channelGain[static_cast<size_t>(ch)]; }
     juce::AudioParameterChoice& routeParameter(int ch) { return *channelRoute[static_cast<size_t>(ch)]; }
+    juce::RangedAudioParameter& compressorParameter(int ch,int i) {return *compParams[ch][i];}
+    float compressorValue(int ch,int i) const {auto* p=compParams[ch][i];return p->convertFrom0to1(p->getValue());}
     juce::AudioParameterChoice& qualityParameter() { return *quality; }
     juce::AudioParameterChoice& effectsParameter() { return *effects; }
     juce::AudioParameterChoice& midiFXParameter() { return *midiFX; }
@@ -461,6 +498,11 @@ public:
         if (!lock.owns_lock()) { ++droppedBlocks; for(const auto m:midi) if(m.numBytes>0&&m.data[0]<0xf8) { panic.store(true); break; } midi.clear(); return; }
         if (clearing.load() || !engine || std::abs(engine->rate-hostRate.load())>0.01 || b.getNumChannels()<2) { activeVoices.store(0); sleeping.store(false); midi.clear(); return; }
         for(int ch=0;ch<channels;++ch) engine->channelGains[ch].setTargetValue(juce::Decibels::decibelsToGain(channelGain[ch]->get(),channelGainMin-1.0f));
+        for(int ch=0;ch<channels;++ch) {
+            lsfx::CompValues values{};
+            for(int i=0;i<lsfx::compCount;++i) values[i]=compressorValue(ch,i);
+            engine->compressors[ch].configure(values);
+        }
         bool routingChanged=false;
         for(int ch=0;ch<channels;++ch) {
             const int next=(engine->sfzActive[ch]||sf2MultiOutput)?channelRoute[ch]->getIndex():0;
@@ -527,15 +569,18 @@ public:
                     std::array<float*,4> wetPtrs{};
                     for(size_t i=0;i<dryPtrs.size();++i) { dryPtrs[i]=engine->dry[i].data(); std::fill_n(dryPtrs[i],n,0.0f); }
                     for(size_t i=0;i<wetPtrs.size();++i) { wetPtrs[i]=engine->wet[i].data(); std::fill_n(wetPtrs[i],n,0.0f); }
-                    if(fluid_synth_process(s,n,int(wetPtrs.size()),wetPtrs.data(),int(dryPtrs.size()),dryPtrs.data())!=FLUID_OK) { offset+=n; continue; }
-                    for(int ch=0;ch<channels;++ch) {
+                    if(engine->hasSF2&&fluid_synth_process(s,n,int(wetPtrs.size()),wetPtrs.data(),int(dryPtrs.size()),dryPtrs.data())!=FLUID_OK) { offset+=n; continue; }
+                    if(engine->hasSF2) for(int ch=0;ch<channels;++ch) {
+                        if(engine->sfzActive[ch]) continue; // same MIDI channel must not process its detector twice
+                        engine->compressors[ch].process(dryPtrs[2*ch],dryPtrs[2*ch+1],n);
                         const int index=dest[engine->routes[ch]];
                         if(index<0) continue; // inactive host bus: never leak to Main
                         b.addFrom(index,pos,dryPtrs[2*ch],n);
                         b.addFrom(index+1,pos,dryPtrs[2*ch+1],n);
                     }
                     // One shared native reverb/chorus group; only Main receives returns.
-                    for(int i=0;i<4;++i) b.addFrom(i%2,pos,wetPtrs[i],n);
+                    if(engine->hasSF2) for(int i=0;i<4;++i) b.addFrom(i%2,pos,wetPtrs[i],n);
+                    if(engine->hasSFZ()) renderSfz(*engine,b,dest,f,fx,pos,n);
                     rawPeak=juce::jmax(rawPeak,juce::jmax(b.getMagnitude(0,pos,n),b.getMagnitude(1,pos,n)));
                     wetPeak=juce::jmax(wetPeak,processMaster(*engine,b,f,fx,pos,n));
                     offset+=n;
@@ -619,15 +664,17 @@ public:
         midi.clear();
     }
     void getStateInformation(juce::MemoryBlock& dest) override {
-        juce::String path; Programs p; Controls c; MapEdits edits; int sfzCode=0; stateForSave(path,p,&c,&edits,&sfzCode);
+        juce::String path; Programs p; Controls c; MapEdits edits; int sfzCode=0; InstrumentGains savedGains; stateForSave(path,p,&c,&edits,&sfzCode,&savedGains);
         juce::XmlElement x("LSoundFontState");
         x.setAttribute("uiChannel",uiChannel());
-        x.setAttribute("version",11); x.setAttribute("sfzCode",sfzCode); x.setAttribute("midiFX",midiFX->getIndex()); for(int i=0;i<fxCount;++i) x.setAttribute(fxSpecs[i].key,i==drumTrim?0:readFXValue(i)); x.setAttribute("sfzQuality",sfzQuality->getIndex()); x.setAttribute("quality",quality->getIndex()); x.setAttribute("effects",effects->getIndex()); x.setAttribute("file",path); x.setAttribute("gain",static_cast<double>(gain->get()));
+        x.setAttribute("version",13); x.setAttribute("sfzCode",sfzCode); x.setAttribute("midiFX",midiFX->getIndex()); for(int i=0;i<fxCount;++i) x.setAttribute(fxSpecs[i].key,i==drumTrim?0:readFXValue(i)); x.setAttribute("sfzQuality",sfzQuality->getIndex()); x.setAttribute("quality",quality->getIndex()); x.setAttribute("effects",effects->getIndex()); x.setAttribute("file",path); x.setAttribute("gain",static_cast<double>(gain->get()));
         for(int i=0;i<channels;++i) { x.setAttribute("ch"+juce::String(i+1),p[i]); x.setAttribute(channelGainId(i),double(channelGain[i]->get())); x.setAttribute(routeId(i),channelRoute[i]->getIndex()); }
+        for(int ch=0;ch<channels;++ch) for(int i=0;i<lsfx::compCount;++i) x.setAttribute(compressorId(ch,i),double(compressorValue(ch,i)));
         for(int i=0;i<controlCount;++i) if(c[i]!=unset) {
             auto* entry=x.createNewChildElement("Control"); entry->setAttribute("index",i); entry->setAttribute("value",c[i]);
         }
         for(const auto& e:edits) {auto* entry=x.createNewChildElement("MapEdit"); entry->setAttribute("bank",e.bank);entry->setAttribute("program",e.program);entry->setAttribute("sourceBank",e.sourceBank);entry->setAttribute("sourceProgram",e.sourceProgram);entry->setAttribute("path",e.path);}
+        for(const auto& item:savedGains) {auto* entry=x.createNewChildElement("InstrumentGain"); entry->setAttribute("address",item.first); entry->setAttribute("db",double(item.second));}
         const auto preset=currentPresetFile();
         if(preset!=juce::File{}&&preset.isAChildOf(presetRoot())) x.setAttribute("presetFile",preset.getRelativePathFrom(presetRoot()));
         copyXmlToBinary(x,dest);
@@ -646,6 +693,12 @@ public:
                 const auto v=static_cast<float>(x->getDoubleAttribute(channelGainId(ch),0.0));
                 auto& a=*channelGain[ch]; a.setValueNotifyingHost(a.convertTo0to1(std::isfinite(v)?juce::jlimit(channelGainMin,channelGainMax,v):0.0f));
                 auto& routing=*channelRoute[ch]; routing.setValueNotifyingHost(routing.convertTo0to1(float(juce::jlimit(0,stereoBuses-1,x->getIntAttribute(routeId(ch),0)))));
+            }
+            for(int ch=0;ch<channels;++ch) for(int i=0;i<lsfx::compCount;++i) {
+                auto& par=*compParams[ch][i]; const auto& spec=lsfx::compSpecs[i];
+                const auto db=x->getDoubleAttribute(compressorId(ch,i),spec.initial);
+                const float v=std::isfinite(db)?juce::jlimit(spec.lo,spec.hi,float(db)):spec.initial;
+                par.setValueNotifyingHost(par.convertTo0to1(v));
             }
             quality->setValueNotifyingHost(quality->convertTo0to1(static_cast<float>(juce::jlimit(0,2,x->getIntAttribute("quality",1)))));
             effects->setValueNotifyingHost(effects->convertTo0to1(static_cast<float>(juce::jlimit(0,3,x->getIntAttribute("effects",0)))));
@@ -669,7 +722,12 @@ public:
             if(x->getIntAttribute("version",0)<11&&juce::File(basePath).hasFileExtension("sfz")&&edits.empty()) {
                 for(int ch=1;ch<channels;++ch) if(p[ch]==baseCode) p[ch]=pack(baseCode>>7,(baseCode+1)&127);
             }
-            load(basePath,p,c,std::move(edits),baseCode);
+            InstrumentGains restored;
+            for(auto* entry=x->getFirstChildElement();entry;entry=entry->getNextElement()) if(entry->hasTagName("InstrumentGain")) {
+                const int code=entry->getIntAttribute("address",-1); const auto db=entry->getDoubleAttribute("db",0.0);
+                if(code>=0&&code<=pack(16383,127)&&std::isfinite(db)&&db!=0.0) restored[code]=juce::jlimit(sfzGainMin,sfzGainMax,float(db));
+            }
+            load(basePath,p,c,std::move(edits),baseCode,false,std::move(restored));
         }
     }
 private:
@@ -842,7 +900,12 @@ private:
                 std::fill_n(out[0],n,0.0f); std::fill_n(out[1],n,0.0f);
                 sfizz_render_block(slot->synth,out,2,n);
                 auto& g=e.channelGains[ch];
-                for(int i=0;i<n;++i) {const float v=g.getNextValue();out[0][i]*=v;out[1][i]*=v;}
+                const auto it=instrumentGains.find(e.sfzAddress[ch]);
+                const float target=juce::Decibels::decibelsToGain(it==instrumentGains.end()?0.0f:it->second,sfzGainMin-1.0f);
+                if(!slot->gainPrimed) {slot->instrumentGain.reset(e.rate,0.01); slot->instrumentGain.setCurrentAndTargetValue(target); slot->gainPrimed=true;}
+                else slot->instrumentGain.setTargetValue(target);
+                for(int i=0;i<n;++i) {const float v=g.getNextValue()*slot->instrumentGain.getNextValue();out[0][i]*=v;out[1][i]*=v;}
+                e.compressors[ch].process(out[0],out[1],n);
                 const int route=channelRoute[ch]->getIndex();
                 if(route==0) for(int i=0;i<n;++i) {e.sfzMainL[i]+=out[0][i];e.sfzMainR[i]+=out[1][i];}
                 else if(dest[route]>=0) {b.addFrom(dest[route],pos,out[0],n); b.addFrom(dest[route]+1,pos,out[1],n);}
@@ -864,6 +927,7 @@ private:
     juce::AudioParameterFloat* gain = nullptr;
     std::array<juce::AudioParameterFloat*,channels> channelGain{};
     std::array<juce::AudioParameterChoice*,channels> channelRoute{};
+    std::array<std::array<juce::RangedAudioParameter*,lsfx::compCount>,channels> compParams{};
     static bool updateRouteSend(Engine& e,int ch) {
         bool changed=false;
         const int generators[]={GEN_REVERBSEND,GEN_CHORUSSEND};
@@ -933,6 +997,7 @@ private:
     std::atomic<bool> extraSfzPending{false};
     std::atomic<bool> panic{false}, clearing{false};
     std::mutex engineMutex, requestMutex, viewMutex;
+    InstrumentGains instrumentGains; // protected by engineMutex, already held during render
     std::condition_variable cv;
     std::unique_ptr<Engine> engine;
     std::thread worker;
@@ -996,16 +1061,21 @@ private:
             }
         }
     }
-    void stateForSave(juce::String& path, Programs& p, Controls* controls=nullptr,MapEdits* edits=nullptr,int* sfzCode=nullptr) {
+    void stateForSave(juce::String& path, Programs& p, Controls* controls=nullptr,MapEdits* edits=nullptr,int* sfzCode=nullptr,InstrumentGains* savedGains=nullptr) {
         std::lock_guard<std::mutex> lock(requestMutex);
         path=latest.path; if(edits) *edits=latest.edits; if(sfzCode) *sfzCode=latest.sfzCode;
+        if(savedGains) {
+            std::lock_guard<std::mutex> audio(engineMutex);
+            *savedGains=latest.restoredGains?*latest.restoredGains:instrumentGains;
+            if(latest.resetGainBank>=0) lsfx::eraseInstrumentGains(*savedGains,latest.resetGainBank,latest.resetGainProgram);
+        }
         if(controls) *controls=(pending||loadingSerial!=0||failedSerial==latest.serial)?latest.controls:overrides;
         // While a new bank is loading retain the requested state, not old programs.
         if (pending || loadingSerial!=0 || failedSerial==latest.serial) p=latest.programs;
         else for(int i=0;i<channels;++i) { int cmd=commands[i].load(); p[i]=cmd>=0 ? cmd : selected[i].load(); }
     }
     uint64_t loadingSerial=0, failedSerial=~uint64_t(0);
-    void load(const juce::String& path,Programs p,Controls c=emptyControls(),MapEdits edits={},int sfzCode=0,bool preserveOnFailure=false) {
+    void load(const juce::String& path,Programs p,Controls c=emptyControls(),MapEdits edits={},int sfzCode=0,bool preserveOnFailure=false,std::optional<InstrumentGains> restoredGains=std::nullopt,int resetGainBank=-1,int resetGainProgram=-1) {
         { std::lock_guard<std::mutex> lock(requestMutex);
           importRollback.reset();
           if(preserveOnFailure&&!pending&&loadingSerial==0) {
@@ -1015,7 +1085,7 @@ private:
                   for(int i=0;i<channels;++i) importRollback->programs[i]=current(i);
               }
           }
-          latest={path,hostRate.load(),p,latest.serial+1,c,std::move(edits),sfzCode}; pending=true;
+          latest={path,hostRate.load(),p,latest.serial+1,c,std::move(edits),sfzCode,std::move(restoredGains),resetGainBank,resetGainProgram}; pending=true;
           const bool empty=path.isEmpty()&&latest.edits.empty();
           if(empty) clearing.store(true);
           const auto display=path.isNotEmpty()?path:latest.edits.empty()?juce::String{}:latest.edits.front().path;
@@ -1054,7 +1124,9 @@ private:
                         fresh->synth=new_fluid_synth(fresh->settings);
                     }
                     if(!fresh->synth) error="Unable to create FluidSynth";
-                    else {
+                    else if(sf2MultiOutput&&(fluid_synth_count_audio_channels(fresh->synth)!=channels||fluid_synth_count_audio_groups(fresh->synth)!=channels||fluid_synth_count_effects_groups(fresh->synth)!=1||fluid_synth_count_effects_channels(fresh->synth)!=2)) {
+                        error="Unsupported FluidSynth multigroup layout";
+                    } else {
                         // Every distinct source is loaded once into the validated stereo synth.
                         std::map<juce::String,std::vector<Preset>> sources;
                         auto source=[&](const juce::String& path)->const std::vector<Preset>* {
@@ -1133,6 +1205,8 @@ private:
               importRollback.reset();
               // Failed full replacement unloads the previous bank deliberately: no wrong-bank playback.
               { std::lock_guard<std::mutex> audio(engineMutex);
+                if(r.restoredGains) instrumentGains=std::move(*r.restoredGains);
+                if(error.isEmpty()&&r.resetGainBank>=0) lsfx::eraseInstrumentGains(instrumentGains,r.resetGainBank,r.resetGainProgram);
                 retired=std::move(engine);
                 if(error.isEmpty()) engine=std::move(fresh);
                 overrides=r.controls; controlDirty.store(false);
@@ -1158,6 +1232,7 @@ private:
                 }
                 clearing.store(false);
               }
+              latest.restoredGains.reset(); latest.resetGainBank=-1; latest.resetGainProgram=-1;
               loadingSerial=0; failedSerial=error.isNotEmpty()?r.serial:~uint64_t(0);
               { std::lock_guard<std::mutex> ui(viewMutex);
                 view.ready=error.isEmpty()&&!empty; view.labels=std::move(labels); view.path=r.path.isNotEmpty()?r.path:r.edits.empty()?juce::String{}:r.edits.front().path; view.presets=error.isEmpty()?std::move(presets):std::vector<Preset>{}; view.loading=false;
@@ -1176,7 +1251,10 @@ private:
 constexpr int stepWidths[]={1,5,10,15,20};
 constexpr int pageMultiplier=40;
 constexpr int gridRowsPerColumn=8, gridColumnsPerPage=2, gridPageRows=gridRowsPerColumn*gridColumnsPerPage;
-constexpr int rowGain=-1,rowInterpolation=-2,rowEffects=-3,rowSfzQuality=-4,rowChannel=-5,rowMidiFX=-6,rowRoute=-7;
+constexpr int rowGain=-1,rowInterpolation=-2,rowEffects=-3,rowSfzQuality=-4,rowChannel=-5,rowMidiFX=-6,rowRoute=-7,rowInstrumentGain=-8;
+constexpr int compRowBase=-200;
+int compRow(int i) {return compRowBase-i;}
+int compIndex(int row) {const int i=compRowBase-row;return i>=0&&i<lsfx::compCount?i:-1;}
 struct GridRow { int id; juce::String name; double low,high,step; bool choice; juce::String unit; };
 
 template<class C> class Keyed : public C {
@@ -1223,16 +1301,19 @@ static void speak(juce::Component& source,const juce::String& message) {
         }
     }
 #endif
-    juce::ignoreUnused(source);
-    juce::AccessibilityHandler::postAnnouncement(message,juce::AccessibilityHandler::AnnouncementPriority::high);
+#if !JUCE_WINDOWS
+    source.setDescription(message);
+    if(auto* handler=source.getAccessibilityHandler()) handler->notifyAccessibilityEvent(juce::AccessibilityEvent::titleChanged);
+#endif
+    // No generic JUCE announcement fallback: it may use standalone speech.
 }
 
-class Editor final : public juce::AudioProcessorEditor, private juce::Timer, private juce::KeyListener, private juce::ListBoxModel {
+class Editor final : public juce::AudioProcessorEditor, private juce::Timer, private juce::KeyListener, private juce::ListBoxModel, private juce::FocusChangeListener {
 public:
     explicit Editor(Processor& p) : AudioProcessorEditor(p), proc(p) {
         setWantsKeyboardFocus(true);
         setFocusContainerType(juce::Component::FocusContainerType::keyboardFocusContainer);
-        title.setText("LSFX 0.0.1 TEST23",juce::dontSendNotification); title.setFont(juce::FontOptions(21.0f)); title.setAccessible(false); addAndMakeVisible(title);
+        title.setText(sf2MultiOutput?"LSFX 0.0.1 TEST25 SF2 experimental":"LSFX 0.0.1 TEST25",juce::dontSendNotification); title.setFont(juce::FontOptions(21.0f)); title.setAccessible(false); addAndMakeVisible(title);
         status.setText("No SoundFont loaded",juce::dontSendNotification); status.setTitle("Instrument status"); addAndMakeVisible(status);
         setup(open,"Open SF2 or SFZ",1); setup(parameters,"Parameters",2); setup(channel,"MIDI channel",3); setup(bank,"Bank",37); setup(program,"Program",38); setup(level,"Master output gain",36);
         setup(grid,"Parameter grid",1); setup(value,"Parameter value",2); setup(closeGrid,"Close parameters",3);
@@ -1243,9 +1324,9 @@ public:
         for(auto* l:{&channelLabel,&bankLabel,&programLabel,&levelLabel,&gridTitle,&hint}) addAndMakeVisible(*l);
         for(int i=1;i<=16;++i) channel.addItem("Channel "+juce::String(i),i);
         channel.setSelectedId(proc.uiChannel()+1,juce::dontSendNotification);
-        channel.onChange=[this]{ proc.setUiChannel(channel.getSelectedId()-1); shownCode=-1; refresh(true); if(gridOpen) rebuildGrid(); };
-        bank.onChange=[this]{ if(!updating) { rebuildPrograms(bank.getSelectedId()-1,-1); if(program.getNumItems()>0) { program.setSelectedItemIndex(0,juce::dontSendNotification); apply(); } } };
-        program.onChange=[this]{ if(!updating) apply(); };
+        channel.onChange=[this]{ if(cached.loading||catalogBusy||importInProgress) {refresh(true);return;} proc.setUiChannel(channel.getSelectedId()-1); shownCode=-1; refresh(true); if(gridOpen) rebuildGrid(); };
+        bank.onChange=[this]{ if(!updating&&(cached.loading||catalogBusy||importInProgress)) {refresh(true);return;} if(!updating) { rebuildPrograms(bank.getSelectedId()-1,-1); if(program.getNumItems()>0) { program.setSelectedItemIndex(0,juce::dontSendNotification); apply(); } } };
+        program.onChange=[this]{ if(!updating&&(cached.loading||catalogBusy||importInProgress)) {refresh(true);return;} if(!updating) apply(); };
         open.onClick=[this]{ browse(); }; parameters.onClick=[this]{ openParameters(); };
         closeGrid.onClick=[this]{ closeParameters(); };
         level.setSliderStyle(juce::Slider::LinearHorizontal); level.setTextBoxStyle(juce::Slider::NoTextBox,true,0,0); level.textFromValueFunction=[](double v){return juce::String(v,1)+" dB";}; level.setRange(-60.0,6.0,0.1); level.setValue(proc.gainParameter().get(),juce::dontSendNotification);
@@ -1298,10 +1379,15 @@ public:
         panelLabel.setTitle("Preset information"); panelLabel.setJustificationType(juce::Justification::centredLeft); addAndMakeVisible(panelLabel);
         hidePanelControls();
         presetRoot().createDirectory();
-        showGrid(false); setSize(900,690); refresh(true); startTimerHz(5);
+        lastGainChannel=proc.editorMemory.gainChannel; lastRouteChannel=proc.editorMemory.routeChannel;
+        lastSf2Row=proc.editorMemory.sf2Row; lastSfzRow=proc.editorMemory.sfzRow; stepIndex=proc.editorMemory.step;
+        showGrid(false); setSize(900,690); refresh(true);
+        if(isGridFocus(proc.editorMemory.focus)) {rebuildGrid();showGrid(true);}
+        juce::Desktop::getInstance().addFocusChangeListener(this);
+        startTimerHz(5);
         scheduleInitialFocus();
     }
-    ~Editor() override { stopTimer(); removeKeyListener(this); panelText.removeKeyListener(this); presetList.removeKeyListener(this); presetList.setModel(nullptr); chooser.reset(); if(catalogThread.joinable()) catalogThread.join(); }
+    ~Editor() override { if(panelMode==Panel::none&&!initialFocusPending&&!returnFromChooser&&!chooser&&!importInProgress) rememberFocus(focusId(juce::Component::getCurrentlyFocusedComponent())); juce::Desktop::getInstance().removeFocusChangeListener(this); stopTimer(); removeKeyListener(this); panelText.removeKeyListener(this); presetList.removeKeyListener(this); presetList.setModel(nullptr); chooser.reset(); if(catalogThread.joinable()) catalogThread.join(); }
     void paint(juce::Graphics& g) override {
         g.fillAll(juce::Colour(0xff202429));
         if(panelMode!=Panel::none) return;
@@ -1354,7 +1440,7 @@ public:
         auto r=getLocalBounds().reduced(16); title.setBounds(r.removeFromTop(30)); status.setBounds(r.removeFromTop(30));
         if(panelMode!=Panel::none) {
             panelLabel.setBounds(r.removeFromTop(82)); r.removeFromTop(8);
-            if(panelMode==Panel::browser) { auto buttons=r.removeFromBottom(38); parentButton.setBounds(buttons.removeFromLeft(150)); panelCancel.setBounds(buttons.removeFromRight(150)); presetList.setBounds(r); }
+            if(panelMode==Panel::browser||panelMode==Panel::source) { auto buttons=r.removeFromBottom(38); parentButton.setBounds(buttons.removeFromLeft(150)); panelCancel.setBounds(buttons.removeFromRight(150)); presetList.setBounds(r); }
             else { if(panelMode==Panel::name) panelText.setBounds(r.removeFromTop(36)); r.removeFromTop(12); auto buttons=r.removeFromTop(38); panelOK.setBounds(buttons.removeFromLeft(180)); panelCancel.setBounds(buttons.removeFromLeft(180)); }
             return;
         }
@@ -1391,13 +1477,17 @@ private:
     Keyed<juce::TextButton> parentButton{"Back"},panelOK{"OK"},panelCancel{"Cancel"};
     juce::TextEditor panelText;
     juce::Label panelLabel;
-    enum class Panel {none,browser,name,confirm};
+    enum class Panel {none,browser,name,confirm,source};
     Panel panelMode=Panel::none;
     juce::File browserDirectory;
     juce::String lastRememberedInstrument;
     juce::File pendingBrowserPreset;
     std::vector<juce::File> browserEntries;
     std::function<void()> panelAction,panelCancelAction;
+    std::vector<std::pair<int,juce::String>> sourceEntries;
+    std::function<void(int)> sourceAction;
+    int panelReturn=1,chooserReturn=1;
+    bool importInProgress=false,focusTransition=false,hadEditorFocus=false;
     uint64_t missingPromptRevision=~uint64_t(0);
     Keyed<juce::Slider> level,value;
     std::array<Keyed<juce::Slider>,channels> channelLevels;
@@ -1416,6 +1506,7 @@ private:
     int shownCode=-1,gridShownCode=-1,stepIndex=0,lastSf2Row=rowGain,lastSfzRow=rowGain;
     bool updating=false,dragging=false,gridOpen=false,updatingGrid=false,initialFocusPending=true,focusScheduled=false;
     bool returnFromChooser=false,announceLoaded=false;
+    juce::String pendingReturnMessage;
     uint32_t chooserReturnedAt=0;
     template<class C> void setup(Keyed<C>& c,const juce::String& name,int order) {
         c.setName(name); c.setTitle(name); c.setWantsKeyboardFocus(true); c.setExplicitFocusOrder(order);
@@ -1426,6 +1517,52 @@ private:
         const int w=gridArea.getWidth()/gridColumnsPerPage, h=gridArea.getHeight()/gridRowsPerColumn;
         return {gridArea.getX()+col*w,gridArea.getY()+row*h,w,h};
     }
+    static bool isGridFocus(int id) {return id>=50&&id<=52;}
+    int focusId(juce::Component* c) {
+        for(;c&&c!=this;c=c->getParentComponent()) {
+            if(c==&open)return 1; if(c==&parameters)return 2; if(c==&channel)return 3;
+            if(c==&level)return 36; if(c==&bank)return 37; if(c==&program)return 38;
+            if(c==&presetsButton)return 39; if(c==&saveButton)return 40; if(c==&saveAsButton)return 41;
+            if(c==&grid)return 50; if(c==&value)return 51; if(c==&closeGrid)return 52;
+            for(int i=0;i<channels;++i) {if(c==&channelLevels[i])return 4+i; if(c==&routeLevels[i])return 20+i;}
+        } return 0;
+    }
+    juce::Component& focusTarget(int id) {
+        if(id>=4&&id<20)return channelLevels[id-4]; if(id>=20&&id<36)return routeLevels[id-20];
+        switch(id) {case 2:return parameters;case 3:return channel;case 36:return level;case 37:return bank;case 38:return program;case 39:return presetsButton;case 40:return saveButton;case 41:return saveAsButton;case 50:return grid;case 51:return value;case 52:return closeGrid;default:return open;}
+    }
+    void rememberFocus(int id) {
+        if(!id)return;
+        proc.editorMemory.focus=id;
+        if(id>=4&&id<20) lastGainChannel=id-4;
+        if(id>=20&&id<36) lastRouteChannel=id-20;
+        proc.editorMemory.gainChannel=lastGainChannel; proc.editorMemory.routeChannel=lastRouteChannel;
+    }
+    void globalFocusChanged(juce::Component* c) override {
+        const bool inside=c&&(c==this||isParentOf(c));
+        if(!inside) {if(hadEditorFocus&&!chooser&&!importInProgress&&panelMode==Panel::none) initialFocusPending=true; hadEditorFocus=false;return;}
+        hadEditorFocus=true;
+        if(focusTransition||chooser||importInProgress||returnFromChooser||panelMode!=Panel::none)return;
+        if(initialFocusPending) {scheduleInitialFocus();return;}
+        rememberFocus(focusId(c));
+    }
+    void restoreFocus(int id) {
+        juce::ScopedValueSetter<bool> guard(focusTransition,true);
+        if(isGridFocus(id)&&!gridOpen) {rebuildGrid();showGrid(true);}
+        else if(!isGridFocus(id)&&gridOpen) showGrid(false,&focusTarget(id));
+        initialFocusPending=false; rememberFocus(id); focus(focusTarget(id));
+    }
+    void returnTo(int id) {
+        chooserReturn=id; returnFromChooser=true; chooserReturnedAt=juce::Time::getMillisecondCounter();
+        initialFocusPending=true; rememberFocus(id);
+        auto* current=juce::Component::getCurrentlyFocusedComponent();
+        if(isShowing()&&getPeer()!=nullptr&&getPeer()->isFocused()&&(!current||current==this||isParentOf(current))) {
+            restoreFocus(id);
+            if(focusTarget(id).hasKeyboardFocus(true)) {returnFromChooser=false; initialFocusPending=false; return;}
+            initialFocusPending=true;
+        }
+        scheduleInitialFocus();
+    }
     // Do not publish a UIA focus event unless the native keyboard focus really arrived.
     // Never take focus back from REAPER's FX list or another child on a timer.
     void focus(juce::Component& c) {
@@ -1434,6 +1571,7 @@ private:
             juce::AccessibilityHandler::clearCurrentlyFocusedHandler(); c.grabKeyboardFocus();
             if(c.hasKeyboardFocus(true)) if(auto* handler=c.getAccessibilityHandler()) handler->grabFocus();
         }
+        if(c.hasKeyboardFocus(true)&&panelMode==Panel::none&&!focusTransition&&!importInProgress&&!returnFromChooser) {initialFocusPending=false;rememberFocus(focusId(&c));}
     }
     void scheduleInitialFocus() {
         if(panelMode!=Panel::none||(!initialFocusPending&&!returnFromChooser)||focusScheduled||!isShowing()) return;
@@ -1442,36 +1580,23 @@ private:
         juce::Timer::callAfterDelay(150,[safe]{if(auto* e=safe.getComponent()) {
             e->focusScheduled=false;
             if(e->panelMode!=Panel::none||(!e->initialFocusPending&&!e->returnFromChooser)||!e->isShowing()||e->chooser) return;
-            if(e->returnFromChooser&&juce::Time::getMillisecondCounter()-e->chooserReturnedAt>2000u) {e->returnFromChooser=false; return;}
+            if(e->returnFromChooser&&juce::Time::getMillisecondCounter()-e->chooserReturnedAt>2000u) e->returnFromChooser=false;
             auto* focused=juce::Component::getCurrentlyFocusedComponent();
             auto* peer=e->getPeer();
             if(peer==nullptr||!peer->isFocused()) return;
-            if(e->returnFromChooser) {
-                // Explicit return after OUR dialog, not a general focus-stealing timer.
-                e->initialFocusPending=false;
-                if(focused!=nullptr&&focused!=e&&!e->isParentOf(focused)) { e->returnFromChooser=false; return; }
-                e->focus(e->open);
-                if(e->open.hasKeyboardFocus(true)) {
-                    e->refresh(false); // keep return flag until the status has been read
-                    e->returnFromChooser=false;
-                    speak(e->open,"Open SF2 or SFZ. "+e->cached.status);
-                    if(!e->cached.loading) e->announceLoaded=false;
-                }
-                return;
-            }
-            if(focused!=nullptr&&focused!=e) {
-                if(e->isParentOf(focused)) e->initialFocusPending=false;
-                return;
-            }
-            auto& target=e->gridOpen?static_cast<juce::Component&>(e->grid):static_cast<juce::Component&>(e->open);
+            if(focused!=nullptr&&focused!=e&&!e->isParentOf(focused)) return;
+            if(e->importInProgress) return;
+            const int id=e->returnFromChooser?e->chooserReturn:e->proc.editorMemory.focus;
+            auto& target=e->focusTarget(id);
             auto* h=target.getAccessibilityHandler();
 #if JUCE_WINDOWS
             if(h==nullptr||h->getNativeImplementation()==nullptr) return;
 #else
             juce::ignoreUnused(h);
 #endif
-            e->initialFocusPending=false; e->focus(target);
-            if(!target.hasKeyboardFocus(true)) e->initialFocusPending=true;
+            e->restoreFocus(id);
+            if(target.hasKeyboardFocus(true)) {e->returnFromChooser=false;e->initialFocusPending=false; if(e->pendingReturnMessage.isNotEmpty()) {speak(target,e->pendingReturnMessage);e->pendingReturnMessage.clear();}}
+            else e->initialFocusPending=true;
         }});
     }
     void showGrid(bool show,juce::Component* destination=nullptr) {
@@ -1487,23 +1612,24 @@ private:
         repaint();
     }
     void openParameters() {
-        if(!gridOpen) { refresh(false); rebuildGrid(); showGrid(true); }
+        if(!gridOpen) { const int id=focusId(juce::Component::getCurrentlyFocusedComponent());proc.editorMemory.gridReturn=id&&!isGridFocus(id)?id:2; refresh(false); rebuildGrid(); showGrid(true); }
         initialFocusPending=false; returnFromChooser=false; focus(grid);
     }
-    void closeParameters() { if(!gridOpen) return; showGrid(false); focus(parameters); }
+    void closeParameters() { if(!gridOpen) return; restoreFocus(proc.editorMemory.gridReturn); }
     int selectedChannel() const { return juce::jlimit(0,15,channel.getSelectedId()-1); }
     bool isSfzChannel(int ch) const { const auto* p=findPreset(cached.presets,proc.current(ch));return p&&p->sfzIndex>=0; }
     bool isCurrentSfz() const { return isSfzChannel(selectedChannel()); }
     bool currentProgramReady() const { return cached.ready&&!cached.loading&&findPreset(cached.presets,proc.current(selectedChannel()))!=nullptr; }
     const GridRow* selectedRow() const { const int i=grid.getSelectedItemIndex(); return i>=0&&i<static_cast<int>(rows.size())?&rows[static_cast<size_t>(i)]:nullptr; }
     void rebuildGrid() {
-        const int preferred=isCurrentSfz()?lastSfzRow:lastSf2Row;
+        const int preferred=currentProgramReady()?(isCurrentSfz()?lastSfzRow:lastSf2Row):proc.editorMemory.emptyRow;
         gridShownCode=proc.current(selectedChannel());
         rows.clear();
         rows.push_back({rowGain,"Output gain",-60,6,0.1,false," dB"});
         rows.push_back({rowRoute,"Output routing",0,stereoBuses-1,1,true,{}});
         if(currentProgramReady()) {
             if(isCurrentSfz()) {
+                rows.push_back({rowInstrumentGain,"SFZ instrument gain",sfzGainMin,sfzGainMax,0.1,false," dB"});
                 rows.push_back({rowSfzQuality,"SFZ live sample quality",0,11,1,true,{}});
                 if(const auto* p=findPreset(cached.presets,proc.current(selectedChannel()))) {
                     if(const auto it=cached.labels.find(p->path);it!=cached.labels.end())
@@ -1515,6 +1641,9 @@ private:
 
                 for(const auto& c:sf2Controls) rows.push_back({c.id,c.name,static_cast<double>(c.lo),static_cast<double>(c.hi),static_cast<double>(c.step),false,c.unit});
             }
+        }
+        if(currentProgramReady()&&(isCurrentSfz()||sf2MultiOutput)) {
+            for(int i=0;i<lsfx::compCount;++i) {const auto& c=lsfx::compSpecs[i]; rows.push_back({compRow(i),c.name,c.lo,c.hi,c.step,i==lsfx::compRatio,c.unit});}
         }
         if(currentProgramReady()) {
             rows.push_back({rowEffects,"Effects",0,3,1,true,{}});
@@ -1528,8 +1657,10 @@ private:
         grid.setSelectedItemIndex(target,juce::dontSendNotification); updatingGrid=false; search.reset(); syncValue(); repaint();
     }
     double readRow(const GridRow& r) const {
+        if(const int i=compIndex(r.id);i>=0) return proc.compressorValue(selectedChannel(),i);
         if(const int i=fxIndex(r.id);i>=0) { auto& p=proc.fxParameter(i); return p.convertFrom0to1(p.getValue()); }
         if(r.id==rowGain) return proc.channelGainParameter(selectedChannel()).get();
+        if(r.id==rowInstrumentGain) return proc.instrumentGain(proc.current(selectedChannel()));
         if(r.id==rowRoute) return proc.routeParameter(selectedChannel()).getIndex();
         if(r.id==rowInterpolation) return proc.qualityParameter().getIndex();
         if(r.id==rowEffects) return proc.effectsParameter().getIndex();
@@ -1540,6 +1671,10 @@ private:
     }
     juce::String formatValue(const GridRow& r,double v) const {
         if(v==unset) return "Instrument default (not read)";
+        if(const int i=compIndex(r.id);i>=0) {
+            if(i==lsfx::compRatio) return lsfx::compRatioNames[juce::jlimit(0,3,juce::roundToInt(v))];
+            return juce::String(v,(i==lsfx::compThreshold||i==lsfx::compMakeup||i==lsfx::compMix)?1:0)+r.unit;
+        }
         if(const int i=fxIndex(r.id);i>=0) {
             const int k=juce::jlimit(fxSpecs[i].lo,fxSpecs[i].hi,juce::roundToInt(v));
             if(i==rvType) return reverbNames[k]; if(i==chType) return chorusNames[k]; if(i==delayMode) return k?"Ping-pong":"Stereo";
@@ -1547,7 +1682,7 @@ private:
             if(i==sf2Dynamics) return k==2?"Reference (unprocessed)":k==1?"Linear (soft ceiling)":"LJuno Glue";
             if(i==sf2Ambience) return k?"Scoring ambience (CC91 40)":"Native MIDI";
         }
-        if(r.id==rowGain) return juce::String(v,1)+r.unit;
+        if(r.id==rowGain||r.id==rowInstrumentGain) return juce::String(v,1)+r.unit;
         if(r.id==rowRoute) return routingValue(v);
         if(r.id==rowInterpolation) return proc.qualityParameter().choices[juce::jlimit(0,2,juce::roundToInt(v))];
         if(r.id==rowMidiFX) return proc.midiFXParameter().choices[juce::jlimit(0,1,juce::roundToInt(v))];
@@ -1560,13 +1695,15 @@ private:
         if(!sf2MultiOutput&&!isSfzChannel(ch<0?selectedChannel():ch)&&v!=0) return name+" (stored; SF2 Main 1/2 only)";
         return name;
     }
-    juce::String rowName(const GridRow& r) const { return r.id==rowGain||r.id==rowRoute?r.name+" channel "+juce::String(selectedChannel()+1):r.name; }
+    juce::String rowName(const GridRow& r) const { return r.id==rowGain||r.id==rowRoute||compIndex(r.id)>=0?r.name+" channel "+juce::String(selectedChannel()+1):r.name; }
     juce::String rowLine(const GridRow& r) const { return rowName(r)+" "+formatValue(r,readRow(r)); }
     void writeRow(const GridRow& r,double v) {
         v=juce::jlimit(r.low,r.high,r.low+std::round((v-r.low)/r.step)*r.step);
         auto set=[v](juce::RangedAudioParameter& p){ p.beginChangeGesture(); p.setValueNotifyingHost(p.convertTo0to1(static_cast<float>(v))); p.endChangeGesture(); };
-        if(const int i=fxIndex(r.id);i>=0) set(proc.fxParameter(i));
+        if(const int c=compIndex(r.id);c>=0) set(proc.compressorParameter(selectedChannel(),c));
+        else if(const int i=fxIndex(r.id);i>=0) set(proc.fxParameter(i));
         else if(r.id==rowGain) set(proc.channelGainParameter(selectedChannel()));
+        else if(r.id==rowInstrumentGain) {if(currentProgramReady()) proc.setInstrumentGain(proc.current(selectedChannel()),float(v));}
         else if(r.id==rowRoute) set(proc.routeParameter(selectedChannel()));
         else if(r.id==rowInterpolation) set(proc.qualityParameter());
         else if(r.id==rowEffects) set(proc.effectsParameter());
@@ -1577,7 +1714,10 @@ private:
     }
     void syncValue() {
         if(auto* row=selectedRow()) {
-            const auto r=*row; if(isCurrentSfz()) lastSfzRow=r.id; else lastSf2Row=r.id;
+            const auto r=*row;
+            if(currentProgramReady()) {if(isCurrentSfz()) lastSfzRow=r.id; else lastSf2Row=r.id;}
+            else if(!cached.loading) proc.editorMemory.emptyRow=r.id;
+            proc.editorMemory.sf2Row=lastSf2Row; proc.editorMemory.sfzRow=lastSfzRow;
             updatingGrid=true;
             value.setTitle(rowName(r)); value.setName(rowName(r)); value.setRange(r.low,r.high,r.step);
             value.textFromValueFunction=[this,r](double v) { return formatValue(r,(r.id>=0&&readRow(r)==unset&&v==r.low)?static_cast<double>(unset):v); };
@@ -1620,7 +1760,7 @@ private:
             if(actual!=previous) speak(source,formatValue(r,actual));
         }
     }
-    void changeStep(juce::Component& source,int d) { const int next=juce::jlimit(0,4,stepIndex+d); if(next==stepIndex) return; stepIndex=next; speak(source,"Step "+juce::String(stepWidths[stepIndex])); }
+    void changeStep(juce::Component& source,int d) { const int next=juce::jlimit(0,4,stepIndex+d); if(next==stepIndex) return; stepIndex=next; proc.editorMemory.step=next; speak(source,"Step "+juce::String(stepWidths[stepIndex])); }
     bool keyPressed(const juce::KeyPress& key,juce::Component* origin) override { return handleKey(key,origin); }
     juce::Component* keyboardControl(juce::Component* origin) {
         // Some JUCE controls forward a key from their internal label, rather
@@ -1666,7 +1806,10 @@ private:
     }
     bool handleKey(const juce::KeyPress& k,juce::Component* origin) {
         origin=keyboardControl(origin);
-        if(returnFromChooser&&!chooser) returnFromChooser=false; // user resumed navigation
+        if(returnFromChooser&&!chooser&&!importInProgress) {
+            if(focusId(origin)!=chooserReturn) {restoreFocus(chooserReturn); if(focusTarget(chooserReturn).hasKeyboardFocus(true)) returnFromChooser=false; return true;}
+            returnFromChooser=false; initialFocusPending=false; rememberFocus(focusId(origin));
+        }
         const auto code=k.getKeyCode(); const auto mods=k.getModifiers();
         const auto ch=juce::CharacterFunctions::toLowerCase(code>='A'&&code<='Z'?static_cast<juce::juce_wchar>(code):k.getTextCharacter()!=0?k.getTextCharacter():static_cast<juce::juce_wchar>(code));
         const bool alt=mods.isAltDown(), ctrl=mods.isCtrlDown()||mods.isCommandDown();
@@ -1682,6 +1825,9 @@ private:
         // Leave the host and the native combo popup in control of their own keys.
         if(chooser||catalogBusy) return false;
         if(panelMode!=Panel::none) return handlePanelKey(k,origin);
+        if(importInProgress) return true;
+        if(cached.loading&&(origin==&bank||origin==&program||origin==&channel)&&!alt&&!ctrl&&(vertical||horizontal||page||boundary||code==juce::KeyPress::returnKey||juce::CharacterFunctions::isLetterOrDigit(k.getTextCharacter()))) return true;
+        initialFocusPending=false; rememberFocus(focusId(origin));
         if(!gridOpen&&(bank.isPopupActive()||program.isPopupActive()||channel.isPopupActive())) return false;
         if(ctrl&&!alt&&(ch=='s'||code==19||k.getTextCharacter()==19)) {if(mods.isShiftDown()) showSaveAs(); else saveCurrent();return true;}
         if(gridOpen&&!alt&&!ctrl&&code==juce::KeyPress::tabKey) {
@@ -1761,9 +1907,10 @@ private:
             if(code==juce::KeyPress::backspaceKey) {
                 if(auto* r=selectedRow()) {
                     const auto copy=*r; const int f=fxIndex(copy.id); double reset=0; bool supported=true;
-                    if(f>=0) reset=fxSpecs[f].initial;
+                    if(const int c=compIndex(copy.id);c>=0) reset=lsfx::compSpecs[c].initial;
+                    else if(f>=0) reset=fxSpecs[f].initial;
                     else if(copy.id>=128) reset=0;
-                    else if(copy.id==rowGain||copy.id==rowRoute) reset=0;
+                    else if(copy.id==rowGain||copy.id==rowRoute||copy.id==rowInstrumentGain) reset=0;
                     else if(copy.id==rowInterpolation) reset=1;
                     else if(copy.id==rowEffects||copy.id==rowSfzQuality) reset=0;
                     else if(copy.id==rowMidiFX) reset=1;
@@ -1795,12 +1942,14 @@ private:
     }
     void announce(const juce::String& text) {
         if(auto* c=juce::Component::getCurrentlyFocusedComponent(); c!=nullptr&&isParentOf(c)) speak(*c,text);
-        else juce::AccessibilityHandler::postAnnouncement(text,juce::AccessibilityHandler::AnnouncementPriority::high);
+        // No speech if there is no focused accessible control.
     }
     void hidePanelControls() {
         for(auto* c:std::array<juce::Component*,6>{&presetList,&parentButton,&panelOK,&panelCancel,&panelText,&panelLabel}) c->setVisible(false);
     }
     void hideMainForPanel() {
+        if(panelMode==Panel::none) {const int id=focusId(juce::Component::getCurrentlyFocusedComponent());panelReturn=id?id:proc.editorMemory.focus;}
+        juce::ScopedValueSetter<bool> guard(focusTransition,true);
         if(gridOpen) showGrid(false);
         for(auto* c:std::array<juce::Component*,16>{&open,&parameters,&channel,&bank,&program,&level,&channelLabel,&bankLabel,&programLabel,&levelLabel,&levelReadout,&channelGainLabel,&routingLabel,&presetsButton,&saveButton,&saveAsButton}) c->setVisible(false);
         for(auto& c:channelLevels) c.setVisible(false);
@@ -1808,9 +1957,10 @@ private:
         initialFocusPending=false; returnFromChooser=false;
     }
     void closePanel(juce::Component* destination=nullptr) {
-        panelMode=Panel::none; panelAction={}; panelCancelAction={};
+        juce::ScopedValueSetter<bool> guard(focusTransition,true);
+        panelMode=Panel::none; panelAction={}; panelCancelAction={}; sourceAction={}; sourceEntries.clear();
         hidePanelControls(); showGrid(false); initialFocusPending=false; returnFromChooser=false;
-        focus(destination?*destination:static_cast<juce::Component&>(presetsButton));
+        restoreFocus(destination?focusId(destination):panelReturn);
     }
     void cancelPanel() {
         if(panelMode==Panel::none) return;
@@ -1830,18 +1980,19 @@ private:
         for(auto* c:std::array<juce::Component*,3>{&panelLabel,&panelOK,&panelCancel}) c->setVisible(true);
         resized(); repaint(); focus(focusPositive?static_cast<juce::Component&>(panelOK):static_cast<juce::Component&>(panelCancel)); announce(prompt);
     }
-    int getNumRows() override { return static_cast<int>(browserEntries.size()); }
+    int getNumRows() override { return static_cast<int>(panelMode==Panel::source?sourceEntries.size():browserEntries.size()); }
     juce::String getNameForRow(int row) override {
         if(!juce::isPositiveAndBelow(row,getNumRows())) return {};
+        if(panelMode==Panel::source) return sourceEntries[static_cast<size_t>(row)].second;
         const auto& f=browserEntries[static_cast<size_t>(row)]; return f.isDirectory()?"Folder "+f.getFileName():f.getFileNameWithoutExtension();
     }
     void paintListBoxItem(int row,juce::Graphics& g,int width,int height,bool selected) override {
         if(selected) g.fillAll(juce::Colour(0xff304d66));
         g.setColour(juce::Colours::white); g.setFont(juce::Font(juce::FontOptions(15.0f))); g.drawText(getNameForRow(row),8,0,width-16,height,juce::Justification::centredLeft,true);
     }
-    void selectedRowsChanged(int row) override { if(panelMode==Panel::browser&&presetList.hasKeyboardFocus(true)&&juce::isPositiveAndBelow(row,getNumRows())) announce(getNameForRow(row)); }
-    void listBoxItemDoubleClicked(int row,const juce::MouseEvent&) override { if(panelMode==Panel::browser) activatePreset(row); }
-    void returnKeyPressed(int row) override { if(panelMode==Panel::browser) activatePreset(row); }
+    void selectedRowsChanged(int row) override { if((panelMode==Panel::browser||panelMode==Panel::source)&&presetList.hasKeyboardFocus(true)&&juce::isPositiveAndBelow(row,getNumRows())) announce(getNameForRow(row)); }
+    void listBoxItemDoubleClicked(int row,const juce::MouseEvent&) override { if(panelMode==Panel::browser) activatePreset(row); else if(panelMode==Panel::source) activateSource(row); }
+    void returnKeyPressed(int row) override { if(panelMode==Panel::browser) activatePreset(row); else if(panelMode==Panel::source) activateSource(row); }
     void deleteKeyPressed(int) override { if(panelMode==Panel::browser) deletePreset(); }
     juce::File selectedPreset() { const int row=presetList.getSelectedRow(); return juce::isPositiveAndBelow(row,getNumRows())?browserEntries[static_cast<size_t>(row)]:juce::File{}; }
     void refreshBrowser(const juce::File& selected={}) {
@@ -1856,6 +2007,7 @@ private:
     }
     void showBrowserAt(const juce::File& selected={}) {
         hideMainForPanel(); hidePanelControls(); panelMode=Panel::browser; panelAction={}; panelCancelAction={};
+        presetList.setName("Preset browser");presetList.setTitle("Preset browser");
         panelCancel.setButtonText("Close");panelCancel.setTitle("Close");
         for(auto* c:std::array<juce::Component*,4>{&presetList,&parentButton,&panelCancel,&panelLabel}) c->setVisible(true);
         refreshBrowser(selected); resized(); repaint(); focus(presetList);
@@ -1892,7 +2044,7 @@ private:
         pendingBrowserPreset=f;
         proc.setStateInformation(state.getData(),static_cast<int>(state.getSize()));
         rememberSetting("saveDirectory",f.getParentDirectory().getFullPathName());
-        closePanel(&open); announceLoaded=true; refresh(true);
+        closePanel(); announceLoaded=true; refresh(true);
         announce("Preset selected. "+f.getFileNameWithoutExtension());
     }
     void maybePromptMissing() {
@@ -1904,8 +2056,8 @@ private:
             if(!juce::File(missing).existsAsFile()) {announce("Instrument file still not found: "+missing);return;}
             // Do not retry a stale request if the host changed state while the panel was open.
             if(proc.getView().status=="SoundFont not found: "+missing) {proc.retryFile();announceLoaded=true;}
-            closePanel(&open);refresh(true);
-        },[this]{closePanel(&open);},true);
+            closePanel();refresh(true);
+        },[this]{closePanel();},true);
     }
     juce::String legalName(juce::String name) {
         name=juce::File::createLegalFileName(name.trim());
@@ -1915,7 +2067,7 @@ private:
         const auto result=proc.savePresetFile(f);
         if(result.failed()) {announce(result.getErrorMessage());return;}
         rememberSetting("saveDirectory",f.getParentDirectory().getFullPathName());
-        if(panelMode!=Panel::none) closePanel(&saveButton);
+        if(panelMode!=Panel::none) closePanel();
         announce("Preset saved. "+f.getFileNameWithoutExtension());
     }
     void saveCurrent() {
@@ -1976,6 +2128,14 @@ private:
         const auto code=k.getKeyCode();const auto mods=k.getModifiers();const bool ctrl=mods.isCtrlDown()||mods.isCommandDown();
         const auto ch=juce::CharacterFunctions::toLowerCase(static_cast<juce::juce_wchar>(code));
         if(code==juce::KeyPress::escapeKey) {cancelPanel();return true;}
+        if(panelMode==Panel::source) {
+            if(code==juce::KeyPress::tabKey) {focus(presetList.hasKeyboardFocus(true)?static_cast<juce::Component&>(panelCancel):static_cast<juce::Component&>(presetList));return true;}
+            if(code==juce::KeyPress::returnKey) {if(panelCancel.hasKeyboardFocus(true))cancelPanel();else activateSource(presetList.getSelectedRow());return true;}
+            const int old=presetList.getSelectedRow(),count=getNumRows(); int next=old;
+            if(code==juce::KeyPress::upKey) --next;else if(code==juce::KeyPress::downKey) ++next;else if(code==juce::KeyPress::pageUpKey)next-=10;else if(code==juce::KeyPress::pageDownKey)next+=10;else if(code==juce::KeyPress::homeKey)next=0;else if(code==juce::KeyPress::endKey)next=count-1;
+            if(count>0) {next=juce::jlimit(0,count-1,next);if(next!=old){focus(presetList);presetList.selectRow(next);presetList.scrollToEnsureRowIsOnscreen(next);}}
+            return true;
+        }
         if(panelMode==Panel::browser) {
             if(mods.isAltDown()) {if(ch=='b'||ch=='c')cancelPanel();return true;}
             if(code==juce::KeyPress::tabKey) {
@@ -2011,8 +2171,8 @@ private:
         juce::Component::SafePointer<juce::Component> previous(origin);
         const bool wasGrid=gridOpen;
         showConfirmation("Initialize LSFX? All instruments and unsaved changes will be cleared.","Initialize",[this]{closePanel(&open);initializeInstance();},[this,previous,wasGrid]{
-            closePanel(&open);
-            if(wasGrid) {rebuildGrid();showGrid(true);}
+            closePanel();
+            if(wasGrid&&!gridOpen) {rebuildGrid();showGrid(true);}
             if(auto* c=previous.getComponent();c&&c->isShowing()&&c->isEnabled()) focus(*c);
             else if(wasGrid) focus(grid);
         });
@@ -2022,6 +2182,7 @@ private:
         pendingBrowserPreset=juce::File{};
         announceLoaded=false; initialFocusPending=false; returnFromChooser=false;
         stepIndex=0; lastGainChannel=0; lastRouteChannel=0;
+        proc.editorMemory=Processor::EditorMemory{};
         lastSf2Row=rowGain; lastSfzRow=rowGain; shownCode=-1;
         search.reset();
         proc.initializeInstance();
@@ -2033,11 +2194,11 @@ private:
     void showStatus() {
         const auto text=proc.getView().status+". "+proc.diagnostic();
         if(auto* current=juce::Component::getCurrentlyFocusedComponent(); current!=nullptr&&isParentOf(current)) speak(*current,text);
-        else juce::AccessibilityHandler::postAnnouncement(text,juce::AccessibilityHandler::AnnouncementPriority::high);
+        // No speech if there is no focused accessible control.
     }
     void browse() {
         if(chooser||catalogBusy) return;
-        initialFocusPending=false; returnFromChooser=false; announceLoaded=false;
+        initialFocusPending=false; returnFromChooser=false; announceLoaded=false; pendingReturnMessage.clear();
         focus(open);
         auto start=cached.path.isNotEmpty()?juce::File(cached.path).getParentDirectory():juce::File{};
         const auto previous=setting("instrumentPath");
@@ -2050,15 +2211,15 @@ private:
                 auto file=fc.getResult();
                 if(file!=juce::File{}) { rememberSetting("instrumentPath",file.getFullPathName()); self->pendingBrowserPreset=juce::File{}; self->announceLoaded=true; self->proc.loadFile(file); }
                 juce::MessageManager::callAsync([safe]{if(auto* e=safe.getComponent()) {
-                    e->chooser.reset(); e->returnFromChooser=true; e->chooserReturnedAt=juce::Time::getMillisecondCounter(); e->initialFocusPending=false;
-                    e->scheduleInitialFocus();
+                    e->chooser.reset(); e->returnTo(1);
                 }});
             }
         });
     }
     static juce::String number(int n) {return juce::String(n).paddedLeft('0',3);}
     void browseImport(bool single) {
-        if(chooser||catalogBusy||cached.loading) return;
+        if(chooser||catalogBusy||cached.loading||importInProgress) return;
+        importInProgress=true; pendingReturnMessage.clear(); chooserReturn=single?38:37; rememberFocus(chooserReturn);
         const int ch=selectedChannel(),code=proc.current(ch),destBank=bank.getSelectedId()>0?bank.getSelectedId()-1:code>>7,destProgram=program.getSelectedId()>0?program.getSelectedId()-1:code&127;
         auto start=juce::File::getSpecialLocation(juce::File::userDocumentsDirectory);
         const auto previous=setting("instrumentPath");
@@ -2068,18 +2229,24 @@ private:
         chooser->launchAsync(juce::FileBrowserComponent::openMode|juce::FileBrowserComponent::canSelectFiles,[safe,single,ch,destBank,destProgram](const juce::FileChooser& fc){
             const auto file=fc.getResult();
             juce::MessageManager::callAsync([safe,single,ch,destBank,destProgram,file]{if(auto* e=safe.getComponent()) {
-                e->chooser.reset(); e->focus(single?static_cast<juce::Component&>(e->program):static_cast<juce::Component&>(e->bank));
-                if(file==juce::File{}) return;
+                e->chooser.reset();
+                if(file==juce::File{}) {e->endImport();return;}
                 rememberSetting("instrumentPath",file.getFullPathName());
                 if(single&&file.hasFileExtension("sfz")) {e->finishImport(e->proc.importSFZ(file,pack(destBank,destProgram),ch));return;}
-                if(!file.hasFileExtension("sf2;sf3")) {e->announce("Unsupported file format");return;}
+                if(!file.hasFileExtension("sf2;sf3")) {e->endImport("Unsupported file format");return;}
                 e->scanImport(file,single,ch,destBank,destProgram);
             }});
         });
     }
+    void endImport(const juce::String& message={}) {
+        if(panelMode==Panel::source) closePanel(&focusTarget(chooserReturn));
+        importInProgress=false; pendingReturnMessage=message; returnTo(chooserReturn);
+        if(!returnFromChooser&&focusTarget(chooserReturn).hasKeyboardFocus(true)&&pendingReturnMessage.isNotEmpty()) {speak(focusTarget(chooserReturn),pendingReturnMessage);pendingReturnMessage.clear();}
+    }
     void finishImport(const juce::Result& result) {
-        if(result.failed()) {announce(result.getErrorMessage());return;}
-        refresh(true);announceLoaded=true;announce("Loading assignment");
+        endImport(result.failed()?result.getErrorMessage():juce::String{});
+        if(result.failed()) return;
+        refresh(true);announceLoaded=true;
     }
     void scanImport(juce::File file,bool single,int ch,int destBank,int destProgram) {
         if(catalogThread.joinable()) catalogThread.join();
@@ -2090,29 +2257,48 @@ private:
             auto data=std::make_shared<CatalogResult>(inspectSF2(file));
             juce::MessageManager::callAsync([safe,file,single,ch,destBank,destProgram,data,startRevision]{if(auto* e=safe.getComponent()) {
                 e->catalogBusy=false; if(e->catalogThread.joinable()) e->catalogThread.join(); e->refresh(true);
-                if(e->proc.getRevision()!=startRevision) {e->announce("Instrument changed; import cancelled");return;}
-                if(data->error.isNotEmpty()) {e->announce(data->error);return;}
+                if(e->proc.getRevision()!=startRevision) {e->endImport("Instrument changed; import cancelled");return;}
+                if(data->error.isNotEmpty()) {e->endImport(data->error);return;}
                 e->chooseSourceBank(file,single,ch,destBank,destProgram,data);
             }});
         });
     }
+    void showSourceList(const juce::String& titleText,std::vector<std::pair<int,juce::String>> entries,std::function<void(int)> action) {
+        if(entries.empty()) {endImport("No source entries");return;}
+        hideMainForPanel(); hidePanelControls(); panelMode=Panel::source;
+        sourceEntries=std::move(entries); sourceAction=std::move(action); panelCancelAction=[this]{endImport();};
+        setPanelLabel(titleText); presetList.setName(titleText); presetList.setTitle(titleText);
+        panelCancel.setButtonText("Cancel"); panelCancel.setTitle("Cancel");
+        for(auto* c:std::array<juce::Component*,3>{&presetList,&panelCancel,&panelLabel}) c->setVisible(true);
+        presetList.updateContent(); presetList.deselectAllRows(); presetList.selectRow(0); presetList.scrollToEnsureRowIsOnscreen(0);
+        resized(); repaint(); focus(presetList); announce(titleText+". "+getNameForRow(0));
+        if(!presetList.hasKeyboardFocus(true)) {
+            juce::Component::SafePointer<Editor> safe(this);
+            juce::Timer::callAfterDelay(150,[safe]{if(auto* e=safe.getComponent();e&&e->panelMode==Panel::source&&e->isShowing()&&e->getPeer()!=nullptr&&e->getPeer()->isFocused()) {auto* c=juce::Component::getCurrentlyFocusedComponent(); if(!c||c==e||e->isParentOf(c)) {e->focus(e->presetList);e->announce(e->panelLabel.getText()+". "+e->getNameForRow(e->presetList.getSelectedRow()));}}});
+        }
+    }
+    void activateSource(int row) {
+        if(!juce::isPositiveAndBelow(row,getNumRows())||!sourceAction)return;
+        const int id=sourceEntries[static_cast<size_t>(row)].first; auto action=sourceAction; action(id);
+    }
     void chooseSourceBank(const juce::File& file,bool single,int ch,int destBank,int destProgram,std::shared_ptr<CatalogResult> data) {
-        juce::PopupMenu menu; int last=-1;
-        for(const auto& p:data->presets) if(p.bank!=last) {last=p.bank;menu.addItem(p.bank+1,"Bank "+number(p.bank)+", "+sourceName(p.path));}
-        juce::Component::SafePointer<Editor> safe(this);
+        std::vector<std::pair<int,juce::String>> entries; int last=-1;
+        for(const auto& p:data->presets) if(p.bank!=last) {last=p.bank;entries.emplace_back(p.bank,"Bank "+number(p.bank)+", "+sourceName(p.path));}
         const auto startRevision=proc.getRevision();
-        menu.showMenuAsync(juce::PopupMenu::Options().withTargetComponent(single?static_cast<juce::Component*>(&program):static_cast<juce::Component*>(&bank)),[safe,file,single,ch,destBank,destProgram,data,startRevision](int id){if(auto* e=safe.getComponent();e&&id>0) {
-            if(e->proc.getRevision()!=startRevision) {e->announce("Instrument changed; import cancelled");return;}
-            if(single) e->chooseSourceProgram(file,ch,destBank,destProgram,id-1,data);
-            else e->finishImport(e->proc.importSF2(file,destBank,-1,id-1,0,ch));
-        }});
+        showSourceList("Select source bank",std::move(entries),[this,file,single,ch,destBank,destProgram,data,startRevision](int id){
+            if(proc.getRevision()!=startRevision) {endImport("Instrument changed; import cancelled");return;}
+            if(single) chooseSourceProgram(file,ch,destBank,destProgram,id,data);
+            else finishImport(proc.importSF2(file,destBank,-1,id,0,ch));
+        });
     }
     void chooseSourceProgram(const juce::File& file,int ch,int destBank,int destProgram,int sourceBank,std::shared_ptr<CatalogResult> data) {
-        juce::PopupMenu menu;
-        for(const auto& p:data->presets) if(p.bank==sourceBank) menu.addItem(p.program+1,"Program "+number(p.program)+", "+p.name+", "+sourceName(p.path));
-        juce::Component::SafePointer<Editor> safe(this);
+        std::vector<std::pair<int,juce::String>> entries;
+        for(const auto& p:data->presets) if(p.bank==sourceBank) entries.emplace_back(p.program,"Program "+number(p.program)+", "+p.name+", "+sourceName(p.path));
         const auto startRevision=proc.getRevision();
-        menu.showMenuAsync(juce::PopupMenu::Options().withTargetComponent(&program),[safe,file,ch,destBank,destProgram,sourceBank,startRevision](int id){if(auto* e=safe.getComponent();e&&id>0) {if(e->proc.getRevision()!=startRevision) {e->announce("Instrument changed; import cancelled");return;} e->finishImport(e->proc.importSF2(file,destBank,destProgram,sourceBank,id-1,ch));}});
+        showSourceList("Select source program",std::move(entries),[this,file,ch,destBank,destProgram,sourceBank,startRevision](int id){
+            if(proc.getRevision()!=startRevision) {endImport("Instrument changed; import cancelled");return;}
+            finishImport(proc.importSF2(file,destBank,destProgram,sourceBank,id,ch));
+        });
     }
     void rebuildPrograms(int b,int p) {
         program.clear(juce::dontSendNotification);
@@ -2134,10 +2320,6 @@ private:
         if(pendingBrowserPreset!=juce::File{}&&!cached.loading&&proc.currentPresetFile()==pendingBrowserPreset) {
             if(cached.ready||cached.path.isEmpty()) {preset_browser_memory::remember(presetRoot(),pendingBrowserPreset,settingsName);pendingBrowserPreset=juce::File{};}
         }
-        if(announceLoaded&&!cached.loading&&!chooser&&!returnFromChooser) {
-            announceLoaded=false;
-            if(open.hasKeyboardFocus(true)) speak(open,cached.status); else if(program.hasKeyboardFocus(true)) speak(program,cached.status); else if(bank.hasKeyboardFocus(true)) speak(bank,cached.status);
-        }
         if(channel.getSelectedId()!=proc.uiChannel()+1&&!channel.isPopupActive()) {channel.setSelectedId(proc.uiChannel()+1,juce::dontSendNotification);shownCode=-1;}
         const int code=proc.current(selectedChannel()); const int previousCode=shownCode;
         if(force||changed||code!=shownCode) {
@@ -2156,7 +2338,7 @@ private:
         }
         routingLabel.setText(!sf2MultiOutput?"Stereo output routing - SFZ active, SF2 Main 1/2 only - Alt+R":"Stereo output routing - Alt+R",juce::dontSendNotification);
         if(changed||force||code!=previousCode) for(auto& c:routeLevels) c.updateText();
-        const bool ready=!cached.loading&&!catalogBusy; bank.setEnabled(ready);program.setEnabled(ready);channel.setEnabled(!cached.loading);
+        // Keep the focused native controls enabled during loading. Their edit handlers guard pending requests.
         if(!dragging) { const auto gain=proc.gainParameter().get(); if(std::abs(level.getValue()-gain)>0.000001) level.setValue(gain,juce::dontSendNotification); const auto text=juce::String(gain,1)+" dB"; if(levelReadout.getText()!=text) levelReadout.setText(text,juce::dontSendNotification); }
         for(int ch=0;ch<channels;++ch) {
             auto& c=channelLevels[ch];
@@ -2167,6 +2349,12 @@ private:
             if(!channelDragging[ch]) {const auto v=proc.channelGainParameter(ch).get(); if(std::abs(c.getValue()-v)>0.000001) {c.setValue(v,juce::dontSendNotification);repaint();}}
         }
         if(gridOpen) {if(changed||code!=gridShownCode) {gridShownCode=code;rebuildGrid();} else refreshGridValues();}
+        if(announceLoaded&&!cached.loading&&!chooser&&!returnFromChooser&&!importInProgress&&hasKeyboardFocus(true)) {
+            announceLoaded=false;
+            if(bank.hasKeyboardFocus(true)&&cached.status.startsWith("Loaded:")) speak(bank,bank.getText());
+            else if(program.hasKeyboardFocus(true)&&cached.status.startsWith("Loaded:")) speak(program,program.getText());
+            else if(auto* c=juce::Component::getCurrentlyFocusedComponent();c&&isParentOf(c)) speak(*c,cached.status);
+        }
     }
     void timerCallback() override {if(returnFromChooser&&juce::Time::getMillisecondCounter()-chooserReturnedAt>2000u) returnFromChooser=false; refresh(false); maybePromptMissing(); if(panelMode==Panel::none&&(initialFocusPending||returnFromChooser)&&isShowing()&&getPeer()!=nullptr&&getPeer()->isFocused()) scheduleInitialFocus();}
 };

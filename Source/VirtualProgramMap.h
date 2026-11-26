@@ -25,4 +25,12 @@ template<class Preset> bool replaceBank(std::map<int,Preset>& map,const std::vec
     for(const auto& p:source) if(p.bank==sourceBank) assignProgram(map,p,bank,p.program);
     return true;
 }
+// Trims belong to the virtual address, not the MIDI channel or source file.
+// A successful replacement clears only the replaced location(s).
+template<class GainMap> void eraseInstrumentGains(GainMap& gains,int bank,int program) {
+    if(bank<0) return;
+    if(program>=0) {gains.erase(address(bank,program)); return;}
+    auto it=gains.lower_bound(address(bank,0));
+    while(it!=gains.end()&&it->first/programCount==bank) it=gains.erase(it);
+}
 }

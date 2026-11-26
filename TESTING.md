@@ -1,3 +1,22 @@
+# TEST25 — current acceptance checks
+
+1. Load SFZ instruments on channels 1 and 2. Open Alt+L and verify the six compressor controls for the selected channel. Verify channel 2 remains unchanged after modifying channel 1. Check Backspace defaults, full mix range, zero mix unchanged dry audio, and stereo balance. Empty programs still show only Gain/Routing. In the normal build SF2 compressor rows are hidden because the SF2 stereo render is not isolated.
+2. With the compressor active on channel 1, route channel 1 from Main to 3/4, then 5/6. Verify compression follows the channel and there is no duplicate on Main. Route both channels to the same output and verify independent compression before summation. Change the virtual program: channel compressor settings stay put. Check SFZ instrument gain remains separate.
+3. Save with Ctrl+S/Ctrl+Shift+S; reopen and verify all channel compressor settings and routing. Confirm Alt+I resets all Mix values to 0%; previous presets without the new fields load at Mix 0%.
+4. Independent `Tests/ChannelCompressorTest.cpp` tests all 16 instances, exact bypass, ratio, parallel mix, stereo link, release and sample rates 44100/48000/96000. All seven independent C++ tests passed locally. The previous native two-source and multigroup FluidSynth smoke binaries passed locally. The JUCE/sfizz hybrid processor tests, including independent compression/routing and state checks, are compiled and run on Windows CI, not verified here.
+5. Optional experimental SF2 multigroup workflow: enable only explicitly. Verify CI tests pass before loading the artifact. Use a disposable REAPER project, not important sessions. Test several actual SF2 files, first load/reload, two channels on separate outputs, one channel compressed, change routing while notes sustain, effects on/off, shared outputs, SF2/SFZ mixture, save/restore, and unload. If it crashes, return to the ordinary build and collect the crash event and CI logs. Previous native smoke success does not prove DAW stability.
+
+---
+
+# TEST24 — current acceptance checks
+
+1. With NVDA, test Alt+K at Bank 002 and Alt+P at Program 003. Select SF2 or SFZ, complete import, wait for the loader, and verify exact original control/location and source name. Repeat cancelling the file chooser, source bank list and source program list, and with an invalid file. No SAPI voice; test JAWS if available.
+2. Exit and re-enter the same FX, then close/reopen its editor. Verify last Bank/Program, strip position, master gain, buttons, grid navigator or value slider, and row/step memory. Test native Tab and mouse focus too. Verify no focus steal while REAPER FX list or another plugin has focus. Save/Save As, preset browser, Retry/Cancel, and cancelled Alt+I return to origin. Confirmed Alt+I resets to Open.
+3. Import SFZ into Bank 000 Program 003 and another at 004. Set SFZ instrument gain to -12 dB at 003 (and optionally +6 at 004). Check unchanged channel gain, other program gain and source files; switch programs, switch MIDI channel, route separately, play two channels on same address. Backspace resets instrument gain alone. Save/reopen project and preset, then replace 003 and verify only that trim resets; replace bank and initialize.
+4. Independent C++ tests (six) passed locally, including new address-trim reset assertions. Native two-source FluidSynth test passed. The extended hybrid processor audio and state checks are compiled/run in Windows CI, not verified here. Actual UIA focus and speech must be checked in REAPER.
+
+---
+
 # TEST22
 1. Remove old LSoundFont VST3 from scan paths (same plugin ID); install LSFX. Scan REAPER.
 2. Open FluidR3 GM.sf2. Play same MIDI, host sample rate and block size as TEST1. Compare REAPER Performance Meter at rest, 1 note, 4 notes, and full MIDI arrangement. Use generic UI to compare Fourth order / Seventh order and effects Off / Both. Compare dry sound separately from effects; no claim of equal wet sound.

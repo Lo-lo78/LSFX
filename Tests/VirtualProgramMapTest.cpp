@@ -32,4 +32,12 @@ int main() {
     assert(map.count(address(1,3))==0);
     assert(map.at(address(1,10)).source=="B");
     assert(map.at(address(128,0)).source=="A");
+    std::map<int,float> gains{{address(0,3),-6.0f},{address(0,4),12.0f},{address(1,3),3.0f},{address(128,0),-2.0f}};
+    eraseInstrumentGains(gains,0,3);
+    assert(!gains.count(address(0,3))&&gains.at(address(0,4))==12.0f);
+    assert(gains.at(address(1,3))==3.0f);
+    eraseInstrumentGains(gains,0,-1);
+    assert(gains.size()==2&&gains.at(address(128,0))==-2.0f);
+    eraseInstrumentGains(gains,1,3);
+    assert(gains.size()==1&&gains.count(address(128,0)));
 }
