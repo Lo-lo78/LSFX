@@ -2,6 +2,7 @@
 #include <fluidsynth.h>
 #include <sfizz.h>
 #include "OutputStage.h"
+#include "ParameterSearchKey.h"
 #include <array>
 #include <atomic>
 #include <algorithm>
@@ -153,7 +154,7 @@ public:
     juce::AudioParameterChoice& effectsParameter() { return *effects; }
     juce::AudioParameterChoice& sfzQualityParameter() { return *sfzQuality; }
     juce::RangedAudioParameter& fxParameter(int i) { return *fxParams[i]; }
-    juce::String diagnostic() const { return "Active voices: "+juce::String(activeVoices.load())+"; SF2 idle sleep: "+(sleeping.load()?juce::String("yes"):juce::String("no"))+"; dropped engine-swap blocks: "+juce::String(droppedBlocks.load()); }
+    juce::String diagnostic() const { return "Active voices: "+juce::String(activeVoices.load())+"; SF2 idle sleep: "+(sleeping.load()?juce::String("yes"):juce::String("no"))+"; dropped engine-swap blocks: "+juce::String(droppedBlocks.load())+"; MIDI program changes: "+juce::String(programChanges.load())+"; last program change: "+lastProgramText(); }
     int getControl(int ch,int id) const {
         const int i=controlIndex(ch,id), pendingValue=controlCommands[i].load();
         return pendingValue==unset?controlValues[i].load():pendingValue;
@@ -202,7 +203,7 @@ public:
                     else if((st==0x80 || st==0x90) && m.numBytes>=3) sfizz_send_note_off(z,t,a,v);
                     else if(st==0xb0 && m.numBytes>=3) { sfizz_send_cc(z,t,a,v); if(a<120) controlValues[controlIndex(0,a)].store(v); }
                     else if(st==0xe0 && m.numBytes>=3) sfizz_send_hd_pitch_wheel(z,t,((a|(v<<7))-8192)/8192.0f);
-                    else if(st==0xc0) sfizz_send_program_change(z,t,a);
+                    else if(st==0xc0) { receiveProgram(0,a); sfizz_send_program_change(z,t,a); }
                 }
                 float* out[]={b.getWritePointer(0,start),b.getWritePointer(1,start)};
                 sfizz_render_block(z,out,2,count); start+=count;
@@ -234,13 +235,14 @@ public:
             if (count>0) fluid_synth_write_float(s,count,b.getWritePointer(0,start),0,1,b.getWritePointer(1,start),0,1);
         };
         int cursor=0;
-        for (const auto meta : midi) {
-            if(meta.numBytes<=0||meta.data[0]>=0xf8) continue;
-            const int pos=juce::jlimit(cursor,b.getNumSamples(),meta.samplePosition);
-            render(cursor,pos-cursor); cursor=pos;
+        // VST3 delivers controllers in separate queues and SysEx/notes in an event list.
+        // Restore setup ordering within each timestamp: SysEx, Bank Select, Program,
+        // then the other events. No allocation or reordering across timestamps.
+        auto handleMidi = [&](const auto& meta) {
+            if(meta.numBytes<=0||meta.data[0]>=0xf8) return;
             // Avoid allocating a MidiMessage for long SysEx messages.
             const auto* d=meta.data; const int n=meta.numBytes;
-            if(n<=0) continue;
+            if(n<=0) return;
             const int status=d[0], ch=status&15;
             if(status==0xf0 && n>=2) {
                 int len=n-1; if(d[n-1]==0xf7) --len;
@@ -253,12 +255,35 @@ public:
                     case 0x90: if(n>=3) { if(v) fluid_synth_noteon(s,ch,a,v); else fluid_synth_noteoff(s,ch,a); } break;
                     case 0xa0: if(n>=3) fluid_synth_key_pressure(s,ch,a,v); break;
                     case 0xb0: if(n>=3) { fluid_synth_cc(s,ch,a,v); if(a<120) controlValues[controlIndex(ch,a)].store(v); if(a==121||a==6||a==38||a==96||a==97) refreshFluidControls(s,ch); } break;
-                    case 0xc0: fluid_synth_program_change(s,ch,a); updateProgram(s,ch); break;
+                    case 0xc0: receiveProgram(ch,a); fluid_synth_program_change(s,ch,a); updateProgram(s,ch); break;
                     case 0xd0: fluid_synth_channel_pressure(s,ch,a); break;
                     case 0xe0: if(n>=3) fluid_synth_pitch_bend(s,ch,a|(v<<7)); break;
                     default: break;
                 }
             }
+        };
+        auto priority=[](const auto& m) {
+            if(m.numBytes<=0) return 3;
+            const int st=m.data[0];
+            if(st==0xf0) return 0;
+            if((st&0xf0)==0xb0 && m.numBytes>=3 && (m.data[1]==0 || m.data[1]==32)) return 1;
+            if((st&0xf0)==0xc0) return 2;
+            return 3;
+        };
+        for(auto first=midi.begin(), end=midi.end(); first!=end;) {
+            const int time=(*first).samplePosition;
+            auto next=first; ++next;
+            while(next!=end && (*next).samplePosition==time) ++next;
+            bool relevant=false;
+            for(auto it=first;it!=next;++it) { const auto m=*it; if(m.numBytes>0 && m.data[0]<0xf8) { relevant=true; break; } }
+            if(!relevant) { first=next; continue; }
+            const int pos=juce::jlimit(cursor,b.getNumSamples(),time);
+            render(cursor,pos-cursor); cursor=pos;
+            auto second=first; ++second;
+            if(second==next) handleMidi(*first);
+            else for(int pass=0;pass<4;++pass)
+                for(auto it=first;it!=next;++it) { const auto m=*it; if(priority(m)==pass) handleMidi(m); }
+            first=next;
         }
         render(cursor,b.getNumSamples()-cursor);
         const int after=fluid_synth_get_active_voice_count(s); activeVoices.store(after);
@@ -301,7 +326,14 @@ public:
     }
 private:
     std::array<juce::RangedAudioParameter*,fxCount> fxParams{};
-    std::atomic<int> activeVoices{0}, droppedBlocks{0};
+    std::atomic<int> activeVoices{0}, droppedBlocks{0}, programChanges{0}, lastProgram{-1};
+    juce::String lastProgramText() const {
+        const int code=lastProgram.load();
+        return code<0?juce::String("none"):"CH "+juce::String((code>>7)+1)+", program "+juce::String(code&127);
+    }
+    void receiveProgram(int ch,int program) {
+        lastProgram.store(pack(ch,program)); ++programChanges;
+    }
     std::atomic<bool> sleeping{false};
     int readFXValue(int i) const { const auto* p=fxParams[i]; return juce::jlimit(fxSpecs[i].lo,fxSpecs[i].hi,juce::roundToInt(p->convertFrom0to1(p->getValue()))); }
     FXValues readFX() const { FXValues f; for(int i=0;i<fxCount;++i) f[i]=readFXValue(i); return f; }
@@ -541,6 +573,7 @@ private:
 // then Enter into the value editor. All DSP calls remain on the audio thread.
 constexpr int stepWidths[]={1,5,10,15,20};
 constexpr int pageMultiplier=40;
+constexpr int gridRowsPerColumn=8, gridColumnsPerPage=2, gridPageRows=gridRowsPerColumn*gridColumnsPerPage;
 constexpr int rowGain=-1,rowInterpolation=-2,rowEffects=-3,rowSfzQuality=-4,rowChannel=-5;
 struct GridRow { int id; juce::String name; double low,high,step; bool choice; juce::String unit; };
 
@@ -557,6 +590,7 @@ public:
 // Based on the accessibility notification technique used in LJuno-116.
 // Windows uses the focused control's own UIA provider, rather than a speech DLL.
 static void speak(juce::Component& source,const juce::String& message) {
+    if(!source.hasKeyboardFocus(true)) return;
 #if JUCE_WINDOWS
     if(!UiaClientsAreListening()) return;
     if(auto* handler=source.getAccessibilityHandler()) {
@@ -579,14 +613,14 @@ public:
     explicit Editor(Processor& p) : AudioProcessorEditor(p), proc(p) {
         setWantsKeyboardFocus(true);
         setFocusContainerType(juce::Component::FocusContainerType::keyboardFocusContainer);
-        title.setText("LSFX 0.0.1 TEST8",juce::dontSendNotification); title.setFont(juce::FontOptions(21.0f)); addAndMakeVisible(title);
+        title.setText("LSFX 0.0.1 TEST10",juce::dontSendNotification); title.setFont(juce::FontOptions(21.0f)); title.setAccessible(false); addAndMakeVisible(title);
         status.setText("No SoundFont loaded",juce::dontSendNotification); status.setTitle("Instrument status"); addAndMakeVisible(status);
         setup(open,"Open SF2 or SFZ",1); setup(parameters,"Parameters",2); setup(channel,"MIDI channel",3); setup(bank,"Bank",4); setup(program,"Program",5); setup(level,"Output gain",6); setup(stop,"Panic - all sounds off",7); setup(readStatus,"Read status",8);
         setup(grid,"Parameter grid",1); setup(value,"Parameter value",2); setup(closeGrid,"Close parameters",3);
         open.setDescription("Alt+O"); parameters.setDescription("Alt+L"); channel.setDescription("Alt+M"); bank.setDescription("Alt+B"); program.setDescription("Alt+P"); level.setDescription("Alt+G"); stop.setDescription("Alt+A"); readStatus.setDescription("Alt+S");
-        grid.setDescription("Enter or Tab edits the selected parameter. Escape closes parameters.");
+        grid.setDescription("Alt+L. Enter or Tab edits the selected parameter. Escape closes parameters.");
         channelLabel.setText("MIDI channel",juce::dontSendNotification); bankLabel.setText("Bank",juce::dontSendNotification); programLabel.setText("Program",juce::dontSendNotification); levelLabel.setText("Output gain (dB)",juce::dontSendNotification);
-        gridTitle.setText("Parameters",juce::dontSendNotification); hint.setText("Enter: edit / browse. Left / Right: step in value editor. Esc: close.",juce::dontSendNotification);
+        gridTitle.setText("Parameters",juce::dontSendNotification); hint.setText("Arrows: grid or value. Type to search. Enter: edit / browse. Esc: close.",juce::dontSendNotification);
         for(auto* l:{&channelLabel,&bankLabel,&programLabel,&levelLabel,&gridTitle,&hint}) addAndMakeVisible(*l);
         for(int i=1;i<=16;++i) channel.addItem("Channel "+juce::String(i),i);
         channel.setSelectedId(1,juce::dontSendNotification);
@@ -597,37 +631,75 @@ public:
         stop.onClick=[this]{proc.allOff();};
         readStatus.onClick=[this]{ juce::AlertWindow::showMessageBoxAsync(juce::MessageBoxIconType::InfoIcon,"LSFX status",proc.getView().status+"\n"+proc.diagnostic()); };
         closeGrid.onClick=[this]{ closeParameters(); };
-        level.setSliderStyle(juce::Slider::LinearHorizontal); level.setTextBoxStyle(juce::Slider::TextBoxRight,true,90,25); level.setRange(-60.0,6.0,0.1); level.setValue(proc.gainParameter().get(),juce::dontSendNotification);
+        level.setSliderStyle(juce::Slider::LinearHorizontal); level.setTextBoxStyle(juce::Slider::NoTextBox,true,0,0); level.textFromValueFunction=[](double v){return juce::String(v,1)+" dB";}; level.setRange(-60.0,6.0,0.1); level.setValue(proc.gainParameter().get(),juce::dontSendNotification);
         level.onDragStart=[this]{proc.gainParameter().beginChangeGesture(); dragging=true;};
         level.onDragEnd=[this]{dragging=false;proc.gainParameter().endChangeGesture();};
-        level.onValueChange=[this]{ auto& a=proc.gainParameter(); if(!dragging) a.beginChangeGesture(); a.setValueNotifyingHost(a.convertTo0to1(static_cast<float>(level.getValue()))); if(!dragging) a.endChangeGesture(); };
-        value.setSliderStyle(juce::Slider::LinearHorizontal); value.setTextBoxStyle(juce::Slider::TextBoxRight,true,200,25);
-        grid.onChange=[this]{ if(!updatingGrid) syncValue(); };
+        level.onValueChange=[this]{ auto& a=proc.gainParameter(); if(!dragging) a.beginChangeGesture(); a.setValueNotifyingHost(a.convertTo0to1(static_cast<float>(level.getValue()))); if(!dragging) a.endChangeGesture(); levelReadout.setText(juce::String(level.getValue(),1)+" dB",juce::dontSendNotification); };
+        value.setSliderStyle(juce::Slider::LinearHorizontal); value.setTextBoxStyle(juce::Slider::NoTextBox,true,0,0);
+        for(auto* l:{&levelReadout,&valueReadout}) {l->setJustificationType(juce::Justification::centredRight); l->setAccessible(false); addAndMakeVisible(*l);}
+        grid.onChange=[this]{ if(!updatingGrid) {search.reset(); syncValue(); repaint();} };
         value.onValueChange=[this]{ if(!updatingGrid) { if(auto* row=selectedRow()) { const auto r=*row; writeRow(r,value.getValue()); refreshGridValues(); } } };
         // Keyed controls intercept their own arrows before JUCE's native behavior;
         // the editor listener also handles Alt accelerators bubbling from children.
         addKeyListener(this);
-        showGrid(false); setSize(680,410); refresh(true); startTimerHz(5);
+        showGrid(false); setSize(760,570); refresh(true); startTimerHz(5);
         scheduleInitialFocus();
     }
     ~Editor() override { stopTimer(); removeKeyListener(this); chooser.reset(); }
-    void paint(juce::Graphics& g) override {g.fillAll(juce::Colour(0xff202429));}
-    void focusGained(FocusChangeType) override { scheduleInitialFocus(); }
+    void paint(juce::Graphics& g) override {
+        g.fillAll(juce::Colour(0xff202429));
+        if(!gridOpen) return;
+        const auto count=static_cast<int>(rows.size());
+        const int current=juce::jmax(0,grid.getSelectedItemIndex());
+        const int first=(current/gridPageRows)*gridPageRows;
+        g.setColour(juce::Colour(0xffaeb9c6));
+        g.setFont(juce::Font(juce::FontOptions(13.0f)));
+        g.drawText("Grid  -  page "+juce::String(first/gridPageRows+1)+" / "+juce::String(juce::jmax(1,(count+gridPageRows-1)/gridPageRows)),gridPageBounds,juce::Justification::centredLeft,true);
+        for(int k=0;k<gridPageRows;++k) {
+            const int index=first+k; const auto cell=gridCell(k);
+            const bool selected=index==current&&index<count;
+            g.setColour(selected?juce::Colour(0xff304d66):juce::Colour(0xff272e35)); g.fillRect(cell);
+            g.setColour(selected?juce::Colour(0xffb0d6ff):juce::Colour(0xff657481)); g.drawRect(cell,selected?2:1);
+            if(index>=count) continue;
+            const auto& row=rows[static_cast<size_t>(index)];
+            auto content=cell.reduced(7,1); auto number=content.removeFromLeft(26);
+            g.setColour(juce::Colour(0xffafbac5)); g.drawText(juce::String(index+1),number,juce::Justification::centredLeft,true);
+            auto right=content.removeFromRight(116); content.removeFromRight(4);
+            g.setColour(juce::Colours::white); g.drawFittedText(row.name,content,juce::Justification::centredLeft,1);
+            g.setColour(juce::Colour(0xffd0e4f7)); g.drawFittedText(formatValue(row,readRow(row)),right,juce::Justification::centredRight,1);
+        }
+    }
+    void mouseDown(const juce::MouseEvent& e) override {
+        if(!gridOpen||!gridArea.contains(e.getPosition())) return;
+        const int first=(juce::jmax(0,grid.getSelectedItemIndex())/gridPageRows)*gridPageRows;
+        for(int k=0;k<gridPageRows;++k) if(gridCell(k).contains(e.getPosition())&&first+k<static_cast<int>(rows.size())) {
+            search.reset(); selectGridRow(first+k,false); focus(grid); break;
+        }
+    }
+    void focusGained(FocusChangeType) override { initialFocusPending=true; scheduleInitialFocus(); }
     void visibilityChanged() override { if(isVisible()) { initialFocusPending=true; scheduleInitialFocus(); } }
     void parentHierarchyChanged() override { if(isShowing()) scheduleInitialFocus(); }
+    std::unique_ptr<juce::AccessibilityHandler> createAccessibilityHandler() override {
+        return createIgnoredAccessibilityHandler(*this);
+    }
     void resized() override {
         auto r=getLocalBounds().reduced(16); title.setBounds(r.removeFromTop(30)); status.setBounds(r.removeFromTop(30));
         if(gridOpen) {
-            r.removeFromTop(10); gridTitle.setBounds(r.removeFromTop(28)); grid.setBounds(r.removeFromTop(38)); r.removeFromTop(8); value.setBounds(r.removeFromTop(42));
-            r.removeFromTop(6); hint.setBounds(r.removeFromTop(32)); closeGrid.setBounds(r.removeFromTop(36)); return;
+            r.removeFromTop(8); gridTitle.setBounds(r.removeFromTop(28)); grid.setBounds(r.removeFromTop(34)); r.removeFromTop(6);
+            auto v=r.removeFromTop(38); valueReadout.setBounds(v.removeFromRight(180)); value.setBounds(v.reduced(0,2));
+            r.removeFromTop(6); gridPageBounds=r.removeFromTop(20); gridArea=r.removeFromTop(240);
+            r.removeFromTop(6); hint.setBounds(r.removeFromTop(30)); closeGrid.setBounds(r.removeFromTop(34)); return;
         }
         open.setBounds(r.removeFromTop(30)); r.removeFromTop(4); parameters.setBounds(r.removeFromTop(30)); r.removeFromTop(8);
         auto line=[&](juce::Label& l,juce::Component& c){auto a=r.removeFromTop(38);l.setBounds(a.removeFromLeft(150));c.setBounds(a.reduced(0,3));};
-        line(channelLabel,channel);line(bankLabel,bank);line(programLabel,program);line(levelLabel,level);r.removeFromTop(6);auto a=r.removeFromTop(32);stop.setBounds(a.removeFromLeft(a.getWidth()/2).reduced(2));readStatus.setBounds(a.reduced(2));
+        line(channelLabel,channel);line(bankLabel,bank);line(programLabel,program);
+        auto lv=r.removeFromTop(38); levelLabel.setBounds(lv.removeFromLeft(150)); levelReadout.setBounds(lv.removeFromRight(100)); level.setBounds(lv.reduced(0,3)); r.removeFromTop(6);auto a=r.removeFromTop(32);stop.setBounds(a.removeFromLeft(a.getWidth()/2).reduced(2));readStatus.setBounds(a.reduced(2));
     }
 private:
     Processor& proc;
-    juce::Label title,status,channelLabel,bankLabel,programLabel,levelLabel,gridTitle,hint;
+    juce::Label title,status,channelLabel,bankLabel,programLabel,levelLabel,gridTitle,hint,levelReadout,valueReadout;
+    juce::Rectangle<int> gridArea,gridPageBounds;
+    ljuno::IncrementalParameterSearch search;
     Keyed<juce::TextButton> open{"Open SF2 or SFZ"},parameters{"Parameters"},stop{"Panic - all sounds off"},readStatus{"Read status"},closeGrid{"Close parameters"};
     Keyed<juce::ComboBox> channel,bank,program,grid;
     Keyed<juce::Slider> level,value;
@@ -641,31 +713,59 @@ private:
         c.setTitle(name); c.setWantsKeyboardFocus(true); c.setExplicitFocusOrder(order);
         c.keyHandler=[this](const juce::KeyPress& k,juce::Component* origin){return handleKey(k,origin);}; addAndMakeVisible(c);
     }
+    juce::Rectangle<int> gridCell(int k) const {
+        const int col=k/gridRowsPerColumn, row=k%gridRowsPerColumn;
+        const int w=gridArea.getWidth()/gridColumnsPerPage, h=gridArea.getHeight()/gridRowsPerColumn;
+        return {gridArea.getX()+col*w,gridArea.getY()+row*h,w,h};
+    }
+    // Do not publish a UIA focus event unless the native keyboard focus really arrived.
+    // Never take focus back from REAPER's FX list or another child on a timer.
     void focus(juce::Component& c) {
         if(!c.isShowing()||!c.isEnabled()) return;
-        juce::AccessibilityHandler::clearCurrentlyFocusedHandler(); c.grabKeyboardFocus();
-        if(auto* handler=c.getAccessibilityHandler()) handler->grabFocus();
+        if(!c.hasKeyboardFocus(true)) {
+            juce::AccessibilityHandler::clearCurrentlyFocusedHandler(); c.grabKeyboardFocus();
+            if(c.hasKeyboardFocus(true)) if(auto* handler=c.getAccessibilityHandler()) handler->grabFocus();
+        }
     }
     void scheduleInitialFocus() {
         if(!initialFocusPending||focusScheduled||!isShowing()) return;
         focusScheduled=true;
         juce::Component::SafePointer<Editor> safe(this);
-        juce::MessageManager::callAsync([safe]{if(auto* e=safe.getComponent()) {
+        juce::Timer::callAfterDelay(150,[safe]{if(auto* e=safe.getComponent()) {
             e->focusScheduled=false;
             if(!e->initialFocusPending||!e->isShowing()||e->chooser) return;
-            e->initialFocusPending=false;
-            if(e->gridOpen) e->showGrid(false);
-            e->focus(e->open);
+            auto* focused=juce::Component::getCurrentlyFocusedComponent();
+            if(focused!=nullptr&&focused!=e) {
+                if(e->isParentOf(focused)) e->initialFocusPending=false;
+                return;
+            }
+            auto* peer=e->getPeer();
+            if(peer==nullptr||!peer->isFocused()) return;
+            auto& target=e->gridOpen?static_cast<juce::Component&>(e->grid):static_cast<juce::Component&>(e->open);
+            auto* h=target.getAccessibilityHandler();
+#if JUCE_WINDOWS
+            if(h==nullptr||h->getNativeImplementation()==nullptr) return;
+#else
+            juce::ignoreUnused(h);
+#endif
+            e->initialFocusPending=false; e->focus(target);
+            if(!target.hasKeyboardFocus(true)) e->initialFocusPending=true;
         }});
     }
-    void showGrid(bool show) {
-        gridOpen=show;
-        for(auto* c:std::array<juce::Component*,12>{&open,&parameters,&channel,&bank,&program,&level,&stop,&readStatus,&channelLabel,&bankLabel,&programLabel,&levelLabel}) c->setVisible(!show);
-        for(auto* c:std::array<juce::Component*,5>{&grid,&value,&closeGrid,&gridTitle,&hint}) c->setVisible(show);
+    void showGrid(bool show,juce::Component* destination=nullptr) {
+        gridOpen=show; search.reset();
+        const auto main=std::array<juce::Component*,13>{&open,&parameters,&channel,&bank,&program,&level,&stop,&readStatus,&channelLabel,&bankLabel,&programLabel,&levelLabel,&levelReadout};
+        const auto panel=std::array<juce::Component*,6>{&grid,&value,&closeGrid,&gridTitle,&hint,&valueReadout};
+        // Reveal the destination before hiding the old focused controls.
+        if(show) for(auto* c:panel) c->setVisible(true);
+        else for(auto* c:main) c->setVisible(true);
         resized();
+        if(show) { if(hasKeyboardFocus(true)) focus(grid); for(auto* c:main) c->setVisible(false); }
+        else { if(grid.hasKeyboardFocus(true)||value.hasKeyboardFocus(true)||closeGrid.hasKeyboardFocus(true)) focus(destination!=nullptr?*destination:static_cast<juce::Component&>(parameters)); for(auto* c:panel) c->setVisible(false); }
+        repaint();
     }
     void openParameters() {
-        if(!gridOpen) { refresh(false); showGrid(true); rebuildGrid(); }
+        if(!gridOpen) { refresh(false); rebuildGrid(); showGrid(true); }
         focus(grid);
     }
     void closeParameters() { if(!gridOpen) return; showGrid(false); focus(parameters); }
@@ -694,7 +794,7 @@ private:
         updatingGrid=true; grid.clear(juce::dontSendNotification);
         int target=0;
         for(size_t i=0;i<rows.size();++i) { if(rows[i].id==preferred) target=static_cast<int>(i); grid.addItem(rowLine(rows[i]),static_cast<int>(i)+1); }
-        grid.setSelectedItemIndex(target,juce::dontSendNotification); updatingGrid=false; syncValue();
+        grid.setSelectedItemIndex(target,juce::dontSendNotification); updatingGrid=false; search.reset(); syncValue(); repaint();
     }
     double readRow(const GridRow& r) const {
         if(const int i=fxIndex(r.id);i>=0) { auto& p=proc.fxParameter(i); return p.convertFrom0to1(p.getValue()); }
@@ -734,75 +834,141 @@ private:
         if(auto* row=selectedRow()) {
             const auto r=*row; if(cached.isSfz) lastSfzRow=r.id; else lastSf2Row=r.id;
             updatingGrid=true;
-            value.setTitle(r.name); value.setRange(r.low,r.high,r.step);
+            value.setTitle(r.name); value.setName(r.name); value.setRange(r.low,r.high,r.step);
             value.textFromValueFunction=[this,r](double v) { return formatValue(r,(r.id>=0&&readRow(r)==unset&&v==r.low)?static_cast<double>(unset):v); };
-            const auto v=readRow(r); value.setValue(v==unset?r.low:v,juce::dontSendNotification); value.updateText();
+            const auto v=readRow(r); value.setValue(v==unset?r.low:v,juce::dontSendNotification); value.updateText(); valueReadout.setText(formatValue(r,v),juce::dontSendNotification);
             updatingGrid=false;
         }
     }
     void refreshGridValues() {
         if(!gridOpen||grid.isPopupActive()) return;
-        updatingGrid=true;
-        for(size_t i=0;i<rows.size();++i) { const auto text=rowLine(rows[i]); if(grid.getItemText(static_cast<int>(i))!=text) grid.changeItemText(static_cast<int>(i)+1,text); }
-        updatingGrid=false;
+        bool changed=false; updatingGrid=true;
+        for(size_t i=0;i<rows.size();++i) { const auto text=rowLine(rows[i]); if(grid.getItemText(static_cast<int>(i))!=text) {grid.changeItemText(static_cast<int>(i)+1,text); changed=true;} }
         if(auto* r=selectedRow()) {
-            const double v=readRow(*r); updatingGrid=true; if(!value.isMouseButtonDown()) { value.setValue(v==unset?r->low:v,juce::dontSendNotification); value.updateText(); } updatingGrid=false;
+            const double v=readRow(*r); const auto text=formatValue(*r,v);
+            if(!value.isMouseButtonDown()) {
+                const double actual=v==unset?r->low:v;
+                if(std::abs(value.getValue()-actual)>0.000001) value.setValue(actual,juce::dontSendNotification);
+                if(valueReadout.getText()!=text) {value.updateText(); valueReadout.setText(text,juce::dontSendNotification); changed=true;}
+            }
         }
+        updatingGrid=false; if(changed) repaint();
     }
     void selectGridRow(int target,bool announce) {
         if(rows.empty()) return;
         target=juce::jlimit(0,static_cast<int>(rows.size())-1,target);
-        grid.setSelectedItemIndex(target,juce::dontSendNotification); syncValue();
+        grid.setSelectedItemIndex(target,juce::dontSendNotification); syncValue(); repaint();
         if(announce) speak(grid,rowLine(rows[static_cast<size_t>(target)]));
     }
-    void editSelected(int direction,bool coarse,bool boundary=false) {
+    void editSelected(juce::Component& source,int direction,bool coarse,bool boundary=false) {
         if(auto* row=selectedRow()) {
             const auto r=*row; double v=readRow(r); if(v==unset) v=r.low;
             const double delta=r.step*(r.choice?1:stepWidths[stepIndex]*(coarse?pageMultiplier:1))*direction;
             writeRow(r,boundary?(direction>0?r.high:r.low):v+delta); refreshGridValues();
-            speak(value,formatValue(r,readRow(r)));
+            speak(source,formatValue(r,readRow(r)));
         }
     }
     void changeStep(juce::Component& source,int d) { stepIndex=juce::jlimit(0,4,stepIndex+d); speak(source,"Step "+juce::String(stepWidths[stepIndex])); }
     bool keyPressed(const juce::KeyPress& key,juce::Component* origin) override { return handleKey(key,origin); }
+    juce::Component* keyboardControl(juce::Component* origin) {
+        // Some JUCE controls forward a key from their internal label, rather
+        // than the slider/combobox itself. Treat both routes identically.
+        for(auto* c=origin;c!=nullptr&&c!=this;c=c->getParentComponent()) {
+            for(auto* target:std::array<juce::Component*,11>{&grid,&value,&level,&open,&parameters,&channel,&bank,&program,&stop,&readStatus,&closeGrid}) if(c==target) return target;
+        }
+        return origin;
+    }
+    void changeMainLevel(int direction,bool coarse,bool boundary=false) {
+        const double next=boundary?(direction>0?level.getMaximum():level.getMinimum()):level.getValue()+0.1*stepWidths[stepIndex]*(coarse?pageMultiplier:1)*direction;
+        level.setValue(juce::jlimit(level.getMinimum(),level.getMaximum(),next),juce::sendNotificationSync);
+        levelReadout.setText(juce::String(level.getValue(),1)+" dB",juce::dontSendNotification);
+        speak(level,levelReadout.getText());
+    }
+    void navigateGrid(int code) {
+        if(rows.empty()) return;
+        const int i=juce::jmax(0,grid.getSelectedItemIndex()), count=static_cast<int>(rows.size());
+        const int row=i%gridRowsPerColumn, first=i-row, last=juce::jmin(first+gridRowsPerColumn-1,count-1);
+        int target=i;
+        if(code==juce::KeyPress::upKey) target=juce::jmax(first,i-1);
+        else if(code==juce::KeyPress::downKey) target=juce::jmin(last,i+1);
+        else if(code==juce::KeyPress::leftKey&&first>0) target=i-gridRowsPerColumn;
+        else if(code==juce::KeyPress::rightKey&&i+gridRowsPerColumn<count) target=i+gridRowsPerColumn;
+        else if(code==juce::KeyPress::pageUpKey) target=juce::jmax(first,i-5);
+        else if(code==juce::KeyPress::pageDownKey) target=juce::jmin(last,i+5);
+        else if(code==juce::KeyPress::homeKey) target=0;
+        else if(code==juce::KeyPress::endKey) target=count-1;
+        if(target!=i) selectGridRow(target,true);
+    }
     bool handleKey(const juce::KeyPress& k,juce::Component* origin) {
-        const auto code=k.getKeyCode(); const auto mods=k.getModifiers(); const auto ch=juce::CharacterFunctions::toLowerCase(k.getTextCharacter()!=0?k.getTextCharacter():static_cast<juce::juce_wchar>(code));
-        if(mods.isAltDown()&&!mods.isCtrlDown()&&!mods.isCommandDown()) {
-            if(code==juce::KeyPress::upKey||code==juce::KeyPress::downKey||code==juce::KeyPress::pageUpKey||code==juce::KeyPress::pageDownKey||code==juce::KeyPress::homeKey||code==juce::KeyPress::endKey) {
-                if(gridOpen) { editSelected(code==juce::KeyPress::upKey||code==juce::KeyPress::pageUpKey||code==juce::KeyPress::endKey?1:-1,code==juce::KeyPress::pageUpKey||code==juce::KeyPress::pageDownKey,code==juce::KeyPress::homeKey||code==juce::KeyPress::endKey); return true; }
+        origin=keyboardControl(origin);
+        const auto code=k.getKeyCode(); const auto mods=k.getModifiers();
+        const auto ch=juce::CharacterFunctions::toLowerCase(code>='A'&&code<='Z'?static_cast<juce::juce_wchar>(code):k.getTextCharacter()!=0?k.getTextCharacter():static_cast<juce::juce_wchar>(code));
+        const bool alt=mods.isAltDown(), ctrl=mods.isCtrlDown()||mods.isCommandDown();
+        const bool vertical=code==juce::KeyPress::upKey||code==juce::KeyPress::downKey;
+        const bool horizontal=code==juce::KeyPress::leftKey||code==juce::KeyPress::rightKey;
+        const bool page=code==juce::KeyPress::pageUpKey||code==juce::KeyPress::pageDownKey;
+        const bool boundary=code==juce::KeyPress::homeKey||code==juce::KeyPress::endKey;
+        const int direction=code==juce::KeyPress::upKey||code==juce::KeyPress::pageUpKey||code==juce::KeyPress::endKey||code==juce::KeyPress::rightKey?1:-1;
+        // Leave the host and the native combo popup in control of their own keys.
+        if(chooser||grid.isPopupActive()||bank.isPopupActive()||program.isPopupActive()||channel.isPopupActive()) return false;
+        if(alt&&!ctrl&&!mods.isShiftDown()) {
+            search.reset();
+            if(gridOpen&&(origin==&grid||origin==&value)) {
+                if(horizontal) {changeStep(*origin,direction);return true;}
+                if(vertical||page||boundary) {editSelected(*origin,direction,page,boundary);return true;}
+            }
+            if(!gridOpen&&origin==&level) {
+                if(horizontal) {changeStep(level,direction);return true;}
+                if(vertical||page||boundary) {changeMainLevel(direction,page,boundary);return true;}
             }
             if(ch=='l') {openParameters();return true;}
             if(ch=='v'&&gridOpen) {focus(value);return true;}
             if(ch=='c'&&gridOpen) {closeParameters();return true;}
             juce::Component* target=nullptr;
             if(ch=='o') target=&open; else if(ch=='m') target=&channel; else if(ch=='b') target=&bank; else if(ch=='p') target=&program; else if(ch=='g') target=&level; else if(ch=='a') target=&stop; else if(ch=='s') target=&readStatus;
-            if(target) {if(gridOpen) showGrid(false); focus(*target); return true;}
+            if(target) {if(target->isEnabled()) {if(gridOpen) showGrid(false,target); focus(*target);} return true;}
         }
-        if(gridOpen&&code==juce::KeyPress::escapeKey) {closeParameters();return true;}
-        if(mods.isAltDown()||mods.isCtrlDown()||mods.isCommandDown()) return false;
-        if(gridOpen && (origin==&grid||origin==&value)) {
+        if(gridOpen&&!alt&&!ctrl&&code==juce::KeyPress::escapeKey) {closeParameters();return true;}
+        if(alt||ctrl) {
+            if(!alt&&ctrl&&gridOpen&&origin==&grid&&boundary) {search.reset();navigateGrid(code);return true;}
+            return false;
+        }
+        if(gridOpen&&(origin==&grid||origin==&value)) {
             const bool edit=origin==&value;
-            const int i=grid.getSelectedItemIndex();
-            if(code==juce::KeyPress::returnKey) {focus(edit?static_cast<juce::Component&>(grid):static_cast<juce::Component&>(value));return true;}
-            if(code==juce::KeyPress::homeKey||code==juce::KeyPress::endKey) {selectGridRow(code==juce::KeyPress::homeKey?0:static_cast<int>(rows.size())-1,true);return true;}
+            if(code==juce::KeyPress::returnKey) {search.reset();focus(edit?static_cast<juce::Component&>(grid):static_cast<juce::Component&>(value));return true;}
             if(edit) {
-                if(code==juce::KeyPress::leftKey||code==juce::KeyPress::rightKey) {changeStep(value,code==juce::KeyPress::rightKey?1:-1);return true;}
-                if(code==juce::KeyPress::upKey||code==juce::KeyPress::downKey||code==juce::KeyPress::pageUpKey||code==juce::KeyPress::pageDownKey) {editSelected(code==juce::KeyPress::upKey||code==juce::KeyPress::pageUpKey?1:-1,code==juce::KeyPress::pageUpKey||code==juce::KeyPress::pageDownKey);return true;}
-                if(code==juce::KeyPress::backspaceKey) {if(auto* r=selectedRow()) {if(const int f=fxIndex(r->id);f>=0) {const auto copy=*r;writeRow(copy,fxSpecs[f].initial);refreshGridValues();speak(value,formatValue(copy,readRow(copy)));return true;} if(r->id>=128) {const auto copy=*r;writeRow(copy,0);refreshGridValues();speak(value,formatValue(copy,readRow(copy)));return true;} if(r->id==rowGain||r->id==rowInterpolation||r->id==rowEffects||r->id==rowSfzQuality) {const auto copy=*r;writeRow(copy,r->id==rowGain?-6:r->id==rowInterpolation?1:0);refreshGridValues();speak(value,formatValue(copy,readRow(copy)));return true;}}}
+                search.reset();
+                if(horizontal) {changeStep(value,direction);return true;}
+                if(vertical||page||boundary) {editSelected(value,direction,page,boundary);return true;}
             } else {
-                if(code==juce::KeyPress::upKey||code==juce::KeyPress::downKey) {selectGridRow(i+(code==juce::KeyPress::downKey?1:-1),true);return true;}
-                if(code==juce::KeyPress::leftKey||code==juce::KeyPress::rightKey||code==juce::KeyPress::pageUpKey||code==juce::KeyPress::pageDownKey) {selectGridRow(i+(code==juce::KeyPress::rightKey||code==juce::KeyPress::pageDownKey?5:-5),true);return true;}
-                if(juce::CharacterFunctions::isLetterOrDigit(ch)&&!rows.empty()) {for(int off=1;off<=static_cast<int>(rows.size());++off) {const int n=static_cast<int>(rows.size());const int candidate=(i+n+(mods.isShiftDown()?-off:off))%n;if(rows[static_cast<size_t>(candidate)].name.startsWithIgnoreCase(juce::String::charToString(ch))) {selectGridRow(candidate,true);break;}} return true;}
+                if(vertical||horizontal||page||boundary) {search.reset();navigateGrid(code);return true;}
+                if(const auto character=ljunoParameterSearchCharacter(k);character!=0) {
+                    const int current=juce::jmax(0,grid.getSelectedItemIndex());
+                    const int found=search.next(static_cast<wchar_t>(character),current,static_cast<int>(rows.size()),mods.isShiftDown()?-1:1,juce::Time::getMillisecondCounter(),[this](int index){return std::wstring(rows[static_cast<size_t>(index)].name.toWideCharPointer());});
+                    if(found>=0&&found!=current) selectGridRow(found,true);
+                    return true; // never fall back to ComboBox's own type-ahead
+                }
+                search.reset();
+            }
+            if(code==juce::KeyPress::backspaceKey) {
+                if(auto* r=selectedRow()) {
+                    const auto copy=*r; const int f=fxIndex(copy.id); double reset=0; bool supported=true;
+                    if(f>=0) reset=fxSpecs[f].initial;
+                    else if(copy.id>=128) reset=0;
+                    else if(copy.id==rowGain) reset=-6;
+                    else if(copy.id==rowInterpolation) reset=1;
+                    else if(copy.id==rowEffects||copy.id==rowSfzQuality) reset=0;
+                    else supported=false;
+                    if(supported) {writeRow(copy,reset);refreshGridValues();speak(*origin,formatValue(copy,readRow(copy)));}
+                }
+                return true;
             }
         }
         if(origin==&level) {
-            if(code==juce::KeyPress::leftKey||code==juce::KeyPress::rightKey) {changeStep(level,code==juce::KeyPress::rightKey?1:-1);return true;}
-            if(code==juce::KeyPress::upKey||code==juce::KeyPress::downKey||code==juce::KeyPress::pageUpKey||code==juce::KeyPress::pageDownKey) {
-                const int dir=code==juce::KeyPress::upKey||code==juce::KeyPress::pageUpKey?1:-1; const bool coarse=code==juce::KeyPress::pageUpKey||code==juce::KeyPress::pageDownKey;
-                level.setValue(juce::jlimit(-60.0,6.0,level.getValue()+0.1*stepWidths[stepIndex]*(coarse?pageMultiplier:1)*dir),juce::sendNotificationSync); speak(level,juce::String(level.getValue(),1)+" dB");return true;
-            }
+            if(horizontal) {changeStep(level,direction);return true;}
+            if(vertical||page||boundary) {changeMainLevel(direction,page,boundary);return true;}
         }
-        if(dynamic_cast<juce::Button*>(origin)&&(code==juce::KeyPress::leftKey||code==juce::KeyPress::rightKey||code==juce::KeyPress::upKey||code==juce::KeyPress::downKey)) return true;
+        if(dynamic_cast<juce::Button*>(origin)&&(horizontal||vertical||page||boundary)) return true;
         return false;
     }
     void browse() {
@@ -811,7 +977,7 @@ private:
         chooser=std::make_unique<juce::FileChooser>("Open SF2 or SFZ",start,"*.sf2;*.sfz",true);
         juce::Component::SafePointer<Editor> safe(this);
         chooser->launchAsync(juce::FileBrowserComponent::openMode|juce::FileBrowserComponent::canSelectFiles,[safe](const juce::FileChooser& fc) {
-            if(auto* self=safe.getComponent()) { auto file=fc.getResult(); if(file!=juce::File{}) self->proc.loadFile(file); juce::MessageManager::callAsync([safe]{if(auto* e=safe.getComponent()) {e->chooser.reset();e->focus(e->open);}}); }
+            if(auto* self=safe.getComponent()) { auto file=fc.getResult(); if(file!=juce::File{}) self->proc.loadFile(file); juce::MessageManager::callAsync([safe]{if(auto* e=safe.getComponent()) {e->chooser.reset();e->initialFocusPending=true;e->scheduleInitialFocus();}}); }
         });
     }
     void rebuildPrograms(int b,int p) {
@@ -840,10 +1006,10 @@ private:
             updating=false;
         }
         const bool ready=cached.ready&&!cached.loading&&!cached.presets.empty(); bank.setEnabled(ready);program.setEnabled(ready);channel.setEnabled(!cached.isSfz&&!cached.loading);
-        if(!dragging) level.setValue(proc.gainParameter().get(),juce::dontSendNotification);
+        if(!dragging) { const auto gain=proc.gainParameter().get(); if(std::abs(level.getValue()-gain)>0.000001) level.setValue(gain,juce::dontSendNotification); const auto text=juce::String(gain,1)+" dB"; if(levelReadout.getText()!=text) levelReadout.setText(text,juce::dontSendNotification); }
         if(gridOpen) {if(changed) rebuildGrid(); else refreshGridValues();}
     }
-    void timerCallback() override {refresh(false); if(initialFocusPending) scheduleInitialFocus();}
+    void timerCallback() override {refresh(false); if(initialFocusPending&&isShowing()&&getPeer()!=nullptr&&getPeer()->isFocused()) scheduleInitialFocus();}
 };
 juce::AudioProcessorEditor* Processor::createEditor(){return new Editor(*this);}
 juce::AudioProcessor* JUCE_CALLTYPE createPluginFilter(){return new Processor();}

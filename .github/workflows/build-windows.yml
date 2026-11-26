@@ -31,7 +31,7 @@ jobs:
         run: |
           cmake --build build --config Release --target LSFX_VST3 --parallel 2 2>&1 | Tee-Object -FilePath logs/build.txt
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-      - name: Package TEST8
+      - name: Package TEST10
         shell: pwsh
         run: |
           Start-Transcript -Path logs/package.txt -Force | Out-Null
@@ -41,6 +41,7 @@ jobs:
             New-Item -ItemType Directory -Force package,package/ThirdParty | Out-Null
             Copy-Item -Recurse $bundle package/
             Copy-Item README.md,THIRD_PARTY.md,TESTING.md package/
+            Copy-Item Doc/LJuno-116-LICENSE.md package/ThirdParty/LJuno-116-LICENSE.md
             Copy-Item build/_deps/juce-src/LICENSE.md package/ThirdParty/JUCE-LICENSE.md
             Copy-Item build/_deps/sfizz-src/LICENSE package/ThirdParty/sfizz-LICENSE.txt
             $root = $env:VCPKG_INSTALLATION_ROOT
@@ -51,7 +52,7 @@ jobs:
             & "$root/vcpkg.exe" list | Out-File -Encoding utf8 package/ThirdParty/vcpkg-versions.txt
             git -C $root rev-parse HEAD | Out-File -Encoding utf8 package/ThirdParty/vcpkg-commit.txt
             git rev-parse HEAD | Out-File -Encoding utf8 package/source-commit.txt
-            Compress-Archive -Path package/* -DestinationPath LSFX.0.0.1.TEST8.Windows.x64.VST3.zip -Force
+            Compress-Archive -Path package/* -DestinationPath LSFX.0.0.1.TEST10.Windows.x64.VST3.zip -Force
           } catch {
             $_ | Out-String | Add-Content -Path logs/package-error.txt
             throw
@@ -60,13 +61,13 @@ jobs:
           }
       - uses: actions/upload-artifact@v4
         with:
-          name: LSFX-0.0.1-TEST8-Windows-x64
-          path: LSFX.0.0.1.TEST8.Windows.x64.VST3.zip
+          name: LSFX-0.0.1-TEST10-Windows-x64
+          path: LSFX.0.0.1.TEST10.Windows.x64.VST3.zip
           if-no-files-found: error
       - name: Upload build logs (also on failure)
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: LSFX-TEST8-build-logs
+          name: LSFX-TEST10-build-logs
           path: logs/*.txt
           if-no-files-found: warn

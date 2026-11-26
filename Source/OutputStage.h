@@ -11,12 +11,20 @@ struct OutputStage {
     void prepare(double rate) noexcept { attack=1.0f/(std::max)(1.0f,float(rate*.001)); release=1.0f/(std::max)(1.0f,float(rate*.004)); reset(); }
     void reset() noexcept { envelope=0; }
     static float limit(float x) noexcept { const auto a=std::abs(x); return a>0.98f?std::copysign(0.98f+(a-0.98f)*0.15f,x):x; }
+    // +6.02 dB after the Glue stage; a continuous final knee prevents
+    // large peaks exceeding sample full scale even with high master settings.
+    static float ceiling(float x) noexcept {
+        if(!std::isfinite(x)) return 0.0f;
+        const float a=std::abs(x);
+        if(a<=0.90f) return x;
+        return std::copysign(0.90f+0.099f*(1.0f-0.099f/(0.099f+a-0.90f)),x);
+    }
     void process(float& l,float& r,float gain,float trim) noexcept {
         l=std::isfinite(l)?l*trim:0; r=std::isfinite(r)?r*trim:0;
         const float detector=std::sqrt((std::max)(l*l,r*r)+0.000000000001f);
         envelope+=(detector-envelope)*(envelope<detector?attack:release);
         const float scale=0.4f*(envelope>0.055f?(0.055f+(envelope-0.055f)*0.5f)/envelope:1.0f);
-        l=limit(l*scale)*gain*2.0f; r=limit(r*scale)*gain*2.0f;
+        l=ceiling(limit(l*scale)*gain*4.0f); r=ceiling(limit(r*scale)*gain*4.0f);
     }
 };
 // Allocation only during loading. Reset is O(1), stale samples are inaccessible.

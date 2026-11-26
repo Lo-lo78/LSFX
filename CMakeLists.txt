@@ -7,6 +7,10 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 include(FetchContent)
 FetchContent_Declare(JUCE GIT_REPOSITORY https://github.com/juce-framework/JUCE.git GIT_TAG 8.0.12 GIT_SHALLOW TRUE)
 FetchContent_MakeAvailable(JUCE)
+# JUCE's VST3 client source is compiled later, during the build, not here.
+# Apply also to an existing fetched checkout on a subsequent configure.
+set(JUCE_SOURCE_DIR "${juce_SOURCE_DIR}")
+include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/PatchJuceProgramChange.cmake")
 find_package(FluidSynth CONFIG REQUIRED)
 set(ABSL_MSVC_STATIC_RUNTIME OFF CACHE BOOL "Use dynamic MSVC runtime for Abseil" FORCE)
 set(SFIZZ_SHARED OFF CACHE BOOL "" FORCE)
@@ -44,7 +48,7 @@ juce_add_plugin(LSFX
     COPY_PLUGIN_AFTER_BUILD FALSE VST3_CATEGORIES Instrument Synth)
 juce_generate_juce_header(LSFX)
 target_sources(LSFX PRIVATE Source/Plugin.cpp)
-target_compile_definitions(LSFX PUBLIC JUCE_WEB_BROWSER=0 JUCE_USE_CURL=0 JUCE_VST3_CAN_REPLACE_VST2=0)
+target_compile_definitions(LSFX PUBLIC JUCE_WEB_BROWSER=0 JUCE_USE_CURL=0 JUCE_VST3_CAN_REPLACE_VST2=0 JUCE_VST3_EMULATE_MIDI_CC_WITH_PARAMETERS=1)
 target_link_libraries(LSFX PRIVATE sfizz::static FluidSynth::libfluidsynth juce::juce_audio_utils juce::juce_gui_basics PUBLIC juce::juce_recommended_config_flags juce::juce_recommended_warning_flags)
 
 if(WIN32)
