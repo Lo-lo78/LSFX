@@ -41,6 +41,39 @@ void setComp(Processor& p,int ch,int index,float value) {
     auto& parameter=p.compressorParameter(ch,index);
     parameter.setValueNotifyingHost(parameter.convertTo0to1(value));
 }
+// Exercise all physical pairs, including the last two pins 33/34, using
+// the same processor/render path as the VST3. No Main leakage with FX off.
+void testAllSf2Outputs(const juce::File& source) {
+    Processor p; p.prepareToPlay(48000,257);
+    p.loadFile(source); waitReady(p);
+    setChoice(p.effectsParameter(),0); setChoice(p.midiFXParameter(),0);
+    require(p.getTotalNumOutputChannels()==34,"all 17 stereo buses enabled");
+    for(int ch=0;ch<16;++ch) setChoice(p.routeParameter(ch),ch+1);
+    juce::AudioBuffer<float> b(34,257);
+    juce::MidiBuffer midi;
+    for(int ch=0;ch<16;++ch) midi.addEvent(juce::MidiMessage::noteOn(ch+1,60,juce::uint8(100)),ch);
+    std::array<float,17> peak{};
+    for(int block=0;block<24;++block) {
+        p.processBlock(b,midi); midi.clear();
+        for(int pair=0;pair<17;++pair) {
+            for(int lr=0;lr<2;++lr) for(int n=0;n<b.getNumSamples();++n)
+                require(std::isfinite(b.getSample(pair*2+lr,n)),"nonfinite SF2 output");
+            peak[pair]=(std::max)(peak[pair],(std::max)(b.getMagnitude(2*pair,0,257),b.getMagnitude(2*pair+1,0,257)));
+        }
+    }
+    require(peak[0]<1e-5f,"all separate outputs: Main silent");
+    for(int pair=1;pair<17;++pair) require(peak[pair]>1e-5f,"missing SF2 stereo pair");
+    // All notes remain active, sum any number of channels onto one bus.
+    for(int ch=0;ch<16;++ch) setChoice(p.routeParameter(ch),2);
+    peak.fill(0);
+    for(int block=0;block<16;++block) {
+        p.processBlock(b,midi);
+        for(int pair=0;pair<17;++pair) peak[pair]=(std::max)(peak[pair],(std::max)(b.getMagnitude(2*pair,0,257),b.getMagnitude(2*pair+1,0,257)));
+    }
+    require(peak[2]>1e-5f,"shared SF2 bus missing audio");
+    for(int pair=0;pair<17;++pair) if(pair!=2) require(peak[pair]<1e-5f,"duplicate SF2 audio on other bus");
+    std::cout<<"PASS: SF2 all 16 auxiliary stereo pairs and shared destination\n";
+}
 void testChannelCompression(const juce::File& source,bool sfz) {
     Processor p; p.prepareToPlay(44100,256);
     p.loadFile(source); waitReady(p);
@@ -146,6 +179,6 @@ int main(int argc,char** argv) {
         require(restored.instrumentGain(pack(0,3))==0.0f,"initialize clears SFZ gains");
         std::cout<<"PASS: SF2 + two SFZs, separate routing, duplicate source, state restore, initialize\n";
         testChannelCompression(one,true);
-        if constexpr(sf2MultiOutput) testChannelCompression(sf2,false);
+        if constexpr(sf2MultiOutput) {testChannelCompression(sf2,false);testAllSf2Outputs(sf2);}
     } catch(const std::exception& e) {std::cerr<<"FAIL: "<<e.what()<<'\n';return 1;}
 }

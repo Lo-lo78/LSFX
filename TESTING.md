@@ -1,3 +1,12 @@
+# TEST26 — current acceptance checks
+
+1. Use a disposable REAPER project with a single LSFX instance. The normal TEST26 has SF2 multigroup enabled; older TEST25 normal builds were stereo-only for SF2. Verify GitHub `fluid-multi-smoke.txt` and `hybrid-smoke.txt` passed before installing. Previous Windows crashes on SF2 load are not yet diagnosed; if a crash recurs, report whether it is before Loaded or first note and the Windows Event Viewer faulting module/exception code. Manual workflow with multigroup unchecked produces the recovery package.
+2. Load an SF2, press Alt+L and search Compressor. Six controls must appear for the selected channel; set Mix 100%, threshold -60 dB, gain 0, then compare with Mix 0%. Change MIDI channel and check its compressor is independent. Test routing from Main to 3/4 and 5/6 (enable pins/tracks in REAPER), shared destinations, all pairs up to 33/34, no duplicated Main, and return to Main. Repeat with SFZ and hybrid map. Native wet tails already generated before changing route may decay on Main.
+3. Press Alt+O from the main panel and from the parameter grid: native file chooser must open immediately. Cancel and verify original control and grid row. At Bank 002 and Program 003 press Enter, cancel the native dialog, and confirm NVDA reads the same control and allows immediate arrows without Tab/Shift+Tab. Repeat for SF2 source list cancellation and SFZ import success. SF2 import completion must continue to work. Test with slow loads, then leave plugin and re-enter. No SAPI announcements; ensure focus does not jump from a different foreground window.
+4. Local results: seven independent C++ tests passed; the installed Linux FluidSynth multigroup regression using default-GM.sf2 passed (shared destination, drums on 33/34, Main isolation, all-Main parity). The actual JUCE hybrid processor and Windows UIA changes have not been compiled or run locally; CI performs native multigroup and hybrid audio checks, including the additional all-pairs test.
+
+---
+
 # TEST25 — current acceptance checks
 
 1. Load SFZ instruments on channels 1 and 2. Open Alt+L and verify the six compressor controls for the selected channel. Verify channel 2 remains unchanged after modifying channel 1. Check Backspace defaults, full mix range, zero mix unchanged dry audio, and stereo balance. Empty programs still show only Gain/Routing. In the normal build SF2 compressor rows are hidden because the SF2 stereo render is not isolated.

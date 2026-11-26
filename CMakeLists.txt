@@ -4,7 +4,7 @@ set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL")
 project(LSFX VERSION 0.0.1 LANGUAGES C CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
-option(LSFX_EXPERIMENTAL_SF2_MULTIGROUP "Enable unverified SF2 multi-output and channel compressors" OFF)
+option(LSFX_EXPERIMENTAL_SF2_MULTIGROUP "Enable SF2 multi-output and channel compressors (validation build)" ON)
 include(FetchContent)
 FetchContent_Declare(JUCE GIT_REPOSITORY https://github.com/juce-framework/JUCE.git GIT_TAG 8.0.12 GIT_SHALLOW TRUE)
 FetchContent_MakeAvailable(JUCE)
@@ -89,8 +89,7 @@ if(WIN32)
     target_link_libraries(LSFXHybridSmoke PRIVATE Uiautomationcore OleAut32)
 endif()
 
-# The ordinary VST3 retains the stable SF2 stereo engine. An explicitly
-# requested experimental build also exercises SF2 channel compression/routing.
+# TEST26 defaults to multigroup; configure OFF for the stereo recovery build.
 if(LSFX_EXPERIMENTAL_SF2_MULTIGROUP)
     target_compile_definitions(LSFX PRIVATE LSFX_EXPERIMENTAL_SF2_MULTIGROUP=1)
     target_compile_definitions(LSFXHybridSmoke PRIVATE LSFX_EXPERIMENTAL_SF2_MULTIGROUP=1)

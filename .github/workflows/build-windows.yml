@@ -6,9 +6,9 @@ on:
   workflow_dispatch:
     inputs:
       experimental_sf2_multigroup:
-        description: 'EXPERIMENTAL: SF2 separate outputs and channel compressors (past REAPER crashes)'
+        description: 'SF2 separate outputs and channel compressors; uncheck for stereo recovery'
         type: boolean
-        default: false
+        default: true
 permissions:
   contents: read
 jobs:
@@ -29,7 +29,7 @@ jobs:
       - name: Configure
         shell: pwsh
         run: |
-          cmake -S . -B build -G 'Visual Studio 17 2022' -A x64 "-DCMAKE_TOOLCHAIN_FILE=$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake" -DVCPKG_TARGET_TRIPLET=x64-windows-static-md -DVCPKG_MANIFEST_MODE=OFF "-DLSFX_EXPERIMENTAL_SF2_MULTIGROUP=${{ inputs.experimental_sf2_multigroup && 'ON' || 'OFF' }}" 2>&1 | Tee-Object -FilePath logs/configure.txt
+          cmake -S . -B build -G 'Visual Studio 17 2022' -A x64 "-DCMAKE_TOOLCHAIN_FILE=$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake" -DVCPKG_TARGET_TRIPLET=x64-windows-static-md -DVCPKG_MANIFEST_MODE=OFF "-DLSFX_EXPERIMENTAL_SF2_MULTIGROUP=${{ (github.event_name != 'workflow_dispatch' || inputs.experimental_sf2_multigroup) && 'ON' || 'OFF' }}" 2>&1 | Tee-Object -FilePath logs/configure.txt
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Build VST3
         shell: pwsh
@@ -63,6 +63,13 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           & ./build/Release/LSFXFluidMapSmoke.exe build/smoke.sf2 build/smoke-second.sf2 2>&1 | Tee-Object -FilePath logs/fluid-map-smoke.txt
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Diagnose experimental SF2 multigroup in a separate process
+        timeout-minutes: 2
+        shell: pwsh
+        continue-on-error: ${{ github.event_name == 'workflow_dispatch' && !inputs.experimental_sf2_multigroup }}
+        run: |
+          & ./build/Release/LSFXFluidSmoke.exe build/smoke.sf2 multi 2>&1 | Tee-Object -FilePath logs/fluid-multi-smoke.txt
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Build and test the hybrid LSFX processor outside REAPER
         timeout-minutes: 20
         shell: pwsh
@@ -73,14 +80,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           & ./build/LSFXHybridSmoke_artefacts/Release/LSFXHybridSmoke.exe build/smoke.sf2 build/sfz-one.sfz build/sfz-two.sfz 2>&1 | Tee-Object -FilePath logs/hybrid-smoke.txt
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-      - name: Diagnose experimental SF2 multigroup in a separate process
-        timeout-minutes: 2
-        shell: pwsh
-        continue-on-error: ${{ !inputs.experimental_sf2_multigroup }}
-        run: |
-          & ./build/Release/LSFXFluidSmoke.exe build/smoke.sf2 multi 2>&1 | Tee-Object -FilePath logs/fluid-multi-smoke.txt
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-      - name: Package TEST25
+      - name: Package TEST26
         shell: pwsh
         run: |
           Start-Transcript -Path logs/package.txt -Force | Out-Null
@@ -101,7 +101,7 @@ jobs:
             & "$root/vcpkg.exe" list | Out-File -Encoding utf8 package/ThirdParty/vcpkg-versions.txt
             git -C $root rev-parse HEAD | Out-File -Encoding utf8 package/ThirdParty/vcpkg-commit.txt
             git rev-parse HEAD | Out-File -Encoding utf8 package/source-commit.txt
-            Compress-Archive -Path package/* -DestinationPath LSFX.0.0.1.TEST25${{ inputs.experimental_sf2_multigroup && '-SF2-experimental' || '' }}.Windows.x64.VST3.zip -Force
+            Compress-Archive -Path package/* -DestinationPath LSFX.0.0.1.TEST26${{ (github.event_name == 'workflow_dispatch' && !inputs.experimental_sf2_multigroup) && '-SF2-stereo' || '' }}.Windows.x64.VST3.zip -Force
           } catch {
             $_ | Out-String | Add-Content -Path logs/package-error.txt
             throw
@@ -110,13 +110,13 @@ jobs:
           }
       - uses: actions/upload-artifact@v4
         with:
-          name: LSFX-0.0.1-TEST25${{ inputs.experimental_sf2_multigroup && '-SF2-experimental' || '' }}-Windows-x64
-          path: LSFX.0.0.1.TEST25${{ inputs.experimental_sf2_multigroup && '-SF2-experimental' || '' }}.Windows.x64.VST3.zip
+          name: LSFX-0.0.1-TEST26${{ (github.event_name == 'workflow_dispatch' && !inputs.experimental_sf2_multigroup) && '-SF2-stereo' || '' }}-Windows-x64
+          path: LSFX.0.0.1.TEST26${{ (github.event_name == 'workflow_dispatch' && !inputs.experimental_sf2_multigroup) && '-SF2-stereo' || '' }}.Windows.x64.VST3.zip
           if-no-files-found: error
       - name: Upload build logs (also on failure)
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: LSFX-TEST25-build-logs
+          name: LSFX-TEST26-build-logs
           path: logs/*.txt
           if-no-files-found: warn

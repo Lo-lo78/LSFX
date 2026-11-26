@@ -38,9 +38,9 @@ bool insideLibrary(const juce::File& f) { const auto root=presetRoot(); return f
 juce::File savedDirectory() { const auto path=setting("saveDirectory"); if(juce::File::isAbsolutePath(path)) { juce::File f(path); if(insideLibrary(f)&&f.isDirectory()) return f; } return presetRoot(); }
 
 constexpr int stereoBuses=17, renderChunk=1024;
-// TEST20: repeated Windows host crashes on multigroup SF2. Keep the
-// routing implementation and state for later investigation, but ship only
-// the previously validated single-stereo native path for SF2.
+// TEST26: multigroup is the default validation build. The stereo-only
+// recovery build remains selectable at configure time. Windows host stability
+// is not established by the standalone tests.
 #ifndef LSFX_EXPERIMENTAL_SF2_MULTIGROUP
  #define LSFX_EXPERIMENTAL_SF2_MULTIGROUP 0
 #endif
@@ -1313,7 +1313,7 @@ public:
     explicit Editor(Processor& p) : AudioProcessorEditor(p), proc(p) {
         setWantsKeyboardFocus(true);
         setFocusContainerType(juce::Component::FocusContainerType::keyboardFocusContainer);
-        title.setText(sf2MultiOutput?"LSFX 0.0.1 TEST25 SF2 experimental":"LSFX 0.0.1 TEST25",juce::dontSendNotification); title.setFont(juce::FontOptions(21.0f)); title.setAccessible(false); addAndMakeVisible(title);
+        title.setText(sf2MultiOutput?"LSFX 0.0.1 TEST26":"LSFX 0.0.1 TEST26 SF2 stereo recovery",juce::dontSendNotification); title.setFont(juce::FontOptions(21.0f)); title.setAccessible(false); addAndMakeVisible(title);
         status.setText("No SoundFont loaded",juce::dontSendNotification); status.setTitle("Instrument status"); addAndMakeVisible(status);
         setup(open,"Open SF2 or SFZ",1); setup(parameters,"Parameters",2); setup(channel,"MIDI channel",3); setup(bank,"Bank",37); setup(program,"Program",38); setup(level,"Master output gain",36);
         setup(grid,"Parameter grid",1); setup(value,"Parameter value",2); setup(closeGrid,"Close parameters",3);
@@ -1555,13 +1555,40 @@ private:
     void returnTo(int id) {
         chooserReturn=id; returnFromChooser=true; chooserReturnedAt=juce::Time::getMillisecondCounter();
         initialFocusPending=true; rememberFocus(id);
-        auto* current=juce::Component::getCurrentlyFocusedComponent();
-        if(isShowing()&&getPeer()!=nullptr&&getPeer()->isFocused()&&(!current||current==this||isParentOf(current))) {
-            restoreFocus(id);
-            if(focusTarget(id).hasKeyboardFocus(true)) {returnFromChooser=false; initialFocusPending=false; return;}
-            initialFocusPending=true;
-        }
+        // A Windows file dialog can still be releasing native focus in its
+        // completion callback. Do not treat cached JUCE focus as success yet.
         scheduleInitialFocus();
+    }
+    bool peerReadyForReturn() {
+        auto* peer=getPeer();
+        if(!peer||!isShowing()) return false;
+        if(peer->isFocused()) return true;
+#if JUCE_WINDOWS
+        if(returnFromChooser) {
+            const auto hwnd=reinterpret_cast<HWND>(peer->getNativeHandle());
+            const auto foreground=GetForegroundWindow();
+            const auto nativeFocus=GetFocus();
+            // Reclaim focus only in the same foreground window, if Windows
+            // returned to the parent/owner (not a sibling REAPER control).
+            if(hwnd&&foreground&&GetAncestor(hwnd,GA_ROOT)==GetAncestor(foreground,GA_ROOT)
+                &&(!nativeFocus||nativeFocus==hwnd||IsChild(nativeFocus,hwnd))) {
+                peer->grabFocus();
+                return peer->isFocused();
+            }
+        }
+#endif
+        return false;
+    }
+    void publishReturnedFocus(juce::Component& target) {
+        if(!target.hasKeyboardFocus(true)) return;
+        // Recreate the accessibility focus event even if JUCE still believes
+        // this control is focused after the native dialog closes.
+        juce::AccessibilityHandler::clearCurrentlyFocusedHandler();
+        if(auto* h=target.getAccessibilityHandler()) h->grabFocus();
+        if(pendingReturnMessage.isNotEmpty()) speak(target,pendingReturnMessage);
+        else if(&target==&bank) speak(bank,bank.getText());
+        else if(&target==&program) speak(program,program.getText());
+        pendingReturnMessage.clear();
     }
     // Do not publish a UIA focus event unless the native keyboard focus really arrived.
     // Never take focus back from REAPER's FX list or another child on a timer.
@@ -1580,23 +1607,18 @@ private:
         juce::Timer::callAfterDelay(150,[safe]{if(auto* e=safe.getComponent()) {
             e->focusScheduled=false;
             if(e->panelMode!=Panel::none||(!e->initialFocusPending&&!e->returnFromChooser)||!e->isShowing()||e->chooser) return;
-            if(e->returnFromChooser&&juce::Time::getMillisecondCounter()-e->chooserReturnedAt>2000u) e->returnFromChooser=false;
+            if(e->returnFromChooser&&juce::Time::getMillisecondCounter()-e->chooserReturnedAt>5000u) e->returnFromChooser=false;
+            if(e->importInProgress||!e->peerReadyForReturn()) return;
             auto* focused=juce::Component::getCurrentlyFocusedComponent();
-            auto* peer=e->getPeer();
-            if(peer==nullptr||!peer->isFocused()) return;
             if(focused!=nullptr&&focused!=e&&!e->isParentOf(focused)) return;
-            if(e->importInProgress) return;
-            const int id=e->returnFromChooser?e->chooserReturn:e->proc.editorMemory.focus;
+            const bool returning=e->returnFromChooser;
+            const int id=returning?e->chooserReturn:e->proc.editorMemory.focus;
             auto& target=e->focusTarget(id);
-            auto* h=target.getAccessibilityHandler();
-#if JUCE_WINDOWS
-            if(h==nullptr||h->getNativeImplementation()==nullptr) return;
-#else
-            juce::ignoreUnused(h);
-#endif
             e->restoreFocus(id);
-            if(target.hasKeyboardFocus(true)) {e->returnFromChooser=false;e->initialFocusPending=false; if(e->pendingReturnMessage.isNotEmpty()) {speak(target,e->pendingReturnMessage);e->pendingReturnMessage.clear();}}
-            else e->initialFocusPending=true;
+            if(target.hasKeyboardFocus(true)) {
+                e->returnFromChooser=false;e->initialFocusPending=false;
+                if(returning||e->pendingReturnMessage.isNotEmpty()) e->publishReturnedFocus(target);
+            } else e->initialFocusPending=true;
         }});
     }
     void showGrid(bool show,juce::Component* destination=nullptr) {
@@ -1807,8 +1829,14 @@ private:
     bool handleKey(const juce::KeyPress& k,juce::Component* origin) {
         origin=keyboardControl(origin);
         if(returnFromChooser&&!chooser&&!importInProgress) {
-            if(focusId(origin)!=chooserReturn) {restoreFocus(chooserReturn); if(focusTarget(chooserReturn).hasKeyboardFocus(true)) returnFromChooser=false; return true;}
+            if(focusId(origin)!=chooserReturn) {
+                restoreFocus(chooserReturn);
+                auto& target=focusTarget(chooserReturn);
+                if(target.hasKeyboardFocus(true)) {returnFromChooser=false;initialFocusPending=false;publishReturnedFocus(target);}
+                return true;
+            }
             returnFromChooser=false; initialFocusPending=false; rememberFocus(focusId(origin));
+            publishReturnedFocus(focusTarget(chooserReturn));
         }
         const auto code=k.getKeyCode(); const auto mods=k.getModifiers();
         const auto ch=juce::CharacterFunctions::toLowerCase(code>='A'&&code<='Z'?static_cast<juce::juce_wchar>(code):k.getTextCharacter()!=0?k.getTextCharacter():static_cast<juce::juce_wchar>(code));
@@ -1872,11 +1900,12 @@ private:
             if(ch=='a') {proc.allOff(); if(origin) speak(*origin,"All sounds off"); return true;}
             if(ch=='s') {showStatus(); return true;}
             if(ch=='l') {openParameters();return true;}
+            if(ch=='o') {browse();return true;}
             if(ch=='b') {openPresetBrowser();return true;}
             if(ch=='v'&&gridOpen) {focus(value);return true;}
             if(ch=='c'&&gridOpen) {closeParameters();return true;}
             juce::Component* target=nullptr;
-            if(ch=='o') target=&open; else if(ch=='m') target=&channel; else if(ch=='k') target=&bank; else if(ch=='p') target=&program; else if(ch=='g') target=&level; else if(ch=='u') target=&channelLevels[lastGainChannel]; else if(ch=='r') target=&routeLevels[lastRouteChannel];
+            if(ch=='m') target=&channel; else if(ch=='k') target=&bank; else if(ch=='p') target=&program; else if(ch=='g') target=&level; else if(ch=='u') target=&channelLevels[lastGainChannel]; else if(ch=='r') target=&routeLevels[lastRouteChannel];
             if(target) {if(target->isEnabled()) {if(gridOpen) showGrid(false,target); focus(*target);} return true;}
         }
         if(!gridOpen&&!alt&&!ctrl&&code==juce::KeyPress::returnKey&&(origin==&bank||origin==&program)) {
@@ -2197,21 +2226,23 @@ private:
         // No speech if there is no focused accessible control.
     }
     void browse() {
-        if(chooser||catalogBusy) return;
+        if(chooser||catalogBusy||importInProgress||panelMode!=Panel::none) return;
+        const int from=focusId(juce::Component::getCurrentlyFocusedComponent());
+        const int returnId=from?from:proc.editorMemory.focus;
+        rememberFocus(returnId);
         initialFocusPending=false; returnFromChooser=false; announceLoaded=false; pendingReturnMessage.clear();
-        focus(open);
         auto start=cached.path.isNotEmpty()?juce::File(cached.path).getParentDirectory():juce::File{};
         const auto previous=setting("instrumentPath");
         if(!start.isDirectory()&&juce::File::isAbsolutePath(previous)) start=juce::File(previous).getParentDirectory();
         if(!start.isDirectory()) start=juce::File::getSpecialLocation(juce::File::userDocumentsDirectory);
-        chooser=std::make_unique<juce::FileChooser>("Open SF2 or SFZ",start,"*.sf2;*.sfz",true);
+        chooser=std::make_unique<juce::FileChooser>("Open SF2 or SFZ",start,"*.sf2;*.sfz",true,false,this);
         juce::Component::SafePointer<Editor> safe(this);
-        chooser->launchAsync(juce::FileBrowserComponent::openMode|juce::FileBrowserComponent::canSelectFiles,[safe](const juce::FileChooser& fc) {
+        chooser->launchAsync(juce::FileBrowserComponent::openMode|juce::FileBrowserComponent::canSelectFiles,[safe,returnId](const juce::FileChooser& fc) {
             if(auto* self=safe.getComponent()) {
                 auto file=fc.getResult();
                 if(file!=juce::File{}) { rememberSetting("instrumentPath",file.getFullPathName()); self->pendingBrowserPreset=juce::File{}; self->announceLoaded=true; self->proc.loadFile(file); }
-                juce::MessageManager::callAsync([safe]{if(auto* e=safe.getComponent()) {
-                    e->chooser.reset(); e->returnTo(1);
+                juce::MessageManager::callAsync([safe,returnId]{if(auto* e=safe.getComponent()) {
+                    e->chooser.reset(); e->refresh(true); e->returnTo(returnId);
                 }});
             }
         });
@@ -2224,7 +2255,7 @@ private:
         auto start=juce::File::getSpecialLocation(juce::File::userDocumentsDirectory);
         const auto previous=setting("instrumentPath");
         if(juce::File::isAbsolutePath(previous)&&juce::File(previous).getParentDirectory().isDirectory()) start=juce::File(previous).getParentDirectory();
-        chooser=std::make_unique<juce::FileChooser>(single?"Import SF2 or SFZ program":"Import SF2 bank",start,single?"*.sf2;*.sfz":"*.sf2",true);
+        chooser=std::make_unique<juce::FileChooser>(single?"Import SF2 or SFZ program":"Import SF2 bank",start,single?"*.sf2;*.sfz":"*.sf2",true,false,this);
         juce::Component::SafePointer<Editor> safe(this);
         chooser->launchAsync(juce::FileBrowserComponent::openMode|juce::FileBrowserComponent::canSelectFiles,[safe,single,ch,destBank,destProgram](const juce::FileChooser& fc){
             const auto file=fc.getResult();
@@ -2239,14 +2270,14 @@ private:
         });
     }
     void endImport(const juce::String& message={}) {
-        if(panelMode==Panel::source) closePanel(&focusTarget(chooserReturn));
-        importInProgress=false; pendingReturnMessage=message; returnTo(chooserReturn);
-        if(!returnFromChooser&&focusTarget(chooserReturn).hasKeyboardFocus(true)&&pendingReturnMessage.isNotEmpty()) {speak(focusTarget(chooserReturn),pendingReturnMessage);pendingReturnMessage.clear();}
+        const int destination=chooserReturn;
+        if(panelMode==Panel::source) closePanel(&focusTarget(destination));
+        importInProgress=false; pendingReturnMessage=message;
+        refresh(true); returnTo(destination);
     }
     void finishImport(const juce::Result& result) {
         endImport(result.failed()?result.getErrorMessage():juce::String{});
-        if(result.failed()) return;
-        refresh(true);announceLoaded=true;
+        if(result.wasOk()) announceLoaded=true;
     }
     void scanImport(juce::File file,bool single,int ch,int destBank,int destProgram) {
         if(catalogThread.joinable()) catalogThread.join();
@@ -2351,12 +2382,16 @@ private:
         if(gridOpen) {if(changed||code!=gridShownCode) {gridShownCode=code;rebuildGrid();} else refreshGridValues();}
         if(announceLoaded&&!cached.loading&&!chooser&&!returnFromChooser&&!importInProgress&&hasKeyboardFocus(true)) {
             announceLoaded=false;
-            if(bank.hasKeyboardFocus(true)&&cached.status.startsWith("Loaded:")) speak(bank,bank.getText());
-            else if(program.hasKeyboardFocus(true)&&cached.status.startsWith("Loaded:")) speak(program,program.getText());
+            if(bank.hasKeyboardFocus(true)&&cached.status.startsWith("Loaded:")) publishReturnedFocus(bank);
+            else if(program.hasKeyboardFocus(true)&&cached.status.startsWith("Loaded:")) publishReturnedFocus(program);
             else if(auto* c=juce::Component::getCurrentlyFocusedComponent();c&&isParentOf(c)) speak(*c,cached.status);
         }
     }
-    void timerCallback() override {if(returnFromChooser&&juce::Time::getMillisecondCounter()-chooserReturnedAt>2000u) returnFromChooser=false; refresh(false); maybePromptMissing(); if(panelMode==Panel::none&&(initialFocusPending||returnFromChooser)&&isShowing()&&getPeer()!=nullptr&&getPeer()->isFocused()) scheduleInitialFocus();}
+    void timerCallback() override {
+        if(returnFromChooser&&juce::Time::getMillisecondCounter()-chooserReturnedAt>5000u) returnFromChooser=false;
+        refresh(false); maybePromptMissing();
+        if(panelMode==Panel::none&&(initialFocusPending||returnFromChooser)&&isShowing()&&getPeer()!=nullptr&&(returnFromChooser||getPeer()->isFocused())) scheduleInitialFocus();
+    }
 };
 juce::AudioProcessorEditor* Processor::createEditor(){return new Editor(*this);}
 juce::AudioProcessor* JUCE_CALLTYPE createPluginFilter(){return new Processor();}
