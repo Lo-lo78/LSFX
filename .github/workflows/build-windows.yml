@@ -31,7 +31,27 @@ jobs:
         run: |
           cmake --build build --config Release --target LSFX_VST3 --parallel 2 2>&1 | Tee-Object -FilePath logs/build.txt
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-      - name: Package TEST19
+      - name: Build native FluidSynth smoke test
+        shell: pwsh
+        run: |
+          cmake --build build --config Release --target LSFXFluidSmoke --parallel 2 2>&1 | Tee-Object -FilePath logs/fluid-smoke-build.txt
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Test SF2 stereo recovery
+        timeout-minutes: 2
+        shell: pwsh
+        run: |
+          python Tests/MakeSmokeSoundFont.py build/smoke.sf2
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & ./build/Release/LSFXFluidSmoke.exe build/smoke.sf2 stereo 2>&1 | Tee-Object -FilePath logs/fluid-stereo-smoke.txt
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Diagnose experimental SF2 multigroup in a separate process
+        timeout-minutes: 2
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          & ./build/Release/LSFXFluidSmoke.exe build/smoke.sf2 multi 2>&1 | Tee-Object -FilePath logs/fluid-multi-smoke.txt
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Package TEST20.1
         shell: pwsh
         run: |
           Start-Transcript -Path logs/package.txt -Force | Out-Null
@@ -52,7 +72,7 @@ jobs:
             & "$root/vcpkg.exe" list | Out-File -Encoding utf8 package/ThirdParty/vcpkg-versions.txt
             git -C $root rev-parse HEAD | Out-File -Encoding utf8 package/ThirdParty/vcpkg-commit.txt
             git rev-parse HEAD | Out-File -Encoding utf8 package/source-commit.txt
-            Compress-Archive -Path package/* -DestinationPath LSFX.0.0.1.TEST19.Windows.x64.VST3.zip -Force
+            Compress-Archive -Path package/* -DestinationPath LSFX.0.0.1.TEST20.1.Windows.x64.VST3.zip -Force
           } catch {
             $_ | Out-String | Add-Content -Path logs/package-error.txt
             throw
@@ -61,13 +81,13 @@ jobs:
           }
       - uses: actions/upload-artifact@v4
         with:
-          name: LSFX-0.0.1-TEST19-Windows-x64
-          path: LSFX.0.0.1.TEST19.Windows.x64.VST3.zip
+          name: LSFX-0.0.1-TEST20.1-Windows-x64
+          path: LSFX.0.0.1.TEST20.1.Windows.x64.VST3.zip
           if-no-files-found: error
       - name: Upload build logs (also on failure)
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: LSFX-TEST19-build-logs
+          name: LSFX-TEST20.1-build-logs
           path: logs/*.txt
           if-no-files-found: warn

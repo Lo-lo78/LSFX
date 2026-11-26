@@ -55,3 +55,10 @@ if(WIN32)
     target_compile_definitions(LSFX PRIVATE NOMINMAX)
     target_link_libraries(LSFX PRIVATE Uiautomationcore OleAut32)
 endif()
+
+# Standalone native smoke test; intentionally separate from the DAW process.
+add_executable(LSFXFluidSmoke Tests/FluidSmoke.cpp)
+target_link_libraries(LSFXFluidSmoke PRIVATE FluidSynth::libfluidsynth)
+if(WIN32)
+    target_compile_definitions(LSFXFluidSmoke PRIVATE NOMINMAX)
+endif()

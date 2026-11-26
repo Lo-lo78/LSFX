@@ -33,6 +33,10 @@ bool insideLibrary(const juce::File& f) { const auto root=presetRoot(); return f
 juce::File savedDirectory() { const auto path=setting("saveDirectory"); if(juce::File::isAbsolutePath(path)) { juce::File f(path); if(insideLibrary(f)&&f.isDirectory()) return f; } return presetRoot(); }
 
 constexpr int stereoBuses=17, renderChunk=1024;
+// TEST20: repeated Windows host crashes on multigroup SF2. Keep the
+// routing implementation and state for later investigation, but ship only
+// the previously validated single-stereo native path for SF2.
+constexpr bool sf2MultiOutput=false;
 juce::String routeName(int bus) { return bus==0?juce::String("Main 1/2"):juce::String(2*bus+1)+"/"+juce::String(2*bus+2); }
 juce::String routeId(int ch) { return "channelRoute"+juce::String(ch+1); }
 juce::StringArray routeChoices() { juce::StringArray a; for(int i=0;i<stereoBuses;++i) a.add(routeName(i)); return a; }
@@ -269,7 +273,7 @@ public:
         if(engine->sfz) engine->channelGains[0].setTargetValue(juce::Decibels::decibelsToGain(channelGain[0]->get(),channelGainMin-1.0f));
         bool routingChanged=false;
         for(int ch=0;ch<channels;++ch) {
-            const int next=channelRoute[ch]->getIndex();
+            const int next=(engine->sfz||sf2MultiOutput)?channelRoute[ch]->getIndex():0;
             routingChanged=routingChanged||engine->routes[ch]!=next;
             engine->routes[ch]=next;
         }
@@ -342,7 +346,7 @@ public:
         }
         // A manual program change must also retain the user trim.
         if(controlChanged) updateSF2Trims(*engine);
-        if(updateRouteSends(*engine)) controlChanged=true;
+        if constexpr (sf2MultiOutput) { if(updateRouteSends(*engine)) controlChanged=true; }
         // MIDI clock / sensing do not need to wake the synthesizer.
         bool relevantMidi=false;
         for(const auto m:midi) if(m.numBytes>0&&m.data[0]<0xf8) { relevantMidi=true; break; }
@@ -356,24 +360,36 @@ public:
         float rawPeak=0, wetPeak=0;
         auto render = [&](int start,int count) {
             if(count<=0) return;
-            for(int offset=0;offset<count;) {
-                const int n=juce::jmin(renderChunk,count-offset), pos=start+offset;
-                std::array<float*,2*channels> dryPtrs{};
-                std::array<float*,4> wetPtrs{};
-                for(size_t i=0;i<dryPtrs.size();++i) { dryPtrs[i]=engine->dry[i].data(); std::fill_n(dryPtrs[i],n,0.0f); }
-                for(size_t i=0;i<wetPtrs.size();++i) { wetPtrs[i]=engine->wet[i].data(); std::fill_n(wetPtrs[i],n,0.0f); }
-                if(fluid_synth_process(s,n,int(wetPtrs.size()),wetPtrs.data(),int(dryPtrs.size()),dryPtrs.data())!=FLUID_OK) { offset+=n; continue; }
-                for(int ch=0;ch<channels;++ch) {
-                    const int index=dest[engine->routes[ch]];
-                    if(index<0) continue; // inactive host bus: never leak to Main
-                    b.addFrom(index,pos,dryPtrs[2*ch],n);
-                    b.addFrom(index+1,pos,dryPtrs[2*ch+1],n);
+            if constexpr (!sf2MultiOutput) {
+                // TEST14: use the original TEST11 single-stereo render path.
+                // All sixteen MIDI channels and the native FX are mixed by FluidSynth.
+                // Optional channel trim is applied to voice attenuation before mixing.
+                if(fluid_synth_write_float(s,count,b.getWritePointer(0,start),0,1,b.getWritePointer(1,start),0,1)!=FLUID_OK) {
+                    b.clear(0,start,count); b.clear(1,start,count);
+                    return;
                 }
-                // One shared native reverb/chorus group; only Main receives returns.
-                for(int i=0;i<4;++i) b.addFrom(i%2,pos,wetPtrs[i],n);
-                rawPeak=juce::jmax(rawPeak,juce::jmax(b.getMagnitude(0,pos,n),b.getMagnitude(1,pos,n)));
-                wetPeak=juce::jmax(wetPeak,processMaster(*engine,b,f,fx,pos,n));
-                offset+=n;
+                rawPeak=juce::jmax(rawPeak,juce::jmax(b.getMagnitude(0,start,count),b.getMagnitude(1,start,count)));
+                wetPeak=juce::jmax(wetPeak,processMaster(*engine,b,f,fx,start,count));
+            } else {
+                for(int offset=0;offset<count;) {
+                    const int n=juce::jmin(renderChunk,count-offset), pos=start+offset;
+                    std::array<float*,2*channels> dryPtrs{};
+                    std::array<float*,4> wetPtrs{};
+                    for(size_t i=0;i<dryPtrs.size();++i) { dryPtrs[i]=engine->dry[i].data(); std::fill_n(dryPtrs[i],n,0.0f); }
+                    for(size_t i=0;i<wetPtrs.size();++i) { wetPtrs[i]=engine->wet[i].data(); std::fill_n(wetPtrs[i],n,0.0f); }
+                    if(fluid_synth_process(s,n,int(wetPtrs.size()),wetPtrs.data(),int(dryPtrs.size()),dryPtrs.data())!=FLUID_OK) { offset+=n; continue; }
+                    for(int ch=0;ch<channels;++ch) {
+                        const int index=dest[engine->routes[ch]];
+                        if(index<0) continue; // inactive host bus: never leak to Main
+                        b.addFrom(index,pos,dryPtrs[2*ch],n);
+                        b.addFrom(index+1,pos,dryPtrs[2*ch+1],n);
+                    }
+                    // One shared native reverb/chorus group; only Main receives returns.
+                    for(int i=0;i<4;++i) b.addFrom(i%2,pos,wetPtrs[i],n);
+                    rawPeak=juce::jmax(rawPeak,juce::jmax(b.getMagnitude(0,pos,n),b.getMagnitude(1,pos,n)));
+                    wetPeak=juce::jmax(wetPeak,processMaster(*engine,b,f,fx,pos,n));
+                    offset+=n;
+                }
             }
         };
         int cursor=0;
@@ -393,16 +409,16 @@ public:
                 for(int c=0;c<channels;++c) { updateProgram(s,c); refreshFluidControls(s,c); }
                 applyMidiSysEx(*engine,d,n,f,fx);
                 updateSF2Trims(*engine);
-                updateRouteSends(*engine);
+                if constexpr (sf2MultiOutput) updateRouteSends(*engine);
             } else if(status<0xf0 && status>=0x80 && n>=2) {
                 const int a=d[1]&127, v=n>=3 ? d[2]&127 : 0;
-                if((status&0xf0)==0x90) updateRouteSend(*engine,ch);
+                if constexpr (sf2MultiOutput) { if((status&0xf0)==0x90) updateRouteSend(*engine,ch); }
                 switch(status&0xf0) {
                     case 0x80: if(n>=3) fluid_synth_noteoff(s,ch,a); break;
                     case 0x90: if(n>=3) { if(v) fluid_synth_noteon(s,ch,a,v); else fluid_synth_noteoff(s,ch,a); } break;
                     case 0xa0: if(n>=3) fluid_synth_key_pressure(s,ch,a,v); break;
-                    case 0xb0: if(n>=3) { receiveFluidCC(*engine,ch,a,v,f,fx); if(a==121||a==6||a==38||a==96||a==97) { refreshFluidControls(s,ch); updateSF2Trim(*engine,ch); } updateRouteSend(*engine,ch); } break;
-                    case 0xc0: receiveProgram(ch,a); fluid_synth_program_change(s,ch,a); updateProgram(s,ch); updateSF2Trim(*engine,ch); updateRouteSend(*engine,ch); break;
+                    case 0xb0: if(n>=3) { receiveFluidCC(*engine,ch,a,v,f,fx); if(a==121||a==6||a==38||a==96||a==97) { refreshFluidControls(s,ch); updateSF2Trim(*engine,ch); } if constexpr (sf2MultiOutput) updateRouteSend(*engine,ch); } break;
+                    case 0xc0: receiveProgram(ch,a); fluid_synth_program_change(s,ch,a); updateProgram(s,ch); updateSF2Trim(*engine,ch); if constexpr (sf2MultiOutput) updateRouteSend(*engine,ch); break;
                     case 0xd0: fluid_synth_channel_pressure(s,ch,a); break;
                     case 0xe0: if(n>=3) fluid_synth_pitch_bend(s,ch,a|(v<<7)); break;
                     default: break;
@@ -729,7 +745,7 @@ private:
     void load(const juce::String& path,Programs p,Controls c=emptyControls()) {
         { std::lock_guard<std::mutex> lock(requestMutex);
           latest={path,hostRate.load(),p,latest.serial+1,c}; pending=true;
-          std::lock_guard<std::mutex> ui(viewMutex); view.loading=true; view.status=path.isEmpty()?"Unloading SoundFont":"Loading "+juce::File(path).getFileName(); ++view.revision;
+          std::lock_guard<std::mutex> ui(viewMutex); view.loading=true; view.isSfz=path.isNotEmpty()&&juce::File(path).hasFileExtension("sfz"); view.labels.clear(); view.status=path.isEmpty()?"Unloading SoundFont":"Loading "+juce::File(path).getFileName(); ++view.revision;
         }
         cv.notify_one();
     }
@@ -788,8 +804,8 @@ private:
                         // Unity native gain, as in Scoring Synth. No artificial per-voice boost.
                         fluid_settings_setnum(fresh->settings,"synth.gain",1.0);
                         fluid_settings_setint(fresh->settings,"synth.midi-channels",16);
-                        fluid_settings_setint(fresh->settings,"synth.audio-channels",16);
-                        fluid_settings_setint(fresh->settings,"synth.audio-groups",16);
+                        fluid_settings_setint(fresh->settings,"synth.audio-channels",sf2MultiOutput?channels:1);
+                        fluid_settings_setint(fresh->settings,"synth.audio-groups",sf2MultiOutput?channels:1);
                         fluid_settings_setint(fresh->settings,"synth.effects-groups",1);
                         fluid_settings_setint(fresh->settings,"synth.polyphony",256);
                         fluid_settings_setint(fresh->settings,"synth.reverb.active",0);
@@ -838,8 +854,8 @@ private:
               }
               loadingSerial=0; failedSerial=error.isNotEmpty()?r.serial:~uint64_t(0);
               { std::lock_guard<std::mutex> ui(viewMutex);
-                view.isSfz=error.isEmpty() && juce::File(r.path).hasFileExtension("sfz"); view.ready=error.isEmpty()&&r.path.isNotEmpty(); view.labels=std::move(labels); view.path=r.path; view.presets=error.isEmpty()?std::move(presets):std::vector<Preset>{}; view.loading=false;
-                view.status=error.isNotEmpty()?error:r.path.isEmpty()?"No SoundFont loaded":"Loaded: "+juce::File(r.path).getFileName()+"; "+(view.isSfz?juce::String("SFZ, MIDI channel 1"):juce::String(static_cast<int>(view.presets.size()))+" presets");
+                view.isSfz=r.path.isNotEmpty()&&juce::File(r.path).hasFileExtension("sfz"); view.ready=error.isEmpty()&&r.path.isNotEmpty(); view.labels=std::move(labels); view.path=r.path; view.presets=error.isEmpty()?std::move(presets):std::vector<Preset>{}; view.loading=false;
+                view.status=error.isNotEmpty()?error:r.path.isEmpty()?"No SoundFont loaded":"Loaded: "+juce::File(r.path).getFileName()+"; "+(view.isSfz?juce::String("SFZ, MIDI channel 1"):juce::String(static_cast<int>(view.presets.size()))+" presets"+(sf2MultiOutput?juce::String():juce::String("; SF2 stereo recovery, Main 1/2 only")));
                 ++view.revision;
               }
             }
@@ -910,7 +926,7 @@ public:
     explicit Editor(Processor& p) : AudioProcessorEditor(p), proc(p) {
         setWantsKeyboardFocus(true);
         setFocusContainerType(juce::Component::FocusContainerType::keyboardFocusContainer);
-        title.setText("LSFX 0.0.1 TEST19",juce::dontSendNotification); title.setFont(juce::FontOptions(21.0f)); title.setAccessible(false); addAndMakeVisible(title);
+        title.setText("LSFX 0.0.1 TEST20.1",juce::dontSendNotification); title.setFont(juce::FontOptions(21.0f)); title.setAccessible(false); addAndMakeVisible(title);
         status.setText("No SoundFont loaded",juce::dontSendNotification); status.setTitle("Instrument status"); addAndMakeVisible(status);
         setup(open,"Open SF2 or SFZ",1); setup(parameters,"Parameters",2); setup(channel,"MIDI channel",3); setup(bank,"Bank",37); setup(program,"Program",38); setup(level,"Master output gain",36);
         setup(grid,"Parameter grid",1); setup(value,"Parameter value",2); setup(closeGrid,"Close parameters",3);
@@ -950,7 +966,7 @@ public:
             setup(c,"Output routing channel "+juce::String(ch+1),20+ch);
             c.setDescription({});
             c.setSliderStyle(juce::Slider::LinearVertical); c.setTextBoxStyle(juce::Slider::NoTextBox,true,0,0);
-            c.setRange(0,stereoBuses-1,1); c.textFromValueFunction=[](double v){return routeName(juce::roundToInt(v));};
+            c.setRange(0,stereoBuses-1,1); c.textFromValueFunction=[this](double v){return routingValue(v);};
             c.setValue(proc.routeParameter(ch).getIndex(),juce::dontSendNotification);
             c.onDragStart=[this,ch]{proc.routeParameter(ch).beginChangeGesture();routeDragging[ch]=true;lastRouteChannel=ch;};
             c.onDragEnd=[this,ch]{routeDragging[ch]=false;proc.routeParameter(ch).endChangeGesture();};
@@ -1181,7 +1197,7 @@ private:
             } else {
                 rows.push_back({rowChannel,"MIDI channel",1,16,1,true,{}});
                 rows.push_back({rowInterpolation,"SF2 interpolation",0,2,1,true,{}});
-                
+
                 for(const auto& c:sf2Controls) rows.push_back({c.id,c.name,static_cast<double>(c.lo),static_cast<double>(c.hi),static_cast<double>(c.step),false,c.unit});
             }
         }
@@ -1205,7 +1221,7 @@ private:
         if(r.id==rowMidiFX) return proc.midiFXParameter().getIndex();
         if(r.id==rowSfzQuality) return proc.sfzQualityParameter().getIndex();
         if(r.id==rowChannel) return selectedChannel()+1;
-        return proc.getControl(selectedChannel(),r.id);
+        return cached.ready&&!cached.loading?proc.getControl(selectedChannel(),r.id):unset;
     }
     juce::String formatValue(const GridRow& r,double v) const {
         if(v==unset) return "Instrument default (not read)";
@@ -1217,12 +1233,17 @@ private:
             if(i==sf2Ambience) return k?"Scoring ambience (CC91 40)":"Native MIDI";
         }
         if(r.id==rowGain) return juce::String(v,1)+r.unit;
-        if(r.id==rowRoute) return routeName(juce::roundToInt(v));
+        if(r.id==rowRoute) return routingValue(v);
         if(r.id==rowInterpolation) return proc.qualityParameter().choices[juce::jlimit(0,2,juce::roundToInt(v))];
         if(r.id==rowMidiFX) return proc.midiFXParameter().choices[juce::jlimit(0,1,juce::roundToInt(v))];
         if(r.id==rowEffects) return proc.effectsParameter().choices[juce::jlimit(0,3,juce::roundToInt(v))];
         if(r.id==rowSfzQuality) return proc.sfzQualityParameter().choices[juce::jlimit(0,11,juce::roundToInt(v))];
         return juce::String(juce::roundToInt(v))+r.unit;
+    }
+    juce::String routingValue(double v) const {
+        const auto name=routeName(juce::roundToInt(v));
+        if(!sf2MultiOutput&&!cached.isSfz&&v!=0) return name+" (stored; SF2 Main 1/2 only)";
+        return name;
     }
     juce::String rowName(const GridRow& r) const { return r.id==rowGain||r.id==rowRoute?r.name+" channel "+juce::String(selectedChannel()+1):r.name; }
     juce::String rowLine(const GridRow& r) const { return rowName(r)+" "+formatValue(r,readRow(r)); }
@@ -1274,7 +1295,7 @@ private:
     }
     void editSelected(juce::Component& source,int direction,bool coarse,bool boundary=false) {
         if(auto* row=selectedRow()) {
-            const auto r=*row; double v=readRow(r); if(v==unset) v=r.low;
+            const auto r=*row; if(r.id>=0&&(!cached.ready||cached.loading)) {speak(source,"Load an instrument first");return;} double v=readRow(r); if(v==unset) v=r.low;
             const double delta=r.step*(r.choice?1:stepWidths[stepIndex]*(coarse?pageMultiplier:1))*direction;
             const double previous=readRow(r);
             const double next=juce::jlimit(r.low,r.high,boundary?(direction>0?r.high:r.low):v+delta);
@@ -1438,7 +1459,7 @@ private:
             if(vertical||page||boundary||code==juce::KeyPress::backspaceKey) {
                 auto& c=routeLevels[routeCh]; const int old=juce::roundToInt(c.getValue());
                 const int next=code==juce::KeyPress::backspaceKey?0:code==juce::KeyPress::homeKey?0:code==juce::KeyPress::endKey?stereoBuses-1:juce::jlimit(0,stereoBuses-1,old+direction*(page?4:1));
-                if(next!=old) {c.setValue(next,juce::sendNotificationSync);speak(c,routeName(next));} return true;
+                if(next!=old) {c.setValue(next,juce::sendNotificationSync);speak(c,routingValue(next));} return true;
             }
         }
         if(outputCh>=0) {
@@ -1726,6 +1747,8 @@ private:
             bank.setSelectedId((code>>7)+1,juce::dontSendNotification); rebuildPrograms(code>>7,code&127); shownCode=code;
             updating=false;
         }
+        routingLabel.setText(!sf2MultiOutput&&!cached.isSfz?"Stereo output routing - stored only for SF2 (Main 1/2) - Alt+R":"Stereo output routing - Alt+R",juce::dontSendNotification);
+        if(changed) for(auto& c:routeLevels) c.updateText();
         const bool ready=cached.ready&&!cached.loading&&!cached.presets.empty(); bank.setEnabled(ready);program.setEnabled(ready);channel.setEnabled(!cached.isSfz&&!cached.loading);
         if(!dragging) { const auto gain=proc.gainParameter().get(); if(std::abs(level.getValue()-gain)>0.000001) level.setValue(gain,juce::dontSendNotification); const auto text=juce::String(gain,1)+" dB"; if(levelReadout.getText()!=text) levelReadout.setText(text,juce::dontSendNotification); }
         for(int ch=0;ch<channels;++ch) {
