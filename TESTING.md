@@ -169,3 +169,12 @@ Run `python Tests/FluidNotePatchTest.py`. The generated CMake insertion is teste
 
 ## TEST31.3 — native CMake installer regression
 Run `python Tests/FluidNotePatchTest.py`. The generated CMake implementation executes in-process without Python or any subprocess in the vcpkg sandbox. Regression tests invoke CMake with empty PATH on synthetic sources, LF/CRLF, changed whitespace, paths containing spaces, and verify exact LF-normalized output equality against the Python reference, idempotence, missing/duplicate anchor refusal before writing, two supported versions, and unchanged shared sources. The mandatory Windows dependency and audio smoke tests are unchanged; local fixtures do not validate actual FluidSynth compilation.
+
+## TEST32 — main-window keyboard regression
+
+- In MIDI Channel, Channel Gain and Output Routing: press digits 2–9 from any channel; press 1 repeatedly and verify channel 1, 10–16, 1 (from a nonmatching channel). The gain/routing value must not change when choosing a strip channel.
+- Bank/Program: 000 Right -> 016; Down from 015 stays silent; Up from 016 stays silent. On 037, Home -> 032 and End -> 047, Page Up/Down moves five within the column. Ctrl+Home -> 000, Ctrl+End -> last available location (127 for programs; at least 128 for banks). No wrap or additional announcement at a boundary.
+- Verify Enter import, Delete confirmation, cancellation and remembered focus. Test both SF2 and SFZ maps, empty entries and percussion bank 128.
+- Tab order: Save preset as, Export SoundFont, About. Test reverse Tab as well.
+- Recheck SF2 per-note routing, channel routing and hybrid export; no audio-path changes in TEST32.
+- LSFXGridNavigationTest is included in Windows CI, with assertions enabled in Release. This is a keyboard-destination unit test, not a substitute for NVDA/REAPER verification.

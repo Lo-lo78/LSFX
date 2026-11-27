@@ -115,3 +115,11 @@ if(MSVC)
 else()
     target_compile_options(LSFXNoteRouteGroupsTest PRIVATE -UNDEBUG)
 endif()
+
+# TEST32: keyboard-grid and channel digit navigation, independent of JUCE.
+add_executable(LSFXGridNavigationTest Tests/GridNavigationTest.cpp)
+if(MSVC)
+    target_compile_options(LSFXGridNavigationTest PRIVATE /UNDEBUG)
+else()
+    target_compile_options(LSFXGridNavigationTest PRIVATE -UNDEBUG)
+endif()

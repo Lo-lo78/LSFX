@@ -62,7 +62,7 @@ lsfx::sfzexport::Audio decodeSfzExportSample(juce::AudioFormatManager& formats,c
     return a;
 }
 constexpr int channels = 16;
-constexpr auto lsfxVersion="0.99.2 TEST31.3";
+constexpr auto lsfxVersion="0.99.2 TEST32";
 constexpr auto lsfxReleaseDate="27 November 2026 (test build)";
 constexpr auto lsfxProjectUrl="https://github.com/Lo-lo78/LSFX";
 constexpr auto lsfxContactEmail="vmanolo301@gmail.com";
@@ -1420,7 +1420,7 @@ public:
     explicit Editor(Processor& p) : AudioProcessorEditor(p), proc(p) {
         setWantsKeyboardFocus(true);
         setFocusContainerType(juce::Component::FocusContainerType::keyboardFocusContainer);
-        title.setText(sf2MultiOutput?"LSFX 0.99.2 TEST31.3":"LSFX 0.99.2 TEST31.3 SF2 stereo recovery",juce::dontSendNotification); title.setFont(juce::FontOptions(21.0f)); title.setAccessible(false); addAndMakeVisible(title);
+        title.setText(sf2MultiOutput?"LSFX 0.99.2 TEST32":"LSFX 0.99.2 TEST32 SF2 stereo recovery",juce::dontSendNotification); title.setFont(juce::FontOptions(21.0f)); title.setAccessible(false); addAndMakeVisible(title);
         status.setText("No SoundFont loaded",juce::dontSendNotification); status.setTitle("Instrument status"); addAndMakeVisible(status);
         setup(open,"Open SF2 or SFZ",1); setup(parameters,"Parameters",2); setup(channel,"MIDI channel",3); setup(bank,"Bank",37); setup(program,"Program",38); setup(level,"Master output gain",36);
         setup(grid,"Parameter grid",1); setup(value,"Parameter value",2); setup(closeGrid,"Close parameters",3);
@@ -1485,8 +1485,8 @@ public:
         panelText.onReturnKey=[this]{if(panelMode==Panel::name&&panelAction) {auto action=panelAction;action();}};
         panelText.onEscapeKey=[this]{cancelPanel();};
         panelLabel.setTitle("Preset information"); panelLabel.setJustificationType(juce::Justification::centredLeft); addAndMakeVisible(panelLabel);
-        setup(exportButton,"Export SoundFont",43); exportButton.setDescription("Alt+E"); exportButton.onClick=[this]{browseExport();};
-        setup(aboutButton,"About",42); aboutButton.setDescription("Alt+A"); aboutButton.onClick=[this]{openAbout();};
+        setup(exportButton,"Export SoundFont",42); exportButton.setDescription("Alt+E"); exportButton.onClick=[this]{browseExport();};
+        setup(aboutButton,"About",43); aboutButton.setDescription("Alt+A"); aboutButton.onClick=[this]{openAbout();};
         const auto aboutText=juce::String("LSFX\nVersion: ")+lsfxVersion+"\nRelease date: "+lsfxReleaseDate+"\nLicense: "+lsfxLicense+"\nProject: "+lsfxProjectUrl+"\nContact: "+lsfxContactEmail;
         setup(aboutInfo,"About LSFX",1);
         aboutInfo.setMultiLine(true,true); aboutInfo.setReturnKeyStartsNewLine(false); aboutInfo.setReadOnly(true);
@@ -1612,7 +1612,7 @@ public:
         for(int ch=0;ch<channels;++ch) routeLevels[ch].setBounds(routes.getX()+ch*cellWidth,routes.getY(),cellWidth,routes.getHeight());
         auto lv=r.removeFromTop(38); levelLabel.setBounds(lv.removeFromLeft(200)); levelReadout.setBounds(lv.removeFromRight(100)); level.setBounds(lv.reduced(0,3));
         line(bankLabel,bank);line(programLabel,program);
-        auto buttons=r.removeFromTop(34); presetsButton.setBounds(buttons.removeFromLeft(170)); saveButton.setBounds(buttons.removeFromLeft(150)); saveAsButton.setBounds(buttons.removeFromLeft(170)); aboutButton.setBounds(buttons.removeFromLeft(120)); exportButton.setBounds(buttons.removeFromLeft(250));
+        auto buttons=r.removeFromTop(34); presetsButton.setBounds(buttons.removeFromLeft(170)); saveButton.setBounds(buttons.removeFromLeft(150)); saveAsButton.setBounds(buttons.removeFromLeft(170)); exportButton.setBounds(buttons.removeFromLeft(250)); aboutButton.setBounds(buttons.removeFromLeft(120));
     }
 private:
     Processor& proc;
@@ -1972,11 +1972,8 @@ private:
         levelReadout.setText(juce::String(level.getValue(),1)+" dB",juce::dontSendNotification);
         speak(level,levelReadout.getText());
     }
-    void navigateGrid(int code,bool wholeGrid=false) {
-        if(rows.empty()) return;
-        const int i=juce::jmax(0,grid.getSelectedItemIndex()), count=static_cast<int>(rows.size());
+    static bool gridMoveForKey(int code,lsfx::GridMove& move) {
         using Move=lsfx::GridMove;
-        Move move;
         if(code==juce::KeyPress::upKey) move=Move::up;
         else if(code==juce::KeyPress::downKey) move=Move::down;
         else if(code==juce::KeyPress::leftKey) move=Move::left;
@@ -1985,9 +1982,27 @@ private:
         else if(code==juce::KeyPress::pageDownKey) move=Move::pageDown;
         else if(code==juce::KeyPress::homeKey) move=Move::home;
         else if(code==juce::KeyPress::endKey) move=Move::end;
-        else return;
+        else return false;
+        return true;
+    }
+    void navigateGrid(int code,bool wholeGrid=false) {
+        if(rows.empty()) return;
+        const int i=juce::jmax(0,grid.getSelectedItemIndex()), count=static_cast<int>(rows.size());
+        lsfx::GridMove move;
+        if(!gridMoveForKey(code,move)) return;
         const int target=lsfx::gridDestination(i,count,gridRowsPerColumn,move,wholeGrid);
         if(target!=i) selectGridRow(target,true);
+    }
+    // The existing accessible bank/program controls act as column-major
+    // keyboard grids, with no keyboard popup and no wrap at an edge.
+    void navigateLocation(juce::ComboBox& control,int code,bool wholeGrid) {
+        lsfx::GridMove move;
+        if(!gridMoveForKey(code,move)||control.getNumItems()==0) return;
+        const int current=juce::jmax(0,control.getSelectedItemIndex());
+        const int target=lsfx::gridDestination(current,control.getNumItems(),16,move,wholeGrid);
+        if(target==current) return;
+        control.setSelectedItemIndex(target,juce::sendNotificationSync);
+        speak(control,control.getText());
     }
     bool handleKey(const juce::KeyPress& k,juce::Component* origin) {
         origin=keyboardControl(origin);
@@ -2075,6 +2090,23 @@ private:
             juce::Component* target=nullptr;
             if(ch=='m') target=&channel; else if(ch=='k') target=&bank; else if(ch=='p') target=&program; else if(ch=='g') target=&level; else if(ch=='u') target=&channelLevels[lastGainChannel]; else if(ch=='r') target=&routeLevels[lastRouteChannel];
             if(target) {if(target->isEnabled()) {if(gridOpen) showGrid(false,target); focus(*target);} return true;}
+        }
+        if(!gridOpen&&!alt&&!mods.isShiftDown()&&(origin==&bank||origin==&program)
+            &&((!ctrl&&(vertical||horizontal||page||boundary))||(ctrl&&boundary))) {
+            if(!cached.loading) navigateLocation(origin==&bank?static_cast<juce::ComboBox&>(bank):static_cast<juce::ComboBox&>(program),code,ctrl);
+            return true;
+        }
+        if(!gridOpen&&!alt&&!ctrl&&!mods.isShiftDown()&&ch>='1'&&ch<='9'
+            &&(origin==&channel||outputCh>=0||routeCh>=0)) {
+            const int current=origin==&channel?selectedChannel():outputCh>=0?outputCh:routeCh;
+            const int next=lsfx::channelDigitDestination(current,int(ch-'0'),channels);
+            if(next!=current) {
+                if(origin==&channel) {
+                    if(!cached.loading) {channel.setSelectedId(next+1,juce::sendNotificationSync);speak(channel,channel.getText());}
+                } else if(outputCh>=0) {lastGainChannel=next;focus(channelLevels[next]);}
+                else {lastRouteChannel=next;focus(routeLevels[next]);}
+            }
+            return true;
         }
         if(!gridOpen&&!alt&&!ctrl&&code==juce::KeyPress::deleteKey&&(origin==&bank||origin==&program)) {
             if(!cached.loading) requestClearLocation(origin==&bank);return true;

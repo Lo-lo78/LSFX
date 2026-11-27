@@ -1,4 +1,4 @@
-# LSFX 0.99.2 TEST31.3 — SF2 note routing and keyboard navigation
+# LSFX 0.99.2 TEST32 — release candidate keyboard ergonomics
 
 27 November 2026 · Windows x64 VST3 · Lo-lo
 
@@ -13,11 +13,18 @@ In the Windows distribution both HTML guides are included in the Doc folder next
 
 ## Essential commands
 
-Alt+O opens a source and replaces the map; Alt+K selects a bank (Enter imports an SF2 bank); Alt+P selects a program (Enter imports SF2/SFZ); Alt+M selects MIDI channel; Alt+L opens parameters; Alt+U channel gains; Alt+R routing; Alt+G master gain; Alt+B preset browser; Ctrl+S save; Ctrl+Shift+S save as; Alt+I initialize with confirmation; Ctrl+Enter MIDI Panic; Alt+Enter note mixer editor draft (not applied to audio); Alt+A About; Alt+S status; Alt+E export SoundFont.
+Alt+O opens a source and replaces the map; Alt+K selects a bank (Enter imports an SF2 bank); Alt+P selects a program (Enter imports SF2/SFZ); Alt+M selects MIDI channel; Alt+L opens parameters; Alt+U channel gains; Alt+R routing; Alt+G master gain; Alt+B preset browser; Ctrl+S save; Ctrl+Shift+S save as; Alt+I initialize with confirmation; Ctrl+Enter MIDI Panic; Alt+Enter note mixer (SF2 per-note audio processing; SFZ assignments stored only); Alt+A About; Alt+S status; Alt+E export SoundFont.
+
+## TEST32: main-window navigation
+
+- Alt+M, Alt+U and Alt+R: digits 2–9 select that MIDI channel directly; 1 cycles 1, 10–16, then 1. Gain and routing digits select the strip channel, without changing its gain or output value.
+- Alt+K and Alt+P: existing native selection controls use a logical column-major grid of 16 rows per column. Up/down moves one slot within the column; left/right moves one column; Page Up/Down moves five rows within the column. Home/End selects column boundaries; Ctrl+Home/End selects whole-grid boundaries. No wrap or explicit repeat announcement at edges. Bank 128 and any existing extended banks remain accessible. Enter imports, Delete clears with confirmation, as before.
+- Main-window order ends with Save preset as, Export SoundFont, About. Focus memory IDs are unchanged.
+- No DSP, map format, export, SF2 patch or note mixer changes. About and complete bilingual guide updates are reserved for the final 0.99.2 release.
 
 ## Build and verification
 
-Push to main and download the Windows x64 artifact from GitHub Actions. The default build retains the FluidSynth VLA allocation correction from TEST26.1 and the mandatory native multigroup and hybrid processor tests. The user confirmed TEST26.1 worked in REAPER on Windows. The 0.99.1 About and shortcut changes still require compilation and screen-reader verification. The optional SF2 stereo recovery build is diagnostic only.
+Push to main and download the Windows x64 artifact from GitHub Actions. The default build retains the FluidSynth VLA allocation correction from TEST26.1 and the mandatory native multigroup and hybrid processor tests. The user confirmed TEST26.1 worked in REAPER on Windows. The user confirmed TEST31.3 per-note SF2 routing in REAPER. TEST32 is the candidate for 0.99.2, pending Windows keyboard and regression verification. The optional SF2 stereo recovery build is diagnostic only.
 
 The plug-in IDs and existing state format are unchanged. See [testing](TESTING.md), [third-party and licensing notes](THIRD_PARTY.md) and [development history](Doc/DEVELOPMENT_HISTORY.md).
 
