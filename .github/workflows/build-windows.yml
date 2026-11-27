@@ -37,7 +37,7 @@ jobs:
       - name: Build native FluidSynth smoke test
         shell: pwsh
         run: |
-          cmake --build build --config Release --target LSFXFluidSmoke LSFXFluidMapSmoke LSFXVirtualProgramMapTest LSFXChannelCompressorTest LSFXSoundFontExportTest --parallel 2 2>&1 | Tee-Object -FilePath logs/fluid-smoke-build.txt
+          cmake --build build --config Release --target LSFXFluidSmoke LSFXFluidMapSmoke LSFXVirtualProgramMapTest LSFXChannelCompressorTest LSFXSoundFontExportTest LSFXSfzSoundFontExportTest --parallel 2 2>&1 | Tee-Object -FilePath logs/fluid-smoke-build.txt
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Test channel compressor DSP
         shell: pwsh
@@ -69,6 +69,14 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           & ./build/Release/LSFXFluidSmoke.exe build/exported.sf2 stereo 2>&1 | Tee-Object -FilePath logs/sf2-export-reload.txt
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Test SFZ conversion and mixed SoundFont reload
+        timeout-minutes: 2
+        shell: pwsh
+        run: |
+          & ./build/Release/LSFXSfzSoundFontExportTest.exe build/sfz-export-fixtures build/smoke.sf2 build/sfz-mixed-export.sf2 2>&1 | Tee-Object -FilePath logs/sfz-export-test.txt
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & ./build/Release/LSFXFluidSmoke.exe build/sfz-mixed-export.sf2 stereo 2>&1 | Tee-Object -FilePath logs/sfz-export-reload.txt
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Diagnose experimental SF2 multigroup in a separate process
         timeout-minutes: 2
         shell: pwsh
@@ -91,7 +99,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           & ./build/LSFXHybridSmoke_artefacts/Release/LSFXHybridSmoke.exe build/smoke.sf2 build/sfz-one.sfz build/sfz-two.sfz 2>&1 | Tee-Object -FilePath logs/hybrid-smoke.txt
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-      - name: Package 0.99.2-TEST27.1
+      - name: Package 0.99.2-TEST28
         shell: pwsh
         run: |
           Start-Transcript -Path logs/package.txt -Force | Out-Null
@@ -114,7 +122,7 @@ jobs:
             & "$root/vcpkg.exe" list | Out-File -Encoding utf8 package/ThirdParty/vcpkg-versions.txt
             git -C $root rev-parse HEAD | Out-File -Encoding utf8 package/ThirdParty/vcpkg-commit.txt
             git rev-parse HEAD | Out-File -Encoding utf8 package/source-commit.txt
-            Compress-Archive -Path package/* -DestinationPath LSFX.0.99.2-TEST27.1${{ (github.event_name == 'workflow_dispatch' && !inputs.experimental_sf2_multigroup) && '-SF2-stereo' || '' }}.Windows.x64.VST3.zip -Force
+            Compress-Archive -Path package/* -DestinationPath LSFX.0.99.2-TEST28${{ (github.event_name == 'workflow_dispatch' && !inputs.experimental_sf2_multigroup) && '-SF2-stereo' || '' }}.Windows.x64.VST3.zip -Force
           } catch {
             $_ | Out-String | Add-Content -Path logs/package-error.txt
             throw
@@ -123,13 +131,13 @@ jobs:
           }
       - uses: actions/upload-artifact@v4
         with:
-          name: LSFX-0.99.2-TEST27.1${{ (github.event_name == 'workflow_dispatch' && !inputs.experimental_sf2_multigroup) && '-SF2-stereo' || '' }}-Windows-x64
-          path: LSFX.0.99.2-TEST27.1${{ (github.event_name == 'workflow_dispatch' && !inputs.experimental_sf2_multigroup) && '-SF2-stereo' || '' }}.Windows.x64.VST3.zip
+          name: LSFX-0.99.2-TEST28${{ (github.event_name == 'workflow_dispatch' && !inputs.experimental_sf2_multigroup) && '-SF2-stereo' || '' }}-Windows-x64
+          path: LSFX.0.99.2-TEST28${{ (github.event_name == 'workflow_dispatch' && !inputs.experimental_sf2_multigroup) && '-SF2-stereo' || '' }}.Windows.x64.VST3.zip
           if-no-files-found: error
       - name: Upload build logs (also on failure)
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: LSFX-0.99.2-TEST27.1-build-logs
+          name: LSFX-0.99.2-TEST28-build-logs
           path: logs/*.txt
           if-no-files-found: warn

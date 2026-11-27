@@ -178,3 +178,6 @@ Selective lossless SF2 assembly from the committed virtual map, with Alt+E, a ca
 ## TEST27.1 — FluidSynth dependency update
 
 Allow FluidSynth 2.6.3 as well as 2.6.2 in the overlay preparation script. The VLA patch still applies; no audio or export algorithm changes.
+
+## TEST28 — hybrid SF2/SFZ export
+Convert each distinct sampled SFZ into one standard SF2 preset, then merge into the mapped addresses using the TEST27 selective assembler. Explicit approximation warnings; Space activates the final OK button. No changes to playback DSP.

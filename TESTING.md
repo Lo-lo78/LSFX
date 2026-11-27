@@ -135,3 +135,8 @@ Local native trim check: `python Tests/FluidStereoTrimTest.py /path/to/FluidR3.s
 - Accept vcpkg FluidSynth 2.6.2 or 2.6.3 only; apply the same VLA correction to either version.
 - Check the overlay script accepts both supported versions and rejects unknown versions and ports without a PATCHES block.
 - Windows CI must still pass the stereo, export/reload, multigroup and hybrid processor tests. No exporter or audio engine changes.
+
+## TEST28 hybrid SF2/SFZ export
+- CI builds and runs `LSFXSfzSoundFontExportTest` before the VST3. Tests macro expansion, includes, default paths, inherited region properties, stereo links, velocity layers, loop indices, release-region warning, deduplication, mapped addresses and cancellation. The native FluidSynth smoke test reloads the mixed output; the hybrid processor smoke test additionally uses the real JUCE WAV decoder and reloads a converted SFZ.
+- Manual Windows/NVDA: import one SFZ into a GeneralUser GS slot, export with Alt+E, dismiss OK with Space, reopen output in LSFX, and check the program addresses, stereo image and dynamics. Repeat with a complex SFZ and verify the conversion warnings. Cancel with Esc and confirm no destination change. Missing sample, unsupported oscillator, and unsupported SF2 inputs must leave the existing target intact. Test FLAC and WAV paths including spaces and Unicode.
+- Source SFZ synthesis is approximate. Compare dry audio at multiple velocities; do not assume envelope/LFO/CC equivalence or identical loudness.

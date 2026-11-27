@@ -23,6 +23,7 @@
 #include <map>
 #include "VirtualProgramMap.h"
 #include "SoundFontExport.h"
+#include "SfzSoundFontExport.h"
 #if JUCE_WINDOWS
  #include <Windows.h>
  #include <UIAutomation.h>
@@ -30,8 +31,33 @@
 #endif
 
 namespace {
+lsfx::sfzexport::Audio decodeSfzExportSample(juce::AudioFormatManager& formats,const lsfx::sf2export::Path& path,const std::atomic<bool>* cancel) {
+    auto sampleFile=juce::File(juce::String::fromUTF8(path.u8string().c_str()));
+    std::unique_ptr<juce::AudioFormatReader> reader(formats.createReaderFor(sampleFile));
+    if(!reader) throw std::runtime_error("Cannot decode SFZ sample: "+path.u8string());
+    lsfx::sfzexport::Audio a;
+    if(reader->numChannels<1||reader->numChannels>2||reader->lengthInSamples<=0||reader->lengthInSamples>100000000)
+        throw std::runtime_error("Unsupported SFZ sample length or channel count: "+path.u8string());
+    a.channels=int(reader->numChannels); a.rate=int(reader->sampleRate);
+    const auto& meta=reader->metadataValues;
+    a.root=meta.getValue("MidiUnityNote","60").getIntValue();
+    if(meta.getValue("NumSampleLoops","0").getIntValue()>0) {
+        a.loopStart=meta.getValue("Loop0Start","-1").getLargeIntValue();
+        a.loopEnd=meta.getValue("Loop0End","-1").getLargeIntValue()+1;
+    }
+    a.pcm.resize(size_t(reader->lengthInSamples)*size_t(a.channels));
+    juce::AudioBuffer<float> block(a.channels,32768);
+    for(juce::int64 pos=0;pos<reader->lengthInSamples;) {
+        lsfx::sf2export::checkCancel(cancel);
+        int n=int(std::min<juce::int64>(32768,reader->lengthInSamples-pos));
+        if(!reader->read(&block,0,n,pos,true,a.channels==2)) throw std::runtime_error("Cannot read SFZ audio sample");
+        for(int i=0;i<n;++i)for(int ch=0;ch<a.channels;++ch)a.pcm[size_t(pos+i)*size_t(a.channels)+size_t(ch)]=block.getSample(ch,i);
+        pos+=n;
+    }
+    return a;
+}
 constexpr int channels = 16;
-constexpr auto lsfxVersion="0.99.2 TEST27.1";
+constexpr auto lsfxVersion="0.99.2 TEST28";
 constexpr auto lsfxReleaseDate="27 November 2026 (test build)";
 constexpr auto lsfxProjectUrl="https://github.com/Lo-lo78/LSFX";
 constexpr auto lsfxContactEmail="vmanolo301@gmail.com";
@@ -1319,7 +1345,7 @@ public:
     explicit Editor(Processor& p) : AudioProcessorEditor(p), proc(p) {
         setWantsKeyboardFocus(true);
         setFocusContainerType(juce::Component::FocusContainerType::keyboardFocusContainer);
-        title.setText(sf2MultiOutput?"LSFX 0.99.2 TEST27.1":"LSFX 0.99.2 TEST27.1 SF2 stereo recovery",juce::dontSendNotification); title.setFont(juce::FontOptions(21.0f)); title.setAccessible(false); addAndMakeVisible(title);
+        title.setText(sf2MultiOutput?"LSFX 0.99.2 TEST28":"LSFX 0.99.2 TEST28 SF2 stereo recovery",juce::dontSendNotification); title.setFont(juce::FontOptions(21.0f)); title.setAccessible(false); addAndMakeVisible(title);
         status.setText("No SoundFont loaded",juce::dontSendNotification); status.setTitle("Instrument status"); addAndMakeVisible(status);
         setup(open,"Open SF2 or SFZ",1); setup(parameters,"Parameters",2); setup(channel,"MIDI channel",3); setup(bank,"Bank",37); setup(program,"Program",38); setup(level,"Master output gain",36);
         setup(grid,"Parameter grid",1); setup(value,"Parameter value",2); setup(closeGrid,"Close parameters",3);
@@ -2323,7 +2349,7 @@ private:
         const auto code=k.getKeyCode();const auto mods=k.getModifiers();const bool ctrl=mods.isCtrlDown()||mods.isCommandDown();
         const auto ch=juce::CharacterFunctions::toLowerCase(static_cast<juce::juce_wchar>(code));
         if(code==juce::KeyPress::escapeKey) {cancelPanel();return true;}
-        if(panelMode==Panel::exportProgress) {if(code==juce::KeyPress::returnKey)cancelPanel();return true;}
+        if(panelMode==Panel::exportProgress) {if(code==juce::KeyPress::returnKey||code==juce::KeyPress::spaceKey)cancelPanel();return true;}
         if(panelMode==Panel::source) {
             if(code==juce::KeyPress::tabKey) {focus(presetList.hasKeyboardFocus(true)?static_cast<juce::Component&>(panelCancel):static_cast<juce::Component&>(presetList));return true;}
             if(code==juce::KeyPress::returnKey) {if(panelCancel.hasKeyboardFocus(true))cancelPanel();else activateSource(presetList.getSelectedRow());return true;}
@@ -2359,7 +2385,7 @@ private:
             } else focus(panelOK.hasKeyboardFocus(true)?static_cast<juce::Component&>(panelCancel):static_cast<juce::Component&>(panelOK));
             return true;
         }
-        if(code==juce::KeyPress::returnKey) {if(panelCancel.hasKeyboardFocus(true))cancelPanel();else if(panelAction){auto action=panelAction;action();}return true;}
+        if(code==juce::KeyPress::returnKey||(code==juce::KeyPress::spaceKey&&(panelOK.hasKeyboardFocus(true)||panelCancel.hasKeyboardFocus(true)))) {if(panelCancel.hasKeyboardFocus(true))cancelPanel();else if(panelAction){auto action=panelAction;action();}return true;}
         if(panelMode==Panel::confirm) return true;
         return false;
     }
@@ -2408,8 +2434,7 @@ private:
         if(!snapshot.ready||snapshot.presets.empty()) {exportMessage("The map is empty. Nothing to export.",from);return;}
         std::vector<lsfx::sf2export::Entry> entries;
         for(const auto& p:snapshot.presets) {
-            if(p.sfzIndex>=0||juce::File(p.path).hasFileExtension("sfz")) {exportMessage("TEST27.1 exports SF2 only. The map contains SFZ instruments. Nothing was exported; SFZ conversion is not yet available.",from);return;}
-            if(!juce::File(p.path).hasFileExtension("sf2")) {exportMessage("TEST27.1 exports uncompressed SF2 sources only. Nothing was exported.",from);return;}
+            if(!juce::File(p.path).hasFileExtension("sf2;sfz")) {exportMessage("Export supports PCM16 SF2 and sampled SFZ sources only. Nothing was exported.",from);return;}
             if(p.bank>128) {exportMessage("A mapped bank is outside the standard SF2 range 0 to 128. Nothing was exported.",from);return;}
             entries.push_back({exportPath(juce::File(p.path)),p.sourceBank,p.sourceProgram,p.bank,p.program});
         }
@@ -2440,10 +2465,35 @@ private:
         try {exportThread=std::thread([job,file,entries=std::move(entries)]() mutable {
             try {
                 juce::TemporaryFile temp(file);
+                // Convert each distinct SFZ only once, then use the validated selective SF2 assembler.
+                juce::AudioFormatManager formats; formats.registerBasicFormats();
+                lsfx::sfzexport::Decode decode=[&](const lsfx::sf2export::Path& path) {return decodeSfzExportSample(formats,path,&job->cancel);};
+                std::map<lsfx::sf2export::Path,std::unique_ptr<juce::TemporaryFile>> converted;
+                size_t convertedRegions=0,skippedRegions=0;
+                std::set<std::string> warnings;
+                for(auto& entry:entries) {
+                    lsfx::sf2export::checkCancel(&job->cancel);
+                    if(lsfx::sfzexport::lower(entry.path.extension().u8string())!=".sfz") continue;
+                    auto it=converted.find(entry.path);
+                    if(it==converted.end()) {
+                        auto intermediate=std::make_unique<juce::TemporaryFile>(juce::String(".sf2"));
+                        lsfx::sfzexport::Report report;
+                        try {lsfx::sfzexport::convert(entry.path,exportPath(intermediate->getFile()),decode,report,&job->cancel);}
+                        catch(const std::exception& error) {throw std::runtime_error(entry.path.u8string()+": "+error.what());}
+                        convertedRegions+=report.regions; skippedRegions+=report.skipped;
+                        warnings.insert(report.warnings.begin(),report.warnings.end());
+                        it=converted.emplace(entry.path,std::move(intermediate)).first;
+                    }
+                    entry.path=exportPath(it->second->getFile()); entry.sourceBank=0; entry.sourceProgram=0;
+                }
                 auto result=lsfx::sf2export::exportFile(std::move(entries),exportPath(temp.getFile()),&job->cancel,&job->progress);
                 lsfx::sf2export::checkCancel(&job->cancel);
                 if(!temp.overwriteTargetFileWithTemporary()) throw std::runtime_error("Unable to replace destination file");
                 job->message="SoundFont export completed. Presets: "+juce::String(static_cast<juce::int64>(result.presets))+", instruments: "+juce::String(static_cast<juce::int64>(result.instruments))+", samples: "+juce::String(static_cast<juce::int64>(result.samples))+", sources: "+juce::String(static_cast<juce::int64>(result.sources))+", size: "+juce::String(double(result.bytes)/1000000.0,2)+" MB.";
+                if(!converted.empty()) {
+                    job->message+=" SFZ sources: "+juce::String(static_cast<juce::int64>(converted.size()))+", converted regions: "+juce::String(static_cast<juce::int64>(convertedRegions))+", omitted regions: "+juce::String(static_cast<juce::int64>(skippedRegions))+". SFZ conversion is approximate.";
+                    if(!warnings.empty()) {job->message+=" Conversion warnings: ";for(const auto& warning:warnings)job->message+=juce::String::fromUTF8(warning.c_str())+"; ";}
+                }
             } catch(const std::exception& e) {job->message=job->cancel.load()?juce::String("SoundFont export cancelled."):juce::String("SoundFont export failed: ")+juce::String::fromUTF8(e.what());}
             catch(...) {job->message="SoundFont export failed.";}
             job->done.store(true);

@@ -103,3 +103,5 @@ endif()
 
 # TEST27: validate the SF2 writer without the DAW or JUCE.
 add_executable(LSFXSoundFontExportTest Tests/SoundFontExportTest.cpp)
+
+add_executable(LSFXSfzSoundFontExportTest Tests/SfzSoundFontExportTest.cpp)
