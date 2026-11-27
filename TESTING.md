@@ -129,3 +129,9 @@ Local native trim check: `python Tests/FluidStereoTrimTest.py /path/to/FluidR3.s
 - For a mixed map with SFZ, Alt+E must explain the TEST27 limitation without creating a partial SF2. The same applies to 24-bit SF2, SF3 and unsupported sample offsets or bank addresses. Confirm focus returns to its origin after dismissing the report; no SAPI fallback.
 - CI builds `LSFXSoundFontExportTest`, verifies remapping, table counts, shared dependencies and PCM, rejects invalid maps, then loads and renders the output through native FluidSynth. All prior smoke tests and the VLA patch are retained.
 - Local private fixtures: GeneralUser GS 2.0.3 plus FluidR3 original program 33 substituted at bank 0/program 33, yielded 287 presets, 925 sample headers, about 33.6 MB. Native Linux FluidSynth comparison (effects disabled) gave zero sample difference for piano, bass, strings and one drum note, over 4096 frames each. Full FluidR3 export also succeeded. These are spot checks, not exhaustive audio equivalence or Windows host certification.
+
+## TEST27.1 dependency compatibility
+
+- Accept vcpkg FluidSynth 2.6.2 or 2.6.3 only; apply the same VLA correction to either version.
+- Check the overlay script accepts both supported versions and rejects unknown versions and ports without a PATCHES block.
+- Windows CI must still pass the stereo, export/reload, multigroup and hybrid processor tests. No exporter or audio engine changes.

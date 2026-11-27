@@ -1,4 +1,4 @@
-"""Copy the runner's vcpkg port and add the FluidSynth 2.6.2 MSVC VLA fix.
+"""Copy the runner's vcpkg port and add the FluidSynth 2.6.2/2.6.3 MSVC VLA fix.
 
 Fail explicitly if the port has changed rather than silently building an
 unpatched dependency. The patch is part of the vcpkg ABI/cache key.
@@ -16,8 +16,10 @@ args = parser.parse_args()
 source = args.vcpkg_root / 'ports' / 'fluidsynth'
 manifest = json.loads((source / 'vcpkg.json').read_text(encoding='utf-8-sig'))
 version = next((manifest[key] for key in ('version', 'version-semver', 'version-string', 'version-date') if key in manifest), None)
-if version != '2.6.2':
-    raise SystemExit(f'Expected FluidSynth 2.6.2 port, found {version}; review VLA fix before upgrading.')
+# Both upstream tags contain the same unsafe allocation macro.
+# Keep a strict allowlist and let vcpkg fail if the patch no longer applies.
+if version not in ('2.6.2', '2.6.3'):
+    raise SystemExit(f'Expected FluidSynth 2.6.2 or 2.6.3 port, found {version}; review VLA fix before upgrading.')
 target = args.overlay_root / 'fluidsynth'
 if target.exists():
     shutil.rmtree(target)

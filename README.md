@@ -1,4 +1,4 @@
-# LSFX 0.99.2 TEST27 — selective SF2 export
+# LSFX 0.99.2 TEST27.1 — selective SF2 export
 
 27 November 2026 · Windows x64 VST3 · Lo-lo
 
@@ -21,8 +21,10 @@ Push to main and download the Windows x64 artifact from GitHub Actions. The defa
 
 The plug-in IDs and existing state format are unchanged. See [testing](TESTING.md), [third-party and licensing notes](THIRD_PARTY.md) and [development history](Doc/DEVELOPMENT_HISTORY.md).
 
-## TEST27: Export SoundFont (Alt+E)
+## TEST27.1: Export SoundFont (Alt+E)
 
 Exports the actual virtual map, including selected individual SF2 programs and banks only, into a standard standalone PCM16 SoundFont 2.01. Shared instruments and samples are reused within each source file; linked stereo samples, generators, modulators and source preset names are retained. The output uses the virtual destination bank and program numbers, not the original addresses. No LSFX-specific gain, CC overrides, routing, compressors or effects are exported. Source banks are never overwritten. Choose a destination with the Windows Save dialog; Cancel/Escape cancels, including during export. The current map is unchanged. The worker streams PCM to a temporary file before replacing the destination.
 
 This test is limited to PCM16 SF2. Maps containing SFZ, SF3, 24-bit SF2, nonportable banks above 128, ROM samples or selected sample offsets outside nominal sample bounds are rejected rather than silently converted or partially exported. Invalid unused loop coordinates in old files are repaired. Deduplication is by source identity, not across unrelated source files. Original licenses continue to apply. Do not redistribute exports unless permitted by all source licenses. SFZ conversion is a separate development stage.
+
+TEST27.1 build fix: accept the reviewed FluidSynth 2.6.3 vcpkg port while retaining the Windows VLA patch and all native smoke tests.

@@ -27,3 +27,7 @@ Upstream source: https://github.com/FluidSynth/fluidsynth/tree/v2.6.2 (LGPL-2.1-
 ## 0.99.1
 
 About panel and caret navigation adapted from LJuno-116 0.99.67 (AGPL-3.0-or-later). The public release candidate keeps the existing static linkage and vcpkg overlay. Complete the distribution-compliance checklist above before distributing binaries; the provided notices alone do not establish compliance.
+
+## TEST27.1: FluidSynth 2.6.3
+
+The runner now supplies FluidSynth 2.6.3. The upstream header in [v2.6.3](https://github.com/FluidSynth/fluidsynth/blob/v2.6.3/src/utils/fluidsynth_priv.h) still contains the same non-VLA allocation expression. The existing patch is retained for both 2.6.2 and 2.6.3; unknown versions are rejected. The mandatory native multigroup and hybrid processor tests remain enabled.

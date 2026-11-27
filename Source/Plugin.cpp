@@ -31,7 +31,7 @@
 
 namespace {
 constexpr int channels = 16;
-constexpr auto lsfxVersion="0.99.2 TEST27";
+constexpr auto lsfxVersion="0.99.2 TEST27.1";
 constexpr auto lsfxReleaseDate="27 November 2026 (test build)";
 constexpr auto lsfxProjectUrl="https://github.com/Lo-lo78/LSFX";
 constexpr auto lsfxContactEmail="vmanolo301@gmail.com";
@@ -1319,7 +1319,7 @@ public:
     explicit Editor(Processor& p) : AudioProcessorEditor(p), proc(p) {
         setWantsKeyboardFocus(true);
         setFocusContainerType(juce::Component::FocusContainerType::keyboardFocusContainer);
-        title.setText(sf2MultiOutput?"LSFX 0.99.2 TEST27":"LSFX 0.99.2 TEST27 SF2 stereo recovery",juce::dontSendNotification); title.setFont(juce::FontOptions(21.0f)); title.setAccessible(false); addAndMakeVisible(title);
+        title.setText(sf2MultiOutput?"LSFX 0.99.2 TEST27.1":"LSFX 0.99.2 TEST27.1 SF2 stereo recovery",juce::dontSendNotification); title.setFont(juce::FontOptions(21.0f)); title.setAccessible(false); addAndMakeVisible(title);
         status.setText("No SoundFont loaded",juce::dontSendNotification); status.setTitle("Instrument status"); addAndMakeVisible(status);
         setup(open,"Open SF2 or SFZ",1); setup(parameters,"Parameters",2); setup(channel,"MIDI channel",3); setup(bank,"Bank",37); setup(program,"Program",38); setup(level,"Master output gain",36);
         setup(grid,"Parameter grid",1); setup(value,"Parameter value",2); setup(closeGrid,"Close parameters",3);
@@ -2408,8 +2408,8 @@ private:
         if(!snapshot.ready||snapshot.presets.empty()) {exportMessage("The map is empty. Nothing to export.",from);return;}
         std::vector<lsfx::sf2export::Entry> entries;
         for(const auto& p:snapshot.presets) {
-            if(p.sfzIndex>=0||juce::File(p.path).hasFileExtension("sfz")) {exportMessage("TEST27 exports SF2 only. The map contains SFZ instruments. Nothing was exported; SFZ conversion is not yet available.",from);return;}
-            if(!juce::File(p.path).hasFileExtension("sf2")) {exportMessage("TEST27 exports uncompressed SF2 sources only. Nothing was exported.",from);return;}
+            if(p.sfzIndex>=0||juce::File(p.path).hasFileExtension("sfz")) {exportMessage("TEST27.1 exports SF2 only. The map contains SFZ instruments. Nothing was exported; SFZ conversion is not yet available.",from);return;}
+            if(!juce::File(p.path).hasFileExtension("sf2")) {exportMessage("TEST27.1 exports uncompressed SF2 sources only. Nothing was exported.",from);return;}
             if(p.bank>128) {exportMessage("A mapped bank is outside the standard SF2 range 0 to 128. Nothing was exported.",from);return;}
             entries.push_back({exportPath(juce::File(p.path)),p.sourceBank,p.sourceProgram,p.bank,p.program});
         }

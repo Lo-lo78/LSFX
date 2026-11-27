@@ -174,3 +174,7 @@ Alt+O opens the native file chooser immediately, including from the parameter gr
 
 ## 0.99.2 TEST27 — 27 November 2026
 Selective lossless SF2 assembly from the committed virtual map, with Alt+E, a cancellable worker, and native reload validation. SFZ conversion remains a separate stage. No audio engine or plug-in identifiers changed.
+
+## TEST27.1 — FluidSynth dependency update
+
+Allow FluidSynth 2.6.3 as well as 2.6.2 in the overlay preparation script. The VLA patch still applies; no audio or export algorithm changes.
