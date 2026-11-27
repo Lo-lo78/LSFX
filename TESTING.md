@@ -163,3 +163,6 @@ Local native trim check: `python Tests/FluidStereoTrimTest.py /path/to/FluidR3.s
 ## TEST31.1 — dependency patch installation
 
 Run `python Tests/FluidNotePatchTest.py`. The synthetic fixtures verify LF and CRLF, unrelated context changes, idempotence, missing/duplicate anchor rejection, unmodified shared extraction, CMake integration, 2.6.2/2.6.3 allowlist and rejection of other versions. On Windows the workflow then installs patched FluidSynth and runs the existing 128-group and processor smoke tests. Local fixture checks do not prove the real dependency compiles or sounds correct; inspect `fluid-note-patch-test.txt`, `vcpkg.txt`, and `fluid-note-routing.txt`.
+
+## TEST31.2 — vcpkg host Python regression
+Run `python Tests/FluidNotePatchTest.py`. The generated CMake insertion is tested with an empty PATH and a mocked vcpkg host-tool acquisition returning the absolute Python executable. Real vcpkg acquisition and the patched Windows library/audio tests remain mandatory in CI.

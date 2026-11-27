@@ -6,6 +6,7 @@ import sys
 import tempfile
 import shutil
 import json
+import os
 sys.dont_write_bytecode = True
 TOOLS = Path(__file__).resolve().parents[1] / 'Tools'
 sys.path.insert(0, str(TOOLS))
@@ -75,15 +76,20 @@ with tempfile.TemporaryDirectory() as tmp:
         extraction, rest = script.split('\n)\n', 1)
         assert 'fluidsynth-vla-size.patch' in extraction and 'vendor.patch' in extraction
         assert 'fluidsynth-note-routing.patch' not in extraction
+        assert 'vcpkg_find_acquire_program(PYTHON3)' in rest
+        assert 'find_program(LSFX_PYTHON' not in rest
         assert 'ApplyFluidNoteRouting.py' in rest and 'set(SOURCE_PATH "${LSFX_PATCHED_SOURCE_PATH}")' in rest
         assert (overlay / 'ApplyFluidNoteRouting.py').is_file()
         # Execute the generated CMake insertion against a synthetic extraction.
         original = tmp / f'extracted-{version}'; fixture(original, True, True)
         before = snapshot(original)
         cmake = tmp / 'test.cmake'
-        cmake.write_text(f'set(SOURCE_PATH "{original.as_posix()}")\nset(CURRENT_PORT_DIR "{overlay.as_posix()}")\n' + rest)
-        subprocess.run(['cmake', '-P', str(cmake)], check=True)
+        cmake.write_text(f'function(vcpkg_find_acquire_program name)\n  if(NOT name STREQUAL \"PYTHON3\")\n    message(FATAL_ERROR \"Unexpected host tool\")\n  endif()\n  set(PYTHON3 \"{Path(sys.executable).as_posix()}\" PARENT_SCOPE)\nendfunction()\nset(SOURCE_PATH "{original.as_posix()}")\nset(CURRENT_PORT_DIR "{overlay.as_posix()}")\n' + rest)
+        # Simulate vcpkg's sanitized PATH; only the acquired absolute Python is usable.
+        cmake_exe = shutil.which('cmake')
+        assert cmake_exe
+        subprocess.run([cmake_exe, '-P', str(cmake)], check=True, env={**os.environ, 'PATH': ''})
         assert snapshot(original) == before, 'shared source changed'
         patched = Path(str(original) + '-lsfx-note-routing')
         assert b'lsfx_note_gain' in (patched / 'src/synth/fluid_voice.c').read_bytes()
-print('PASS: LF, CRLF, changed context, repeat, missing/duplicate anchor, two supported versions, private CMake source copy, unsupported version rejection')
+print('PASS: LF, CRLF, changed context, repeat, missing/duplicate anchor, two supported versions, private CMake source copy with empty PATH and mocked host-tool acquisition, unsupported version rejection')

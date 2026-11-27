@@ -1,4 +1,4 @@
-# LSFX 0.99.2 TEST31.1 — SF2 note routing and keyboard navigation
+# LSFX 0.99.2 TEST31.2 — SF2 note routing and keyboard navigation
 
 27 November 2026 · Windows x64 VST3 · Lo-lo
 
@@ -53,3 +53,6 @@ TEST27.1 build fix: accept the reviewed FluidSynth 2.6.3 vcpkg port while retain
 ## TEST31.1 — FluidSynth patch installation fix
 
 The TEST31 build failed while vcpkg applied the voice-routing diff. The same code changes are now applied to a private copy of the extracted FluidSynth sources using ten unique code anchors, independent of unrelated diff context and LF/CRLF line endings. Missing or ambiguous anchors abort the build. The VLA patch and native SF2 note routing / hybrid processor tests remain mandatory. No change to LSFX DSP or keyboard behavior. The installer regression test passes locally with synthetic source fixtures; a complete Windows dependency build and audio verification remain required.
+
+## TEST31.2 — vcpkg host Python fix
+The overlay now uses `vcpkg_find_acquire_program(PYTHON3)` instead of searching the sanitized Windows PATH. The VLA and note-routing patches and mandatory audio smoke tests are unchanged.

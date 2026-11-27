@@ -41,13 +41,18 @@ match = re.search(r'(?ms)^vcpkg_from_github\(.*?^\)[ \t]*$', text)
 if not match or not re.search(r'\bOUT_SOURCE_PATH[ \t]+SOURCE_PATH\b', match.group(0)):
     raise SystemExit('FluidSynth port extraction has changed; refusing unpatched build.')
 extra = r'''
-# LSFX TEST31.1: apply the same reviewed delta by code anchors.
+# LSFX TEST31.2: apply the same reviewed delta by code anchors.
 set(LSFX_PATCHED_SOURCE_PATH "${SOURCE_PATH}-lsfx-note-routing")
 file(REMOVE_RECURSE "${LSFX_PATCHED_SOURCE_PATH}")
 file(MAKE_DIRECTORY "${LSFX_PATCHED_SOURCE_PATH}")
 file(COPY "${SOURCE_PATH}/" DESTINATION "${LSFX_PATCHED_SOURCE_PATH}")
-find_program(LSFX_PYTHON NAMES python3 python REQUIRED)
-execute_process(COMMAND "${LSFX_PYTHON}" "${CURRENT_PORT_DIR}/ApplyFluidNoteRouting.py"
+# vcpkg sanitizes PATH on Windows; use its supported host-tool acquisition.
+vcpkg_find_acquire_program(PYTHON3)
+if(NOT IS_ABSOLUTE "${PYTHON3}" OR NOT EXISTS "${PYTHON3}")
+    message(FATAL_ERROR "LSFX: vcpkg did not provide an absolute Python 3 executable: ${PYTHON3}")
+endif()
+message(STATUS "LSFX note routing patch Python: ${PYTHON3}")
+execute_process(COMMAND "${PYTHON3}" "${CURRENT_PORT_DIR}/ApplyFluidNoteRouting.py"
     "${LSFX_PATCHED_SOURCE_PATH}" RESULT_VARIABLE LSFX_NOTE_PATCH_RESULT)
 if(NOT "${LSFX_NOTE_PATCH_RESULT}" STREQUAL "0")
     message(FATAL_ERROR "LSFX FluidSynth note routing patch failed: ${LSFX_NOTE_PATCH_RESULT}")
