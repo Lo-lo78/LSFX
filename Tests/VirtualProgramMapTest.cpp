@@ -1,4 +1,5 @@
 #include "../Source/VirtualProgramMap.h"
+#include "../Source/NoteAssignments.h"
 #include <cassert>
 #include <string>
 struct P {int bank,program,sourceBank,sourceProgram;std::string source;};
@@ -40,4 +41,38 @@ int main() {
     assert(gains.size()==2&&gains.at(address(128,0))==-2.0f);
     eraseInstrumentGains(gains,1,3);
     assert(gains.size()==1&&gains.count(address(128,0)));
+    // Tombstones applied in order must remove base or imported addresses without
+    // revealing earlier layers. Subsequent import can intentionally refill them.
+    std::map<int,P> layered;
+    for(auto p:a) assignProgram(layered,p,p.bank,p.program);
+    clearAddress(layered,0,3);
+    assert(layered.count(address(0,0))&&!layered.count(address(0,3)));
+    assignProgram(layered,b[0],0,3);
+    clearAddress(layered,0,-1);
+    assert(layered.size()==1&&layered.count(address(128,0)));
+    assignProgram(layered,a[0],0,0);
+    assert(layered.size()==2);
+    clearAddress(layered,0,-2); // invalid request must not delete an entire bank
+    assert(layered.size()==2);
+    NoteAssignments notes;
+    setNoteAssignment(notes,address(0,0),36,{1,20,-10,-20});
+    setNoteAssignment(notes,address(0,0),38,{2,-10,0,0});
+    setNoteAssignment(notes,address(128,0),36,{3,0,0,0});
+    assert(noteAssignment(notes,address(0,0),36).output==1);
+    assert(noteAssignment(notes,address(128,0),36).output==3);
+    assert(noteAssignment(notes,address(0,0),37).isDefault());
+    setNoteAssignment(notes,address(0,0),36,{});
+    assert(notes.at(address(0,0)).size()==1);
+    setNoteAssignment(notes,address(0,0),38,{100,-999,999,-9999});
+    auto n=noteAssignment(notes,address(0,0),38);
+    assert(n.output==maxOutputRoute&&n.level==-600&&n.pan==100&&n.pitch==-1200);
+    static_assert(stereoOutputCount==64&&monoOutputCount==128);
+    for(int route=-1;route<stereoOutputCount;++route) {
+        setNoteAssignment(notes,address(0,0),38,{route,-10,0,0});
+        assert(noteAssignment(notes,address(0,0),38).output==route);
+    }
+    clearAddress(notes,0,0);
+    assert(notes.size()==1&&notes.count(address(128,0)));
+    clearAddress(notes,128,-1);
+    assert(notes.empty());
 }

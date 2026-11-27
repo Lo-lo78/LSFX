@@ -21,7 +21,9 @@
 #include <vector>
 #include <functional>
 #include <map>
+#include <iterator>
 #include "VirtualProgramMap.h"
+#include "NoteAssignments.h"
 #include "SoundFontExport.h"
 #include "SfzSoundFontExport.h"
 #if JUCE_WINDOWS
@@ -57,7 +59,7 @@ lsfx::sfzexport::Audio decodeSfzExportSample(juce::AudioFormatManager& formats,c
     return a;
 }
 constexpr int channels = 16;
-constexpr auto lsfxVersion="0.99.2 TEST28";
+constexpr auto lsfxVersion="0.99.2 TEST30";
 constexpr auto lsfxReleaseDate="27 November 2026 (test build)";
 constexpr auto lsfxProjectUrl="https://github.com/Lo-lo78/LSFX";
 constexpr auto lsfxContactEmail="vmanolo301@gmail.com";
@@ -69,7 +71,7 @@ void rememberSetting(const juce::String& key,const juce::String& value) { juce::
 bool insideLibrary(const juce::File& f) { const auto root=presetRoot(); return f==root||f.isAChildOf(root); }
 juce::File savedDirectory() { const auto path=setting("saveDirectory"); if(juce::File::isAbsolutePath(path)) { juce::File f(path); if(insideLibrary(f)&&f.isDirectory()) return f; } return presetRoot(); }
 
-constexpr int stereoBuses=17, renderChunk=1024;
+constexpr int stereoBuses=lsfx::stereoOutputCount, renderChunk=1024;
 // TEST26.1: multigroup is the default validation build. The stereo-only
 // recovery build remains selectable at configure time. Windows host stability
 // is not established by the standalone tests.
@@ -132,8 +134,13 @@ int controlIndex(int ch,int id) { return ch*slots+id; }
 const ControlSpec* sf2Spec(int id) { for(const auto& c:sf2Controls) if(c.id==id) return &c; return nullptr; }
 struct CCLabel { int cc; juce::String name; int initial=unset; };
 struct Preset { int bank, program; juce::String name; juce::String path; int sourceBank=0, sourceProgram=0, font=-1, sfzIndex=-1; };
-struct MapEdit { int bank=0, program=-1, sourceBank=0, sourceProgram=0; juce::String path; };
+struct MapEdit { int bank=0, program=-1, sourceBank=0, sourceProgram=0; juce::String path; bool clear=false; };
 using MapEdits=std::vector<MapEdit>;
+static juce::String mapDisplayPath(const juce::String& base,const MapEdits& edits) {
+    if(base.isNotEmpty())return base;
+    for(const auto& e:edits)if(!e.clear&&e.path.isNotEmpty())return e.path;
+    return {};
+}
 const Preset* findPreset(const std::vector<Preset>& list,int code) {
     const auto it=std::lower_bound(list.begin(),list.end(),code,[](const Preset& a,int key){return pack(a.bank,a.program)<key;});
     return it!=list.end()&&pack(it->bank,it->program)==code?&*it:nullptr;
@@ -315,7 +322,7 @@ struct Engine {
 };
 using Programs = std::array<int, channels>;
 Programs defaults() { Programs p{}; p[9] = pack(128, 0); return p; }
-struct Request { juce::String path; double rate = 44100; Programs programs = defaults(); uint64_t serial = 0; Controls controls=emptyControls(); MapEdits edits; int sfzCode=0; std::optional<InstrumentGains> restoredGains; int resetGainBank=-1,resetGainProgram=-1; };
+struct Request { juce::String path; double rate = 44100; Programs programs = defaults(); uint64_t serial = 0; Controls controls=emptyControls(); MapEdits edits; int sfzCode=0; std::optional<InstrumentGains> restoredGains; int resetGainBank=-1,resetGainProgram=-1; std::optional<lsfx::NoteAssignments> restoredNotes; };
 struct View { juce::String path, status = "No SoundFont loaded"; std::vector<Preset> presets; uint64_t revision = 0; bool loading = false; bool ready=false; std::map<juce::String,std::vector<CCLabel>> labels; };
 }
 
@@ -393,8 +400,8 @@ public:
         const auto old = hostRate.exchange(rate);
         if (std::abs(old-rate)>0.01) {
             juce::String path; Programs p; Controls c; MapEdits edits; int sfzCode=0;
-            InstrumentGains savedGains; stateForSave(path,p,&c,&edits,&sfzCode,&savedGains);
-            if (path.isNotEmpty()||!edits.empty()) load(path,p,c,std::move(edits),sfzCode,false,std::move(savedGains));
+            InstrumentGains savedGains; lsfx::NoteAssignments savedNotes; stateForSave(path,p,&c,&edits,&sfzCode,&savedGains,&savedNotes);
+            if (path.isNotEmpty()||!edits.empty()) load(path,p,c,std::move(edits),sfzCode,false,std::move(savedGains),-1,-1,std::move(savedNotes));
         }
     }
     void releaseResources() override { panic.store(true); }
@@ -411,7 +418,7 @@ public:
         panic.store(true);
         setCurrentPresetFile(juce::File{});
         setUiChannel(0);
-        load({},defaults(),emptyControls(),{},0,false,InstrumentGains{});
+        load({},defaults(),emptyControls(),{},0,false,InstrumentGains{},-1,-1,lsfx::NoteAssignments{});
         for(auto* parameter:getParameters()) {
             if(parameter->getValue()!=parameter->getDefaultValue()) {
                 parameter->beginChangeGesture();
@@ -459,6 +466,36 @@ public:
         if(path.isEmpty()&&edits.size()==1) for(int i=0;i<channels;++i) if(i!=ch&&p[i]==code) p[i]=pack(code>>7,(code+1)&127);
         p[ch]=code; load(path,p,c,std::move(edits),sfzCode,true,std::nullopt,code>>7,code&127); return juce::Result::ok();
     }
+    juce::Result clearLocation(int bank,int program) {
+        if(program<-1||!lsfx::validAddress(bank,program<0?0:program)) return juce::Result::fail("Invalid destination");
+        const auto v=getView();
+        if(v.loading) return juce::Result::fail("Wait for the current load to finish");
+        const auto matches=[&](const Preset& item){return item.bank==bank&&(program<0||item.program==program);};
+        const auto count=std::count_if(v.presets.begin(),v.presets.end(),matches);
+        if(count==0) return juce::Result::ok();
+        juce::String path; Programs p; Controls c; MapEdits edits; int sfzCode=0;
+        stateForSave(path,p,&c,&edits,&sfzCode);
+        // If this was the last mapped material, release the entire engine and all sources.
+        if(static_cast<size_t>(count)==v.presets.size()) {
+            load({},p,c,{},0,true,InstrumentGains{},-1,-1,lsfx::NoteAssignments{});
+        } else {
+            edits.erase(std::remove_if(edits.begin(),edits.end(),[&](const MapEdit& e){return e.bank==bank&&(program<0||e.program==program);}),edits.end());
+            // Tombstone masks the original base map or a previously imported bank.
+            edits.push_back({bank,program,0,0,{},true});
+            load(path,p,c,std::move(edits),sfzCode,true,std::nullopt,bank,program);
+        }
+        return juce::Result::ok();
+    }
+    std::map<int,lsfx::NoteAssignment> notesForProgram(int code) {
+        std::lock_guard<std::mutex> lock(noteMutex);
+        auto it=noteAssignments.find(code);return it==noteAssignments.end()?std::map<int,lsfx::NoteAssignment>{}:it->second;
+    }
+    void setNote(int code,int note,lsfx::NoteAssignment value) {
+        std::lock_guard<std::mutex> lock(noteMutex);lsfx::setNoteAssignment(noteAssignments,code,note,value);
+    }
+    void clearNotes(int code) {std::lock_guard<std::mutex> lock(noteMutex);noteAssignments.erase(code);}
+    void setNoteLearnChannel(int ch) noexcept {noteLearnChannel.store(ch);}
+    uint64_t lastLearnedNote() const noexcept {return learnedNote.load();}
     juce::File currentPresetFile() { std::lock_guard<std::mutex> lock(presetMutex); return currentPreset; }
     void setCurrentPresetFile(const juce::File& f) { std::lock_guard<std::mutex> lock(presetMutex); currentPreset=f; }
     juce::Result savePresetFile(const juce::File& f) {
@@ -482,6 +519,7 @@ public:
             if(!juce::File(path).existsAsFile()) { missing=path; return juce::Result::fail("Instrument file not found"); }
         }
         for(auto* entry=xml->getFirstChildElement();entry;entry=entry->getNextElement()) if(entry->hasTagName("MapEdit")) {
+            if(entry->getBoolAttribute("clear",false)&&entry->getStringAttribute("path").isEmpty()) continue;
             const auto mapped=entry->getStringAttribute("path");
             if(!juce::File::isAbsolutePath(mapped)) return juce::Result::fail("Invalid instrument path: "+mapped);
             if(!juce::File(mapped).existsAsFile()) {missing=mapped; return juce::Result::fail("Instrument file not found");}
@@ -495,7 +533,7 @@ public:
             effects->setValueNotifyingHost(effects->convertTo0to1(3.0f));
         auto p=defaults();
         if(f.hasFileExtension("sfz")) for(int ch=1;ch<channels;++ch) if(p[ch]==0) p[ch]=pack(0,1);
-        load(f.getFullPathName(),p,emptyControls(),{},0,false,InstrumentGains{});
+        load(f.getFullPathName(),p,emptyControls(),{},0,false,InstrumentGains{},-1,-1,lsfx::NoteAssignments{});
     }
     juce::AudioParameterFloat& gainParameter() { return *gain; }
     juce::AudioParameterFloat& channelGainParameter(int ch) { return *channelGain[static_cast<size_t>(ch)]; }
@@ -648,6 +686,10 @@ public:
                 switch(status&0xf0) {
                     case 0x80: if(n>=3) { if(auto* z=engine->sfzActive[ch]) sfizz_send_note_off(z->synth,0,a,v); else fluid_synth_noteoff(s,ch,a); } break;
                     case 0x90: if(n>=3) {
+                        if(v&&noteLearnChannel.load(std::memory_order_relaxed)==ch) {
+                            const uint64_t address=static_cast<uint64_t>(selected[ch].load());
+                            learnedNote.store((uint64_t(++noteEventSerial)<<32)|(address<<7)|uint64_t(a),std::memory_order_relaxed);
+                        }
                         if(auto* z=engine->sfzActive[ch]) { if(v) sfizz_send_note_on(z->synth,0,a,v); else sfizz_send_note_off(z->synth,0,a,0); }
                         else if(const auto* preset=findPreset(engine->map,selected[ch].load());preset&&preset->sfzIndex<0) { if(v) fluid_synth_noteon(s,ch,a,v); else fluid_synth_noteoff(s,ch,a); }
                     } break;
@@ -696,17 +738,22 @@ public:
         midi.clear();
     }
     void getStateInformation(juce::MemoryBlock& dest) override {
-        juce::String path; Programs p; Controls c; MapEdits edits; int sfzCode=0; InstrumentGains savedGains; stateForSave(path,p,&c,&edits,&sfzCode,&savedGains);
+        juce::String path; Programs p; Controls c; MapEdits edits; int sfzCode=0; InstrumentGains savedGains; lsfx::NoteAssignments savedNotes; stateForSave(path,p,&c,&edits,&sfzCode,&savedGains,&savedNotes);
         juce::XmlElement x("LSoundFontState");
         x.setAttribute("uiChannel",uiChannel());
-        x.setAttribute("version",13); x.setAttribute("sfzCode",sfzCode); x.setAttribute("midiFX",midiFX->getIndex()); for(int i=0;i<fxCount;++i) x.setAttribute(fxSpecs[i].key,i==drumTrim?0:readFXValue(i)); x.setAttribute("sfzQuality",sfzQuality->getIndex()); x.setAttribute("quality",quality->getIndex()); x.setAttribute("effects",effects->getIndex()); x.setAttribute("file",path); x.setAttribute("gain",static_cast<double>(gain->get()));
+        x.setAttribute("version",14); x.setAttribute("sfzCode",sfzCode); x.setAttribute("midiFX",midiFX->getIndex()); for(int i=0;i<fxCount;++i) x.setAttribute(fxSpecs[i].key,i==drumTrim?0:readFXValue(i)); x.setAttribute("sfzQuality",sfzQuality->getIndex()); x.setAttribute("quality",quality->getIndex()); x.setAttribute("effects",effects->getIndex()); x.setAttribute("file",path); x.setAttribute("gain",static_cast<double>(gain->get()));
         for(int i=0;i<channels;++i) { x.setAttribute("ch"+juce::String(i+1),p[i]); x.setAttribute(channelGainId(i),double(channelGain[i]->get())); x.setAttribute(routeId(i),channelRoute[i]->getIndex()); }
         for(int ch=0;ch<channels;++ch) for(int i=0;i<lsfx::compCount;++i) x.setAttribute(compressorId(ch,i),double(compressorValue(ch,i)));
         for(int i=0;i<controlCount;++i) if(c[i]!=unset) {
             auto* entry=x.createNewChildElement("Control"); entry->setAttribute("index",i); entry->setAttribute("value",c[i]);
         }
-        for(const auto& e:edits) {auto* entry=x.createNewChildElement("MapEdit"); entry->setAttribute("bank",e.bank);entry->setAttribute("program",e.program);entry->setAttribute("sourceBank",e.sourceBank);entry->setAttribute("sourceProgram",e.sourceProgram);entry->setAttribute("path",e.path);}
+        for(const auto& e:edits) {auto* entry=x.createNewChildElement("MapEdit"); entry->setAttribute("bank",e.bank);entry->setAttribute("program",e.program);entry->setAttribute("sourceBank",e.sourceBank);entry->setAttribute("sourceProgram",e.sourceProgram);entry->setAttribute("path",e.path);if(e.clear)entry->setAttribute("clear",true);}
         for(const auto& item:savedGains) {auto* entry=x.createNewChildElement("InstrumentGain"); entry->setAttribute("address",item.first); entry->setAttribute("db",double(item.second));}
+        for(const auto& program:savedNotes) for(const auto& item:program.second) {
+            const auto& v=item.second;auto* entry=x.createNewChildElement("NoteAssignment");
+            entry->setAttribute("address",program.first);entry->setAttribute("note",item.first);entry->setAttribute("output",v.output);
+            entry->setAttribute("level",v.level);entry->setAttribute("pan",v.pan);entry->setAttribute("pitch",v.pitch);
+        }
         const auto preset=currentPresetFile();
         if(preset!=juce::File{}&&preset.isAChildOf(presetRoot())) x.setAttribute("presetFile",preset.getRelativePathFrom(presetRoot()));
         copyXmlToBinary(x,dest);
@@ -747,7 +794,11 @@ public:
             MapEdits edits;
             for(auto* entry=x->getFirstChildElement();entry;entry=entry->getNextElement()) if(entry->hasTagName("MapEdit")) {
                 MapEdit e{entry->getIntAttribute("bank",-1),entry->getIntAttribute("program",-2),entry->getIntAttribute("sourceBank",-1),entry->getIntAttribute("sourceProgram",-1),entry->getStringAttribute("path")};
-                if(e.program>=-1&&lsfx::validAddress(e.bank,e.program<0?0:e.program)&&lsfx::validAddress(e.sourceBank,e.sourceProgram)&&juce::File::isAbsolutePath(e.path)&&(juce::File(e.path).hasFileExtension("sf2;sf3")||(e.program>=0&&juce::File(e.path).hasFileExtension("sfz")))) edits.push_back(std::move(e));
+                e.clear=entry->getBoolAttribute("clear",false);
+                if(e.program>=-1&&lsfx::validAddress(e.bank,e.program<0?0:e.program)) {
+                    if(e.clear&&e.path.isEmpty()) edits.push_back(std::move(e));
+                    else if(!e.clear&&lsfx::validAddress(e.sourceBank,e.sourceProgram)&&juce::File::isAbsolutePath(e.path)&&(juce::File(e.path).hasFileExtension("sf2;sf3")||(e.program>=0&&juce::File(e.path).hasFileExtension("sfz")))) edits.push_back(std::move(e));
+                }
             }
             const auto basePath=x->getStringAttribute("file");
             const int baseCode=juce::jlimit(0,pack(16383,127),x->getIntAttribute("sfzCode",0));
@@ -759,7 +810,12 @@ public:
                 const int code=entry->getIntAttribute("address",-1); const auto db=entry->getDoubleAttribute("db",0.0);
                 if(code>=0&&code<=pack(16383,127)&&std::isfinite(db)&&db!=0.0) restored[code]=juce::jlimit(sfzGainMin,sfzGainMax,float(db));
             }
-            load(basePath,p,c,std::move(edits),baseCode,false,std::move(restored));
+            lsfx::NoteAssignments restoredNotes;
+            for(auto* entry=x->getFirstChildElement();entry;entry=entry->getNextElement()) if(entry->hasTagName("NoteAssignment")) {
+                lsfx::setNoteAssignment(restoredNotes,entry->getIntAttribute("address",-1),entry->getIntAttribute("note",-1),
+                    {entry->getIntAttribute("output",-1),entry->getIntAttribute("level",0),entry->getIntAttribute("pan",0),entry->getIntAttribute("pitch",0)});
+            }
+            load(basePath,p,c,std::move(edits),baseCode,false,std::move(restored),-1,-1,std::move(restoredNotes));
         }
     }
 private:
@@ -1030,6 +1086,11 @@ private:
     std::atomic<bool> panic{false}, clearing{false};
     std::mutex engineMutex, requestMutex, viewMutex;
     InstrumentGains instrumentGains; // protected by engineMutex, already held during render
+    std::mutex noteMutex;
+    lsfx::NoteAssignments noteAssignments;
+    std::atomic<int> noteLearnChannel{-1};
+    std::atomic<uint64_t> learnedNote{0};
+    uint32_t noteEventSerial=0; // written only by processBlock
     std::condition_variable cv;
     std::unique_ptr<Engine> engine;
     std::thread worker;
@@ -1093,7 +1154,7 @@ private:
             }
         }
     }
-    void stateForSave(juce::String& path, Programs& p, Controls* controls=nullptr,MapEdits* edits=nullptr,int* sfzCode=nullptr,InstrumentGains* savedGains=nullptr) {
+    void stateForSave(juce::String& path, Programs& p, Controls* controls=nullptr,MapEdits* edits=nullptr,int* sfzCode=nullptr,InstrumentGains* savedGains=nullptr,lsfx::NoteAssignments* savedNotes=nullptr) {
         std::lock_guard<std::mutex> lock(requestMutex);
         path=latest.path; if(edits) *edits=latest.edits; if(sfzCode) *sfzCode=latest.sfzCode;
         if(savedGains) {
@@ -1101,13 +1162,18 @@ private:
             *savedGains=latest.restoredGains?*latest.restoredGains:instrumentGains;
             if(latest.resetGainBank>=0) lsfx::eraseInstrumentGains(*savedGains,latest.resetGainBank,latest.resetGainProgram);
         }
+        if(savedNotes) {
+            std::lock_guard<std::mutex> notes(noteMutex);
+            *savedNotes=latest.restoredNotes?*latest.restoredNotes:noteAssignments;
+            if(latest.resetGainBank>=0) lsfx::clearAddress(*savedNotes,latest.resetGainBank,latest.resetGainProgram);
+        }
         if(controls) *controls=(pending||loadingSerial!=0||failedSerial==latest.serial)?latest.controls:overrides;
         // While a new bank is loading retain the requested state, not old programs.
         if (pending || loadingSerial!=0 || failedSerial==latest.serial) p=latest.programs;
         else for(int i=0;i<channels;++i) { int cmd=commands[i].load(); p[i]=cmd>=0 ? cmd : selected[i].load(); }
     }
     uint64_t loadingSerial=0, failedSerial=~uint64_t(0);
-    void load(const juce::String& path,Programs p,Controls c=emptyControls(),MapEdits edits={},int sfzCode=0,bool preserveOnFailure=false,std::optional<InstrumentGains> restoredGains=std::nullopt,int resetGainBank=-1,int resetGainProgram=-1) {
+    void load(const juce::String& path,Programs p,Controls c=emptyControls(),MapEdits edits={},int sfzCode=0,bool preserveOnFailure=false,std::optional<InstrumentGains> restoredGains=std::nullopt,int resetGainBank=-1,int resetGainProgram=-1,std::optional<lsfx::NoteAssignments> restoredNotes=std::nullopt) {
         { std::lock_guard<std::mutex> lock(requestMutex);
           importRollback.reset();
           if(preserveOnFailure&&!pending&&loadingSerial==0) {
@@ -1117,10 +1183,10 @@ private:
                   for(int i=0;i<channels;++i) importRollback->programs[i]=current(i);
               }
           }
-          latest={path,hostRate.load(),p,latest.serial+1,c,std::move(edits),sfzCode,std::move(restoredGains),resetGainBank,resetGainProgram}; pending=true;
+          latest={path,hostRate.load(),p,latest.serial+1,c,std::move(edits),sfzCode,std::move(restoredGains),resetGainBank,resetGainProgram,std::move(restoredNotes)}; pending=true;
           const bool empty=path.isEmpty()&&latest.edits.empty();
           if(empty) clearing.store(true);
-          const auto display=path.isNotEmpty()?path:latest.edits.empty()?juce::String{}:latest.edits.front().path;
+          const auto display=mapDisplayPath(path,latest.edits);
           std::lock_guard<std::mutex> ui(viewMutex); view.loading=true; view.status=empty?"Unloading SoundFont":"Loading "+juce::File(display).getFileName(); ++view.revision;
         }
         cv.notify_one();
@@ -1180,6 +1246,7 @@ private:
                         }
                         for(const auto& e:r.edits) {
                             if(error.isNotEmpty()) break;
+                            if(e.clear) {lsfx::clearAddress(mapped,e.bank,e.program);continue;}
                             if(juce::File(e.path).hasFileExtension("sfz")) { if(e.program<0) {error="SFZ cannot replace a bank";break;} mapSfz(e.path,e.bank,e.program); continue; }
                             const auto* list=source(e.path); if(!list) break;
                             if(e.program<0) {
@@ -1264,10 +1331,14 @@ private:
                 }
                 clearing.store(false);
               }
-              latest.restoredGains.reset(); latest.resetGainBank=-1; latest.resetGainProgram=-1;
+              { std::lock_guard<std::mutex> notes(noteMutex);
+                if(r.restoredNotes) noteAssignments=std::move(*r.restoredNotes);
+                if(error.isEmpty()&&r.resetGainBank>=0) lsfx::clearAddress(noteAssignments,r.resetGainBank,r.resetGainProgram);
+              }
+              latest.restoredNotes.reset(); latest.restoredGains.reset(); latest.resetGainBank=-1; latest.resetGainProgram=-1;
               loadingSerial=0; failedSerial=error.isNotEmpty()?r.serial:~uint64_t(0);
               { std::lock_guard<std::mutex> ui(viewMutex);
-                view.ready=error.isEmpty()&&!empty; view.labels=std::move(labels); view.path=r.path.isNotEmpty()?r.path:r.edits.empty()?juce::String{}:r.edits.front().path; view.presets=error.isEmpty()?std::move(presets):std::vector<Preset>{}; view.loading=false;
+                view.ready=error.isEmpty()&&!empty; view.labels=std::move(labels); view.path=mapDisplayPath(r.path,r.edits); view.presets=error.isEmpty()?std::move(presets):std::vector<Preset>{}; view.loading=false;
                 view.status=error.isNotEmpty()?error:empty?"No SoundFont loaded":"Loaded: "+juce::File(view.path).getFileName()+"; "+juce::String(static_cast<int>(view.presets.size()))+" mapped programs"+(sf2MultiOutput?juce::String():juce::String("; SF2 Main 1/2 only"));
                 ++view.revision;
               }
@@ -1345,7 +1416,7 @@ public:
     explicit Editor(Processor& p) : AudioProcessorEditor(p), proc(p) {
         setWantsKeyboardFocus(true);
         setFocusContainerType(juce::Component::FocusContainerType::keyboardFocusContainer);
-        title.setText(sf2MultiOutput?"LSFX 0.99.2 TEST28":"LSFX 0.99.2 TEST28 SF2 stereo recovery",juce::dontSendNotification); title.setFont(juce::FontOptions(21.0f)); title.setAccessible(false); addAndMakeVisible(title);
+        title.setText(sf2MultiOutput?"LSFX 0.99.2 TEST30":"LSFX 0.99.2 TEST30 SF2 stereo recovery",juce::dontSendNotification); title.setFont(juce::FontOptions(21.0f)); title.setAccessible(false); addAndMakeVisible(title);
         status.setText("No SoundFont loaded",juce::dontSendNotification); status.setTitle("Instrument status"); addAndMakeVisible(status);
         setup(open,"Open SF2 or SFZ",1); setup(parameters,"Parameters",2); setup(channel,"MIDI channel",3); setup(bank,"Bank",37); setup(program,"Program",38); setup(level,"Master output gain",36);
         setup(grid,"Parameter grid",1); setup(value,"Parameter value",2); setup(closeGrid,"Close parameters",3);
@@ -1405,6 +1476,7 @@ public:
         setup(parentButton,"Back",2); parentButton.onClick=[this]{parentFolder();};
         setup(panelOK,"OK",2); panelOK.onClick=[this]{if(panelAction) { auto action=panelAction; action(); }};
         setup(panelCancel,"Cancel",3); panelCancel.onClick=[this]{cancelPanel();};
+        setup(noteCell,"Note assignments",1);noteCell.onClick=[this]{noteEditing=!noteEditing;updateNoteCell(true);};
         panelText.setTitle("Preset name"); panelText.setWantsKeyboardFocus(true); panelText.setExplicitFocusOrder(1); panelText.addKeyListener(this); addAndMakeVisible(panelText);
         panelText.onReturnKey=[this]{if(panelMode==Panel::name&&panelAction) {auto action=panelAction;action();}};
         panelText.onEscapeKey=[this]{cancelPanel();};
@@ -1437,9 +1509,10 @@ public:
         startTimerHz(5);
         scheduleInitialFocus();
     }
-    ~Editor() override { if(panelMode==Panel::none&&!initialFocusPending&&!returnFromChooser&&!chooser&&!importInProgress) rememberFocus(focusId(juce::Component::getCurrentlyFocusedComponent())); juce::Desktop::getInstance().removeFocusChangeListener(this); stopTimer(); removeKeyListener(this); panelText.removeKeyListener(this); presetList.removeKeyListener(this); presetList.setModel(nullptr); chooser.reset(); if(catalogThread.joinable()) catalogThread.join(); if(exportJob) exportJob->cancel.store(true); if(exportThread.joinable()) exportThread.join(); }
+    ~Editor() override { proc.setNoteLearnChannel(-1); if(panelMode==Panel::none&&!initialFocusPending&&!returnFromChooser&&!chooser&&!importInProgress) rememberFocus(focusId(juce::Component::getCurrentlyFocusedComponent())); juce::Desktop::getInstance().removeFocusChangeListener(this); stopTimer(); removeKeyListener(this); panelText.removeKeyListener(this); presetList.removeKeyListener(this); presetList.setModel(nullptr); chooser.reset(); if(catalogThread.joinable()) catalogThread.join(); if(exportJob) exportJob->cancel.store(true); if(exportThread.joinable()) exportThread.join(); }
     void paint(juce::Graphics& g) override {
         g.fillAll(juce::Colour(0xff202429));
+        if(panelMode==Panel::notes) {paintNoteGrid(g);return;}
         if(panelMode!=Panel::none) return;
         if(!gridOpen) {
             g.setFont(juce::Font(juce::FontOptions(11.0f))); g.setColour(juce::Colours::white);
@@ -1474,6 +1547,15 @@ public:
         }
     }
     void mouseDown(const juce::MouseEvent& e) override {
+        if(panelMode==Panel::notes) {
+            if(noteArea.contains(e.getPosition())) {
+                const auto list=visibleNoteRows();const auto first=notePageStart(list);
+                const int row=(e.getPosition().y-noteArea.getY())/25-1;
+                const int col=(e.getPosition().x-noteArea.getX())/juce::jmax(1,noteArea.getWidth()/4);
+                if(row>=0&&row<12&&first+row<int(list.size())) {noteSelected=list[size_t(first+row)];noteColumn=juce::jlimit(0,3,col);noteEditing=false;focus(noteCell);updateNoteCell(true);}
+            }
+            return;
+        }
         if(panelMode!=Panel::none||!gridOpen||!gridArea.contains(e.getPosition())) return;
         const int first=(juce::jmax(0,grid.getSelectedItemIndex())/gridPageRows)*gridPageRows;
         for(int k=0;k<gridPageRows;++k) if(gridCell(k).contains(e.getPosition())&&first+k<static_cast<int>(rows.size())) {
@@ -1495,6 +1577,12 @@ public:
             auto project=a.removeFromBottom(38); a.removeFromBottom(10);
             aboutInfo.setBounds(a); aboutProject.setBounds(project); aboutContact.setBounds(contact);
             aboutClose.setBounds(close.withSizeKeepingCentre(140,36)); return;
+        }
+        if(panelMode==Panel::notes) {
+            panelLabel.setBounds(r.removeFromTop(88));r.removeFromTop(5);
+            noteCell.setBounds(r.removeFromTop(38));r.removeFromTop(10);
+            panelCancel.setBounds(r.removeFromBottom(38).removeFromRight(150));
+            noteArea=r.removeFromTop(325);return;
         }
         if(panelMode!=Panel::none) {
             panelLabel.setBounds(r.removeFromTop(82)); r.removeFromTop(8);
@@ -1535,7 +1623,13 @@ private:
     Keyed<juce::TextButton> parentButton{"Back"},panelOK{"OK"},panelCancel{"Cancel"};
     juce::TextEditor panelText;
     juce::Label panelLabel;
-    enum class Panel {none,browser,name,confirm,source,about,exportProgress};
+    enum class Panel {none,browser,name,confirm,source,about,exportProgress,notes};
+    Keyed<juce::TextButton> noteCell{"Note assignments"};
+    int noteProgram=0,noteChannel=0,noteSelected=-1,noteColumn=0;
+    bool noteEditing=false,noteLearn=true;
+    uint64_t noteEventSeen=0;
+    std::map<int,lsfx::NoteAssignment> noteRows;
+    juce::Rectangle<int> noteArea;
     Keyed<juce::TextButton> exportButton{"Export SoundFont"};
     struct ExportJob {std::atomic<bool> cancel{false},done{false}; std::atomic<int> progress{0}; juce::String message;};
     std::shared_ptr<ExportJob> exportJob;
@@ -1917,6 +2011,8 @@ private:
         if(outputCh>=0) lastGainChannel=outputCh;
         // Leave the host and the native combo popup in control of their own keys.
         if(chooser||catalogBusy) return false;
+        if(ctrl&&!alt&&!mods.isShiftDown()&&code==juce::KeyPress::returnKey&&(panelMode==Panel::none||panelMode==Panel::notes)) {proc.allOff();if(origin)speak(*origin,"All sounds off");return true;}
+        if(panelMode==Panel::notes) return handleNoteKey(k);
         if(panelMode==Panel::about) return handleAboutKey(k,origin);
         if(panelMode!=Panel::none) return handlePanelKey(k,origin);
         if(importInProgress) return true;
@@ -1963,7 +2059,7 @@ private:
                 if(vertical||page||boundary) {changeMainLevel(direction,page,boundary);return true;}
             }
             if(ch=='i') { requestInitialize(origin); return true; }
-            if(code==juce::KeyPress::returnKey) {proc.allOff(); if(origin) speak(*origin,"All sounds off"); return true;}
+            if(code==juce::KeyPress::returnKey) {openNoteGrid();return true;}
             if(ch=='a') {openAbout(); return true;}
             if(ch=='e') {browseExport();return true;}
             if(ch=='s') {showStatus(); return true;}
@@ -1975,6 +2071,9 @@ private:
             juce::Component* target=nullptr;
             if(ch=='m') target=&channel; else if(ch=='k') target=&bank; else if(ch=='p') target=&program; else if(ch=='g') target=&level; else if(ch=='u') target=&channelLevels[lastGainChannel]; else if(ch=='r') target=&routeLevels[lastRouteChannel];
             if(target) {if(target->isEnabled()) {if(gridOpen) showGrid(false,target); focus(*target);} return true;}
+        }
+        if(!gridOpen&&!alt&&!ctrl&&code==juce::KeyPress::deleteKey&&(origin==&bank||origin==&program)) {
+            if(!cached.loading) requestClearLocation(origin==&bank);return true;
         }
         if(!gridOpen&&!alt&&!ctrl&&code==juce::KeyPress::returnKey&&(origin==&bank||origin==&program)) {
             if(!cached.loading) {if(origin==&bank) browseImport(false);else browseImport(true);} return true;
@@ -2165,7 +2264,7 @@ private:
     }
     void hidePanelControls() {
         panelCancel.setDescription({});
-        for(auto* c:std::array<juce::Component*,10>{&presetList,&parentButton,&panelOK,&panelCancel,&panelText,&panelLabel,&aboutInfo,&aboutProject,&aboutContact,&aboutClose}) c->setVisible(false);
+        for(auto* c:std::array<juce::Component*,11>{&presetList,&parentButton,&panelOK,&panelCancel,&panelText,&panelLabel,&aboutInfo,&aboutProject,&aboutContact,&aboutClose,&noteCell}) c->setVisible(false);
     }
     void hideMainForPanel() {
         if(panelMode==Panel::none) {const int id=focusId(juce::Component::getCurrentlyFocusedComponent());panelReturn=id?id:proc.editorMemory.focus;}
@@ -2178,12 +2277,14 @@ private:
     }
     void closePanel(juce::Component* destination=nullptr) {
         juce::ScopedValueSetter<bool> guard(focusTransition,true);
+        if(panelMode==Panel::notes) {proc.setNoteLearnChannel(-1);startTimerHz(5);}
         panelMode=Panel::none; panelAction={}; panelCancelAction={}; sourceAction={}; sourceEntries.clear();
         hidePanelControls(); showGrid(false); initialFocusPending=false; returnFromChooser=false;
         restoreFocus(destination?focusId(destination):panelReturn);
     }
     void cancelPanel() {
         if(panelMode==Panel::none) return;
+        if(panelMode==Panel::notes) {closePanel();return;}
         if(panelMode==Panel::exportProgress&&exportJob) {if(!exportJob->done.load()) {exportJob->cancel.store(true); setPanelLabel("Cancelling SoundFont export..."); announce("Cancelling SoundFont export");} return;}
         if(panelCancelAction) { auto action=panelCancelAction; action(); }
         else closePanel();
@@ -2388,6 +2489,132 @@ private:
         if(code==juce::KeyPress::returnKey||(code==juce::KeyPress::spaceKey&&(panelOK.hasKeyboardFocus(true)||panelCancel.hasKeyboardFocus(true)))) {if(panelCancel.hasKeyboardFocus(true))cancelPanel();else if(panelAction){auto action=panelAction;action();}return true;}
         if(panelMode==Panel::confirm) return true;
         return false;
+    }
+    static juce::String noteName(int key) {
+        return juce::MidiMessage::getMidiNoteName(key,true,true,4)+", MIDI "+juce::String(key);
+    }
+    static const char* noteColumnName(int col) {
+        constexpr const char* names[]={"Output","Level","Pan","Pitch"};return names[juce::jlimit(0,3,col)];
+    }
+    lsfx::NoteAssignment selectedNoteValue(int key) const {
+        const auto it=noteRows.find(key);return it==noteRows.end()?lsfx::NoteAssignment{}:it->second;
+    }
+    static juce::String noteValue(const lsfx::NoteAssignment& v,int col) {
+        switch(col) {
+            case 0:return v.output<0?juce::String("Channel Default"):routeName(v.output);
+            case 1:return juce::String(double(v.level)/10.0,1)+" dB";
+            case 2:return v.pan==0?juce::String("Center"):juce::String(v.pan<0?"Left ":"Right ")+juce::String(std::abs(v.pan))+"%";
+            default:return juce::String(v.pitch)+" cents";
+        }
+    }
+    std::vector<int> visibleNoteRows() const {
+        std::vector<int> list;for(const auto& item:noteRows)list.push_back(item.first);
+        if(noteSelected>=0&&!noteRows.count(noteSelected)) list.insert(std::lower_bound(list.begin(),list.end(),noteSelected),noteSelected);
+        return list;
+    }
+    int notePageStart(const std::vector<int>& list) const {
+        const auto i=std::find(list.begin(),list.end(),noteSelected);return i==list.end()?0:(int(i-list.begin())/12)*12;
+    }
+    void paintNoteGrid(juce::Graphics& g) {
+        const auto list=visibleNoteRows();const auto first=notePageStart(list);const int w=noteArea.getWidth()/4;
+        g.setFont(juce::Font(juce::FontOptions(13.0f)));
+        for(int col=0;col<4;++col) {
+            auto h=juce::Rectangle<int>(noteArea.getX()+col*w,noteArea.getY(),w,25);
+            g.setColour(juce::Colour(0xffaeb9c6));g.drawText(noteColumnName(col),h.reduced(5,0),juce::Justification::centredLeft,true);
+        }
+        for(int row=0;row<12&&first+row<int(list.size());++row) {
+            const int key=list[size_t(first+row)];const auto v=selectedNoteValue(key);
+            for(int col=0;col<4;++col) {
+                const bool active=key==noteSelected&&col==noteColumn;
+                auto r=juce::Rectangle<int>(noteArea.getX()+col*w,noteArea.getY()+25*(row+1),w,25);
+                g.setColour(active?juce::Colour(0xff304d66):juce::Colour(0xff272e35));g.fillRect(r);
+                g.setColour(active?juce::Colour(0xffb0d6ff):juce::Colour(0xff657481));g.drawRect(r,active?2:1);
+                g.setColour(juce::Colours::white);g.drawFittedText(juce::MidiMessage::getMidiNoteName(key,true,true,4)+" "+juce::String(key)+": "+noteValue(v,col),r.reduced(5,1),juce::Justification::centredLeft,1);
+            }
+        }
+    }
+    void updateNoteCell(bool announceValue) {
+        const auto text=noteSelected<0?juce::String("No assigned notes. Play a MIDI note to select it."):
+            noteName(noteSelected)+", "+noteColumnName(noteColumn)+", "+noteValue(selectedNoteValue(noteSelected),noteColumn)+(noteEditing?", Edit":"");
+        noteCell.setButtonText(text);noteCell.setName(text);noteCell.setTitle(text);repaint();
+        if(announceValue)speak(noteCell,text);
+    }
+    void openNoteGrid() {
+        if(chooser||catalogBusy||importInProgress||cached.loading)return;
+        noteChannel=selectedChannel();noteProgram=proc.current(noteChannel);
+        if(!findPreset(cached.presets,noteProgram)) {announce("Select a mapped program first");return;}
+        noteRows=proc.notesForProgram(noteProgram);noteSelected=noteRows.empty()?-1:noteRows.begin()->first;noteColumn=0;noteEditing=false;noteLearn=true;
+        hideMainForPanel();hidePanelControls();panelMode=Panel::notes;
+        setPanelLabel("Note mixer draft. Audio not yet affected. Bank "+number(noteProgram>>7)+", Program "+number(noteProgram&127)+", Channel "+juce::String(noteChannel+1)+". MIDI learn on. Enter edits; Alt+M toggles learn.");
+        noteCell.setVisible(true);panelLabel.setVisible(true);panelCancel.setButtonText("Close");panelCancel.setTitle("Close");panelCancel.setVisible(true);
+        noteEventSeen=proc.lastLearnedNote();proc.setNoteLearnChannel(noteChannel);startTimerHz(30);
+        resized();updateNoteCell(false);focus(noteCell);announce(panelLabel.getText());
+    }
+    void pollNoteLearn() {
+        const auto event=proc.lastLearnedNote();if(event==noteEventSeen)return;noteEventSeen=event;
+        if(!noteLearn||!hasKeyboardFocus(true)||int((event&0xffffffffull)>>7)!=noteProgram)return;
+        noteSelected=int(event&127u);noteColumn=0;noteEditing=true;focus(noteCell);updateNoteCell(true);
+    }
+    void changeNoteValue(int direction,bool reset=false) {
+        if(noteSelected<0)return;
+        auto value=selectedNoteValue(noteSelected);const auto before=value;const lsfx::NoteAssignment defaults;
+        switch(noteColumn) {
+            case 0:value.output=reset?defaults.output:juce::jlimit(-1,stereoBuses-1,value.output+direction);break;
+            case 1:value.level=reset?0:juce::jlimit(-600,240,value.level+direction);break;
+            case 2:value.pan=reset?0:juce::jlimit(-100,100,value.pan+direction);break;
+            default:value.pitch=reset?0:juce::jlimit(-1200,1200,value.pitch+direction);break;
+        }
+        if(value.output==before.output&&value.level==before.level&&value.pan==before.pan&&value.pitch==before.pitch)return;
+        proc.setNote(noteProgram,noteSelected,value);noteRows=proc.notesForProgram(noteProgram);updateNoteCell(true);
+    }
+    bool handleNoteKey(const juce::KeyPress& k) {
+        const auto key=k.getKeyCode();const auto m=k.getModifiers();const bool alt=m.isAltDown(),ctrl=m.isCtrlDown()||m.isCommandDown();
+        const bool enter=key==juce::KeyPress::returnKey;
+        if(key==juce::KeyPress::escapeKey||(alt&&enter)) {closePanel();return true;}
+        if(alt&&!ctrl&&juce::CharacterFunctions::toLowerCase(static_cast<juce::juce_wchar>(key))=='m') {
+            noteLearn=!noteLearn;noteEventSeen=proc.lastLearnedNote();proc.setNoteLearnChannel(noteLearn?noteChannel:-1);
+            announce(noteLearn?"MIDI learn on":"MIDI learn off");return true;
+        }
+        if(key==juce::KeyPress::tabKey) {focus(panelCancel.hasKeyboardFocus(true)?static_cast<juce::Component&>(noteCell):static_cast<juce::Component&>(panelCancel));return true;}
+        if(panelCancel.hasKeyboardFocus(true)) {if(enter||key==juce::KeyPress::spaceKey)closePanel();return true;}
+        if(enter||key==juce::KeyPress::spaceKey) {if(noteSelected>=0){noteEditing=!noteEditing;updateNoteCell(true);}return true;}
+        if(key==juce::KeyPress::backspaceKey&&!ctrl) {changeNoteValue(0,true);return true;}
+        if(key==juce::KeyPress::deleteKey&&noteSelected>=0) {
+            const int old=noteSelected;proc.setNote(noteProgram,old,{});noteRows=proc.notesForProgram(noteProgram);
+            auto next=noteRows.lower_bound(old);if(next==noteRows.end()&&!noteRows.empty())next=std::prev(noteRows.end());
+            noteSelected=next==noteRows.end()?-1:next->first;noteEditing=false;updateNoteCell(true);return true;
+        }
+        if(key==juce::KeyPress::upKey||key==juce::KeyPress::downKey) {
+            if(!ctrl&&(alt||noteEditing)) {changeNoteValue(key==juce::KeyPress::upKey?1:-1);return true;}
+        }
+        if(key==juce::KeyPress::leftKey||key==juce::KeyPress::rightKey) {
+            noteColumn=juce::jlimit(0,3,noteColumn+(key==juce::KeyPress::leftKey?-1:1));updateNoteCell(true);return true;
+        }
+        if(key==juce::KeyPress::homeKey||key==juce::KeyPress::endKey||key==juce::KeyPress::upKey||key==juce::KeyPress::downKey||key==juce::KeyPress::pageUpKey||key==juce::KeyPress::pageDownKey) {
+            const auto list=visibleNoteRows();if(list.empty())return true;
+            int index=int(std::find(list.begin(),list.end(),noteSelected)-list.begin());
+            if(key==juce::KeyPress::homeKey) {index=0;if(ctrl)noteColumn=0;}
+            else if(key==juce::KeyPress::endKey) {index=int(list.size())-1;if(ctrl)noteColumn=3;}
+            else index+=key==juce::KeyPress::upKey?-1:key==juce::KeyPress::downKey?1:key==juce::KeyPress::pageUpKey?-12:12;
+            const int next=list[size_t(juce::jlimit(0,int(list.size())-1,index))];
+            if(next!=noteSelected||ctrl) {noteSelected=next;noteEditing=false;updateNoteCell(true);}return true;
+        }
+        return true;
+    }
+    void requestClearLocation(bool entireBank) {
+        const int address=proc.current(selectedChannel());
+        const int b=bank.getSelectedId()>0?bank.getSelectedId()-1:address>>7;
+        const int p=entireBank?-1:program.getSelectedId()>0?program.getSelectedId()-1:address&127;
+        auto* target=entireBank?static_cast<juce::Component*>(&bank):static_cast<juce::Component*>(&program);
+        if(std::none_of(cached.presets.begin(),cached.presets.end(),[&](const Preset& item){return item.bank==b&&(p<0||p==item.program);})) {speak(*target,"Empty");return;}
+        const auto mapRevision=proc.getRevision();
+        const auto name=p<0?"Bank "+number(b):"Bank "+number(b)+", Program "+number(p);
+        showConfirmation("Clear "+name+" from the virtual map? Source files will not be deleted.","Clear",[this,b,p,target,mapRevision]{
+            closePanel(target);
+            if(proc.getRevision()!=mapRevision) {announce("Map changed; clear cancelled");return;}
+            const auto result=proc.clearLocation(b,p);
+            if(result.failed()) announce(result.getErrorMessage());else {announceLoaded=true;refresh(true);}
+        });
     }
     void requestInitialize(juce::Component* origin) {
         juce::Component::SafePointer<juce::Component> previous(origin);
@@ -2669,12 +2896,16 @@ private:
         if(gridOpen) {if(changed||code!=gridShownCode) {gridShownCode=code;rebuildGrid();} else refreshGridValues();}
         if(announceLoaded&&!cached.loading&&!chooser&&!returnFromChooser&&!importInProgress&&hasKeyboardFocus(true)) {
             announceLoaded=false;
-            if(bank.hasKeyboardFocus(true)&&cached.status.startsWith("Loaded:")) publishReturnedFocus(bank);
-            else if(program.hasKeyboardFocus(true)&&cached.status.startsWith("Loaded:")) publishReturnedFocus(program);
+            if(bank.hasKeyboardFocus(true)&&(cached.status.startsWith("Loaded:")||cached.path.isEmpty())) publishReturnedFocus(bank);
+            else if(program.hasKeyboardFocus(true)&&(cached.status.startsWith("Loaded:")||cached.path.isEmpty())) publishReturnedFocus(program);
             else if(auto* c=juce::Component::getCurrentlyFocusedComponent();c&&isParentOf(c)) speak(*c,cached.status);
         }
     }
     void timerCallback() override {
+        if(panelMode==Panel::notes) {
+            if(proc.getRevision()!=revision||proc.current(noteChannel)!=noteProgram) {closePanel();refresh(true);return;}
+            pollNoteLearn();return;
+        }
         pollExport();
         if(returnFromChooser&&juce::Time::getMillisecondCounter()-chooserReturnedAt>5000u) returnFromChooser=false;
         refresh(false); maybePromptMissing();

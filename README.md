@@ -1,8 +1,8 @@
-# LSFX 0.99.2 TEST28 — hybrid SF2/SFZ export
+# LSFX 0.99.2 TEST30 — 64 stereo outputs
 
 27 November 2026 · Windows x64 VST3 · Lo-lo
 
-LSFX is an accessible multitimbral SF2/SFZ instrument for REAPER. Its defining feature is a fully editable MIDI bank/program map combining complete SoundFont banks, individual SF2 presets and SFZ instruments from multiple sources. Save the entire hybrid map as an LSFX preset. Sixteen independent MIDI channels, 17 stereo audio outputs (Main 1/2 and 3/4–33/34), 16 stereo parallel compressors, channel gains, SFZ program-specific gain, shared Main effects and keyboard/screen-reader navigation make it a flexible mixing instrument.
+LSFX is an accessible multitimbral SF2/SFZ instrument for REAPER. Its defining feature is a fully editable MIDI bank/program map combining complete SoundFont banks, individual SF2 presets and SFZ instruments from multiple sources. Save the entire hybrid map as an LSFX preset. Sixteen independent MIDI channels, 64 stereo audio outputs (Main 1/2 and 63 auxiliary pairs 3/4–127/128), 16 stereo parallel compressors, channel gains, SFZ program-specific gain, shared Main effects and keyboard/screen-reader navigation make it a flexible mixing instrument.
 
 ## User guides
 
@@ -13,7 +13,7 @@ In the Windows distribution both HTML guides are included in the Doc folder next
 
 ## Essential commands
 
-Alt+O opens a source and replaces the map; Alt+K selects a bank (Enter imports an SF2 bank); Alt+P selects a program (Enter imports SF2/SFZ); Alt+M selects MIDI channel; Alt+L opens parameters; Alt+U channel gains; Alt+R routing; Alt+G master gain; Alt+B preset browser; Ctrl+S save; Ctrl+Shift+S save as; Alt+I initialize with confirmation; Alt+Enter MIDI Panic; Alt+A About; Alt+S status; Alt+E export SoundFont.
+Alt+O opens a source and replaces the map; Alt+K selects a bank (Enter imports an SF2 bank); Alt+P selects a program (Enter imports SF2/SFZ); Alt+M selects MIDI channel; Alt+L opens parameters; Alt+U channel gains; Alt+R routing; Alt+G master gain; Alt+B preset browser; Ctrl+S save; Ctrl+Shift+S save as; Alt+I initialize with confirmation; Ctrl+Enter MIDI Panic; Alt+Enter note mixer editor draft (not applied to audio); Alt+A About; Alt+S status; Alt+E export SoundFont.
 
 ## Build and verification
 
@@ -30,3 +30,14 @@ SFZ sources are converted into single SF2 presets at their mapped addresses. Sup
 SF3, 24-bit SF2, nonportable banks above 128, ROM samples or selected SF2 sample offsets outside nominal sample bounds remain unsupported. Invalid unused loop coordinates in old files are repaired. Deduplication is by source identity, not across unrelated source files. Original licenses continue to apply. Do not redistribute exports unless permitted by all source licenses.
 
 TEST27.1 build fix: accept the reviewed FluidSynth 2.6.3 vcpkg port while retaining the Windows VLA patch and all native smoke tests.
+
+## TEST29: map deletion and note editor draft
+
+- Delete on Bank or Program requests confirmation, with Cancel initially focused. Clear removes only the chosen destination bank or program from the virtual map; source files are never deleted. The deletion is saved with the LSFX preset/host state and honored by SoundFont export. Enter still imports. Reimporting a deleted address fills it again. Clearing the last mapped program unloads the engine without resetting the mixer. Deleting a location clears its instrument gain and draft note assignments; other locations are unchanged. Older LSFX builds cannot interpret deletion markers, so retain a copy of important presets before opening them in older versions.
+- Ctrl+Enter is MIDI Panic; Alt+Enter opens the note mixer draft for the selected MIDI channel's mapped program. Alt+M still selects MIDI channel outside the draft; inside it toggles MIDI learn. Playing a note on that channel selects the note and enters Output editing. Other MIDI channels and Note Off do not select a note. Enter toggles edit/navigation. Left/right moves between Output, Level, Pan and Pitch. In navigation, Up/Down selects rows; Alt+Up/Down edits the cell; in edit mode Up/Down edits. Home/End moves to column boundaries, Ctrl+Home/End to whole-grid boundaries. Backspace resets the cell; Delete removes the note assignment. Esc or Alt+Enter closes and returns to the previous focus. Only modified notes and the temporary selected learn note appear. Settings are stored per bank/program and saved in LSFX state, not exported to SF2.
+- **Important: note mixer is a UI/state/MIDI-learn draft, explicitly labeled as such. Its Output, Level, Pan and Pitch values do not change the audio yet.** Per-voice engine routing, shared compression across split outputs, MIDI sustain, exclusive classes and SFZ articulation behavior still need to be implemented and validated. Existing audio rendering and export behavior remain unchanged.
+
+## TEST30: expanded host output routing
+
+- 64 stereo buses (128 mono pins) including Main 1/2. All sixteen MIDI channels may select any destination; existing integer route indices retain their meaning. The FluidSynth internal dry groups and channel compressors remain at 16. The note mixer draft accepts all new destinations but is still not applied to audio.
+- Old preset/project route indices are preserved. Previously recorded host automation for routing may need to be recreated because the normalized choice range has changed.

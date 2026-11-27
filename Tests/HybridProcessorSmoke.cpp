@@ -41,38 +41,60 @@ void setComp(Processor& p,int ch,int index,float value) {
     auto& parameter=p.compressorParameter(ch,index);
     parameter.setValueNotifyingHost(parameter.convertTo0to1(value));
 }
-// Exercise all physical pairs, including the last two pins 33/34, using
-// the same processor/render path as the VST3. No Main leakage with FX off.
+// Exercise every host destination without enlarging the internal MIDI mixer.
 void testAllSf2Outputs(const juce::File& source) {
     Processor p; p.prepareToPlay(48000,257);
     p.loadFile(source); waitReady(p);
     setChoice(p.effectsParameter(),0); setChoice(p.midiFXParameter(),0);
-    require(p.getTotalNumOutputChannels()==34,"all 17 stereo buses enabled");
-    for(int ch=0;ch<16;++ch) setChoice(p.routeParameter(ch),ch+1);
-    juce::AudioBuffer<float> b(34,257);
+    require(p.getTotalNumOutputChannels()==128,"all 64 stereo buses enabled");
+    juce::AudioBuffer<float> b(lsfx::monoOutputCount,257);
     juce::MidiBuffer midi;
+    std::array<float,stereoBuses> peak{};
+    auto measure=[&](int blocks) {
+        peak.fill(0);
+        for(int block=0;block<blocks;++block) {
+            p.processBlock(b,midi); midi.clear();
+            for(int pair=0;pair<stereoBuses;++pair) {
+                for(int lr=0;lr<2;++lr) for(int n=0;n<b.getNumSamples();++n)
+                    require(std::isfinite(b.getSample(pair*2+lr,n)),"nonfinite SF2 output");
+                peak[pair]=(std::max)(peak[pair],(std::max)(b.getMagnitude(2*pair,0,257),b.getMagnitude(2*pair+1,0,257)));
+            }
+        }
+    };
+    // All notes stay held while moving across four batches of destinations.
     for(int ch=0;ch<16;++ch) midi.addEvent(juce::MidiMessage::noteOn(ch+1,60,juce::uint8(100)),ch);
-    std::array<float,17> peak{};
-    for(int block=0;block<24;++block) {
-        p.processBlock(b,midi); midi.clear();
-        for(int pair=0;pair<17;++pair) {
-            for(int lr=0;lr<2;++lr) for(int n=0;n<b.getNumSamples();++n)
-                require(std::isfinite(b.getSample(pair*2+lr,n)),"nonfinite SF2 output");
-            peak[pair]=(std::max)(peak[pair],(std::max)(b.getMagnitude(2*pair,0,257),b.getMagnitude(2*pair+1,0,257)));
+    for(int first=1;first<stereoBuses;first+=16) {
+        const int last=(std::min)(first+15,stereoBuses-1);
+        for(int ch=0;ch<16;++ch) setChoice(p.routeParameter(ch),(std::min)(first+ch,last));
+        measure(24);
+        for(int pair=0;pair<stereoBuses;++pair) {
+            if(pair>=first&&pair<=last) require(peak[pair]>1e-5f,"missing SF2 stereo pair");
+            else require(peak[pair]<1e-5f,"duplicate SF2 audio on other bus");
         }
     }
-    require(peak[0]<1e-5f,"all separate outputs: Main silent");
-    for(int pair=1;pair<17;++pair) require(peak[pair]>1e-5f,"missing SF2 stereo pair");
-    // All notes remain active, sum any number of channels onto one bus.
-    for(int ch=0;ch<16;++ch) setChoice(p.routeParameter(ch),2);
-    peak.fill(0);
-    for(int block=0;block<16;++block) {
-        p.processBlock(b,midi);
-        for(int pair=0;pair<17;++pair) peak[pair]=(std::max)(peak[pair],(std::max)(b.getMagnitude(2*pair,0,257),b.getMagnitude(2*pair+1,0,257)));
+    for(int ch=0;ch<16;++ch) setChoice(p.routeParameter(ch),lsfx::maxOutputRoute);
+    measure(16);
+    require(peak.back()>1e-5f,"shared last SF2 bus missing audio");
+    for(int pair=0;pair<lsfx::maxOutputRoute;++pair) require(peak[pair]<1e-5f,"duplicate SF2 audio on other bus");
+    juce::MemoryBlock state; p.getStateInformation(state);
+    Processor restored; restored.prepareToPlay(48000,257); restored.setStateInformation(state.getData(),int(state.getSize()));waitReady(restored);
+    for(int ch=0;ch<16;++ch) require(restored.routeParameter(ch).getIndex()==lsfx::maxOutputRoute,"high route not restored");
+    std::cout<<"PASS: SF2 all 63 auxiliary stereo pairs and shared destination, high route state\n";
+}
+void testLastSfzOutput(const juce::File& source) {
+    Processor p; p.prepareToPlay(44100,256);p.loadFile(source);waitReady(p);
+    setChoice(p.effectsParameter(),0);setChoice(p.midiFXParameter(),0);
+    setChoice(p.routeParameter(0),lsfx::maxOutputRoute);
+    juce::AudioBuffer<float> b(lsfx::monoOutputCount,256);juce::MidiBuffer midi;
+    midi.addEvent(juce::MidiMessage::noteOn(1,60,juce::uint8(100)),0);
+    float peak=0;
+    for(int block=0;block<24;++block) {
+        p.processBlock(b,midi);midi.clear();
+        for(int ch=0;ch<lsfx::monoOutputCount-2;++ch) require(b.getMagnitude(ch,0,256)<1e-5f,"SFZ duplicate output");
+        peak=(std::max)(peak,(std::max)(b.getMagnitude(126,0,256),b.getMagnitude(127,0,256)));
     }
-    require(peak[2]>1e-5f,"shared SF2 bus missing audio");
-    for(int pair=0;pair<17;++pair) if(pair!=2) require(peak[pair]<1e-5f,"duplicate SF2 audio on other bus");
-    std::cout<<"PASS: SF2 all 16 auxiliary stereo pairs and shared destination\n";
+    require(peak>1e-5f,"SFZ last output silent");
+    std::cout<<"PASS: SFZ output 127/128 without leakage\n";
 }
 void testChannelCompression(const juce::File& source,bool sfz) {
     Processor p; p.prepareToPlay(44100,256);
@@ -190,7 +212,41 @@ int main(int argc,char** argv) {
         setChoice(exported.effectsParameter(),0);midi.clear();midi.addEvent(juce::MidiMessage::noteOn(1,60,juce::uint8(100)),0);
         require(render(exported,midi)[0]>1e-5f,"converted real WAV playback");
         std::cout<<"PASS: actual JUCE WAV decode, SFZ export and processor reload\n";
-        testChannelCompression(one,true);
+        // A deletion must mask the underlying base bank, survive state restore,
+        // and not remove unrelated SFZs or the GM percussion bank.
+        Processor deleted;deleted.prepareToPlay(44100,256);deleted.loadFile(sf2);waitReady(deleted);
+        require(deleted.importSFZ(one,pack(0,3),0).wasOk(),"add SFZ before delete");waitReady(deleted);
+        require(deleted.importSFZ(two,pack(1,4),1).wasOk(),"add SFZ in other bank");waitReady(deleted);
+        deleted.setNote(pack(0,3),36,{2,-30,10,5});deleted.setNote(pack(1,4),38,{lsfx::maxOutputRoute,20,0,0});
+        deleted.setNoteLearnChannel(0);auto eventBefore=deleted.lastLearnedNote();
+        midi.clear();midi.addEvent(juce::MidiMessage::noteOn(2,42,juce::uint8(100)),0);render(deleted,midi,1);
+        require(deleted.lastLearnedNote()==eventBefore,"other MIDI channel ignored by learn");
+        midi.addEvent(juce::MidiMessage::noteOn(1,36,juce::uint8(100)),0);render(deleted,midi,1);
+        auto event=deleted.lastLearnedNote();require(event!=eventBefore&&(event&127u)==36&&int((event&0xffffffffull)>>7)==pack(0,3),"capture note with mapped program");
+        deleted.setNoteLearnChannel(-1);
+        require(deleted.clearLocation(0,0).wasOk(),"delete base program");waitReady(deleted);
+        require(!findPreset(deleted.getView().presets,pack(0,0)),"base program masked");
+        require(findPreset(deleted.getView().presets,pack(0,3))!=nullptr,"unrelated program retained");
+        setChoice(deleted.effectsParameter(),0);setChoice(deleted.midiFXParameter(),0);
+        deleted.allOff();midi.clear();render(deleted,midi,2);
+        deleted.select(2,0,0);midi.addEvent(juce::MidiMessage::noteOn(3,60,juce::uint8(100)),0);
+        const auto silent=render(deleted,midi,8);require(silent[0]<1e-5f&&silent[1]<1e-5f&&silent[2]<1e-5f,"deleted program must be silent");
+        juce::MemoryBlock deletedState;deleted.getStateInformation(deletedState);
+        Processor deletedRestore;deletedRestore.prepareToPlay(44100,256);deletedRestore.setStateInformation(deletedState.getData(),int(deletedState.getSize()));waitReady(deletedRestore);
+        require(!findPreset(deletedRestore.getView().presets,pack(0,0)),"delete persisted");
+        require(deletedRestore.notesForProgram(pack(0,3)).at(36).output==2,"draft note assignment persisted");
+        require(deletedRestore.clearLocation(0,-1).wasOk(),"delete bank");waitReady(deletedRestore);
+        const auto cleared=deletedRestore.getView();
+        require(!findPreset(cleared.presets,pack(0,3))&&findPreset(cleared.presets,pack(1,4))&&findPreset(cleared.presets,pack(128,0)),"bank deletion preserves other banks");
+        require(deletedRestore.notesForProgram(pack(0,3)).empty()&&deletedRestore.notesForProgram(pack(1,4)).at(38).output==lsfx::maxOutputRoute,"bank delete clears only its note settings");
+        require(deletedRestore.importSF2(sf2,0,0,0,0,0).wasOk(),"refill deleted program");waitReady(deletedRestore);
+        require(findPreset(deletedRestore.getView().presets,pack(0,0))!=nullptr,"new import refills tombstone");
+        require(deletedRestore.clearLocation(0,-1).wasOk(),"clear bank again");waitReady(deletedRestore);
+        require(deletedRestore.clearLocation(1,-1).wasOk(),"clear second bank");waitReady(deletedRestore);
+        require(deletedRestore.clearLocation(128,-1).wasOk(),"clear final bank");waitReady(deletedRestore,false);
+        require(deletedRestore.getView().presets.empty()&&deletedRestore.notesForProgram(pack(1,4)).empty(),"last deletion releases map and note state");
+        std::cout<<"PASS: persistent virtual map deletion, refilling, draft note state and MIDI learn\n";
+        testChannelCompression(one,true);testLastSfzOutput(one);
         if constexpr(sf2MultiOutput) {testChannelCompression(sf2,false);testAllSf2Outputs(sf2);}
     } catch(const std::exception& e) {std::cerr<<"FAIL: "<<e.what()<<'\n';return 1;}
 }

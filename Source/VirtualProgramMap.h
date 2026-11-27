@@ -25,6 +25,13 @@ template<class Preset> bool replaceBank(std::map<int,Preset>& map,const std::vec
     for(const auto& p:source) if(p.bank==sourceBank) assignProgram(map,p,bank,p.program);
     return true;
 }
+// A deletion is an overlay operation: it must also hide any program in the base SF2.
+template<class Map> void clearAddress(Map& map,int bank,int program) {
+    if(!validAddress(bank,program<0?0:program)||program<-1) return;
+    if(program>=0) {map.erase(address(bank,program)); return;}
+    auto it=map.lower_bound(address(bank,0));
+    while(it!=map.end()&&it->first/programCount==bank) it=map.erase(it);
+}
 // Trims belong to the virtual address, not the MIDI channel or source file.
 // A successful replacement clears only the replaced location(s).
 template<class GainMap> void eraseInstrumentGains(GainMap& gains,int bank,int program) {

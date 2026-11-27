@@ -30,14 +30,14 @@ def run(routes, groups=16, native=False, effects=True):
                     assert gen(sy,ch,g,-10000)==0
                     assert getgen(sy,ch,g)==-10000
             assert note(sy,ch,36 if ch==9 else 60+ch%12,100)==0
-        out=[[] for _ in range(34)]
+        out=[[] for _ in range(128)]
         for n in (1,63,511,1024,73,1024,1024,1024,1024,1024,1024,1024,1024,1024,1024,1024):
             dry=[(F*n)() for _ in range(32)]; wet=[(F*n)() for _ in range(4)]
             if native:
                 assert write(sy,n,dry[0],0,1,dry[1],0,1)==0
                 out[0].extend(dry[0]);out[1].extend(dry[1]);continue
             assert process(sy,n,4,(FP*4)(*wet),32,(FP*32)(*dry))==0
-            mixed=[[0.0]*n for _ in range(34)]
+            mixed=[[0.0]*n for _ in range(128)]
             for ch in range(16):
                 route=routes.get(ch,0)
                 for lr in (0,1):
@@ -51,9 +51,9 @@ def run(routes, groups=16, native=False, effects=True):
         if sy:free(sy)
         fs(st)
 def peak(out,pair):return max(abs(x) for j in (2*pair,2*pair+1) for x in out[j])
-a=run({0:1,1:1,9:16}); print('dry-only main peak',peak(a,0),'shared peak',peak(a,1),'drum 33/34 peak',peak(a,16),flush=True)
-assert peak(a,0)<1e-6 and peak(a,1)>0 and peak(a,16)>0
-assert all(peak(a,i)==0 for i in range(2,16))
+a=run({0:1,1:1,9:63}); print('dry-only main peak',peak(a,0),'shared peak',peak(a,1),'drum 127/128 peak',peak(a,63),flush=True)
+assert peak(a,0)<1e-6 and peak(a,1)>0 and peak(a,63)>0
+assert all(peak(a,i)==0 for i in range(2,63))
 b=run({0:0,9:3}); assert peak(b,0)>0 and peak(b,3)>0 and peak(b,1)==0
 base=run({0:0,9:0},1,True); multi=run({0:0,9:0})
 for j in (0,1):

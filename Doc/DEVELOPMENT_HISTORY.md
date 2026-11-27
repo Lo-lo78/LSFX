@@ -181,3 +181,7 @@ Allow FluidSynth 2.6.3 as well as 2.6.2 in the overlay preparation script. The V
 
 ## TEST28 — hybrid SF2/SFZ export
 Convert each distinct sampled SFZ into one standard SF2 preset, then merge into the mapped addresses using the TEST27 selective assembler. Explicit approximation warnings; Space activates the final OK button. No changes to playback DSP.
+
+### TEST30
+
+Expand host routing to 64 stereo buses including Main, retaining 16 internal MIDI groups, channel compressors, existing destination indices and the note editor draft.
