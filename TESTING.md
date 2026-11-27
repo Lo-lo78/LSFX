@@ -1,4 +1,18 @@
-# LSFX 0.99.1 — release acceptance checks
+# LSFX 0.99.2 — release acceptance checks
+
+27 November 2026. TEST31.3 SF2 per-note routing and TEST32 keyboard ergonomics were validated by the user in REAPER. This release keeps their audio implementation unchanged.
+
+- Compile the standard Windows x64 build and require all existing dependency, native and hybrid processor checks to pass. The normal package must be named `LSFX.0.99.2.Windows.x64.VST3.zip`.
+- Bank and Program: 000 Right -> 008 -> 016; Down from 007 and Up from 008 stay silent. On 037, Home -> 032 and End -> 039. Page Up/Down moves up to five within the column. Ctrl+Home -> 000, Ctrl+End -> 127 for programs, at least 128 for banks. Check the percussion bank and existing extended bank entries. Enter imports and Delete clears with confirmation; Escape cancels and returns focus.
+- In MIDI Channel, Channel Gain and Output Routing: digits 2–9 jump directly; 1 cycles 1, 10–16, 1. Gain and output values must remain unchanged when selecting channels. Main Tab order ends Save As, Export SoundFont, About.
+- Alt+A opens the unchanged accessible About panel; verify version 0.99.2 and 27 November 2026, text navigation and previous focus. Ctrl+Enter is Panic; Alt+Enter opens the note grid with learn off. Verify Alt+M toggles learn and Alt-key editing with silent boundaries.
+- Test SF2 note 36 on channel 10 to 3/4, another note to a different output, and a melodic program note. Check no Main duplication, linked channel compressor, level/pan/pitch on new notes, save/reload and 127/128 routing. SFZ note DSP remains unsupported.
+- Verify hybrid export with a deleted program, a replacement SF2 program and a sampled SFZ; open the exported file, check map addresses and warning report. Space and Enter dismiss OK. Check both HTML guides in the package.
+- Verify existing project and preset compatibility; previous host automation for routing may need adjustment. Windows final-build and screen reader regression tests remain required.
+
+## Historical test records (commands may differ from 0.99.2)
+
+## LSFX 0.99.1 — release acceptance checks
 
 The user confirmed TEST26.1 working in REAPER. The release retains its audio implementation and dependency patch. Before release, compile the standard multigroup build and verify that the existing native and hybrid tests pass. With NVDA/JAWS: press Alt+A from Bank, Program, gain strip, grid and value. Verify read-only text contains LSFX, 0.99.1, 26 November 2026, license, project and contact; arrows, Home/End, Ctrl+Home/End, Shift selection and Ctrl+C work without double speech. Verify Tab/Shift+Tab cycle text/Project/Contact/Close; Enter, Esc and Alt+C behave as documented. Verify focus returns to the original control. Verify Alt+Enter stops notes without clearing map and Alt+A does not stop audio. Check no SAPI fallback and that the two HTML guides are in the package. Verify saved hybrid maps and routing from TEST26.1 still work. No full Windows build was performed in the authoring environment for this release.
 

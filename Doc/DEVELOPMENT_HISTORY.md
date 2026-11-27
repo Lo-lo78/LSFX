@@ -201,3 +201,17 @@ Use vcpkg host-tool acquisition for Python; the Windows empty-PATH regression re
 ### TEST31.3
 
 Generate and include an in-process CMake installer for the identical ten note-routing edits, removing Python execution from the isolated vcpkg port. Preserve native audio tests and both reviewed patches.
+
+
+## TEST32 — main-window navigation
+
+
+- Alt+M, Alt+U and Alt+R: digits 2–9 select that MIDI channel directly; 1 cycles 1, 10–16, then 1. Gain and routing digits select the strip channel, without changing its gain or output value.
+- Alt+K and Alt+P: existing native selection controls use a logical column-major grid of 16 rows per column. Up/down moves one slot within the column; left/right moves one column; Page Up/Down moves five rows within the column. Home/End selects column boundaries; Ctrl+Home/End selects whole-grid boundaries. No wrap or explicit repeat announcement at edges. Bank 128 and any existing extended banks remain accessible. Enter imports, Delete clears with confirmation, as before.
+- Main-window order ends with Save preset as, Export SoundFont, About. Focus memory IDs are unchanged.
+- No DSP, map format, export, SF2 patch or note mixer changes. About and complete bilingual guide updates are reserved for the final 0.99.2 release.
+
+
+## 0.99.2 — 27 November 2026
+
+TEST32 validated by the user. Bank and Program navigation now uses eight rows per column to match General MIDI instrument families. Release About, guides and package naming updated. No audio, dependency patch or serialization changes.

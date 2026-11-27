@@ -14,21 +14,31 @@ int main() {
     assert(gridDestination(40,42,8,M::home)==40);
     assert(gridDestination(0,2,8,M::down)==1);
     assert(gridDestination(1,2,8,M::up)==0);
-    // 128 entries: 8 columns of 16; the SF2 percussion bank is extra.
-    assert(gridDestination(0,128,16,M::right)==16);
-    assert(gridDestination(15,128,16,M::down)==15);
-    assert(gridDestination(16,128,16,M::up)==16);
-    assert(gridDestination(37,128,16,M::home)==32);
-    assert(gridDestination(37,128,16,M::end)==47);
-    assert(gridDestination(37,128,16,M::pageUp)==32);
-    assert(gridDestination(37,128,16,M::pageDown)==42);
-    assert(gridDestination(37,128,16,M::home,true)==0);
-    assert(gridDestination(37,128,16,M::end,true)==127);
-    assert(gridDestination(127,128,16,M::right)==127);
-    assert(gridDestination(0,129,16,M::left)==0);
-    assert(gridDestination(112,129,16,M::right)==128);
-    assert(gridDestination(128,129,16,M::end)==128);
-    assert(gridDestination(128,129,16,M::down)==128);
+    // General MIDI: sixteen columns of eight entries, plus percussion bank.
+    constexpr int rows=lsfx::locationGridRows;
+    static_assert(rows==8);
+    assert(gridDestination(0,128,rows,M::right)==8);
+    assert(gridDestination(37,128,rows,M::home)==32);
+    assert(gridDestination(37,128,rows,M::end)==39);
+    assert(gridDestination(37,128,rows,M::pageUp)==32);
+    assert(gridDestination(37,128,rows,M::pageDown)==39);
+    assert(gridDestination(33,128,rows,M::pageDown)==38);
+    assert(gridDestination(37,128,rows,M::home,true)==0);
+    assert(gridDestination(37,128,rows,M::end,true)==127);
+    for(int count: {128,129,130,16384}) {
+        for(int i=0;i<count;++i) {
+            int first=i-i%rows, last=std::min(first+rows-1,count-1);
+            assert(gridDestination(i,count,rows,M::home)==first);
+            assert(gridDestination(i,count,rows,M::end)==last);
+            assert(gridDestination(i,count,rows,M::up)==std::max(first,i-1));
+            assert(gridDestination(i,count,rows,M::down)==std::min(last,i+1));
+            assert(gridDestination(i,count,rows,M::left)==(first>0?i-rows:i));
+            assert(gridDestination(i,count,rows,M::right)==(first+rows<count?std::min(i+rows,count-1):i));
+        }
+    }
+    assert(gridDestination(120,129,rows,M::right)==128);
+    assert(gridDestination(128,129,rows,M::end)==128);
+    assert(gridDestination(128,129,rows,M::down)==128);
     using lsfx::channelDigitDestination;
     for(int from=0;from<16;++from) {
         for(int digit=2;digit<=9;++digit) assert(channelDigitDestination(from,digit)==digit-1);

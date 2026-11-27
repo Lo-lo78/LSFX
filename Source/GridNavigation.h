@@ -1,6 +1,8 @@
 #pragma once
 #include <algorithm>
 namespace lsfx {
+// General MIDI groups contain eight programs. Bank and Program share this layout.
+inline constexpr int locationGridRows = 8;
 // Channel digits use one-based MIDI channel numbers, not output bus numbers.
 // Repeating 1 cycles 1, 10, 11, ..., 16, 1. Other digits jump directly.
 inline int channelDigitDestination(int current,int digit,int count=16) {
