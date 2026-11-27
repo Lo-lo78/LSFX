@@ -8,6 +8,7 @@ import json
 from pathlib import Path
 import re
 import shutil
+from GenerateFluidNoteRoutingCmake import generate
 
 parser = argparse.ArgumentParser()
 parser.add_argument('vcpkg_root', type=Path)
@@ -29,6 +30,7 @@ shutil.copytree(source, target)
 for name in ('fluidsynth-vla-size.patch', 'fluidsynth-note-routing.patch', 'ApplyFluidNoteRouting.py'):
     item = Path(__file__).with_name(name)
     (target / name).write_bytes(item.read_text(encoding='utf-8-sig').encode('utf-8'))
+(target / "ApplyFluidNoteRouting.cmake").write_text(generate(), encoding="utf-8")
 patches = [target / 'fluidsynth-vla-size.patch']
 portfile = target / 'portfile.cmake'
 text = portfile.read_text(encoding='utf-8-sig')
@@ -41,22 +43,14 @@ match = re.search(r'(?ms)^vcpkg_from_github\(.*?^\)[ \t]*$', text)
 if not match or not re.search(r'\bOUT_SOURCE_PATH[ \t]+SOURCE_PATH\b', match.group(0)):
     raise SystemExit('FluidSynth port extraction has changed; refusing unpatched build.')
 extra = r'''
-# LSFX TEST31.2: apply the same reviewed delta by code anchors.
+# LSFX TEST31.3: apply the same reviewed delta by code anchors.
 set(LSFX_PATCHED_SOURCE_PATH "${SOURCE_PATH}-lsfx-note-routing")
 file(REMOVE_RECURSE "${LSFX_PATCHED_SOURCE_PATH}")
 file(MAKE_DIRECTORY "${LSFX_PATCHED_SOURCE_PATH}")
 file(COPY "${SOURCE_PATH}/" DESTINATION "${LSFX_PATCHED_SOURCE_PATH}")
-# vcpkg sanitizes PATH on Windows; use its supported host-tool acquisition.
-vcpkg_find_acquire_program(PYTHON3)
-if(NOT IS_ABSOLUTE "${PYTHON3}" OR NOT EXISTS "${PYTHON3}")
-    message(FATAL_ERROR "LSFX: vcpkg did not provide an absolute Python 3 executable: ${PYTHON3}")
-endif()
-message(STATUS "LSFX note routing patch Python: ${PYTHON3}")
-execute_process(COMMAND "${PYTHON3}" "${CURRENT_PORT_DIR}/ApplyFluidNoteRouting.py"
-    "${LSFX_PATCHED_SOURCE_PATH}" RESULT_VARIABLE LSFX_NOTE_PATCH_RESULT)
-if(NOT "${LSFX_NOTE_PATCH_RESULT}" STREQUAL "0")
-    message(FATAL_ERROR "LSFX FluidSynth note routing patch failed: ${LSFX_NOTE_PATCH_RESULT}")
-endif()
+# Apply directly in the current CMake process, without launching Python.
+include("${CURRENT_PORT_DIR}/ApplyFluidNoteRouting.cmake")
+lsfx_apply_note_routing("${LSFX_PATCHED_SOURCE_PATH}")
 set(SOURCE_PATH "${LSFX_PATCHED_SOURCE_PATH}")
 '''
 text = text[:match.end()] + '\n' + extra + text[match.end():]

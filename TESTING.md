@@ -166,3 +166,6 @@ Run `python Tests/FluidNotePatchTest.py`. The synthetic fixtures verify LF and C
 
 ## TEST31.2 — vcpkg host Python regression
 Run `python Tests/FluidNotePatchTest.py`. The generated CMake insertion is tested with an empty PATH and a mocked vcpkg host-tool acquisition returning the absolute Python executable. Real vcpkg acquisition and the patched Windows library/audio tests remain mandatory in CI.
+
+## TEST31.3 — native CMake installer regression
+Run `python Tests/FluidNotePatchTest.py`. The generated CMake implementation executes in-process without Python or any subprocess in the vcpkg sandbox. Regression tests invoke CMake with empty PATH on synthetic sources, LF/CRLF, changed whitespace, paths containing spaces, and verify exact LF-normalized output equality against the Python reference, idempotence, missing/duplicate anchor refusal before writing, two supported versions, and unchanged shared sources. The mandatory Windows dependency and audio smoke tests are unchanged; local fixtures do not validate actual FluidSynth compilation.

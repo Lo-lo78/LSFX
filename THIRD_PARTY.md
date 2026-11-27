@@ -37,3 +37,5 @@ The runner now supplies FluidSynth 2.6.3. The upstream header in [v2.6.3](https:
 `Tools/fluidsynth-note-routing.patch` modifies the pinned FluidSynth 2.6.2/2.6.3 LGPL library: private note-on context, voice mixer mapping, per-note gain/pan/pitch, and per-voice send suppression. The overlay applies the VLA fix through vcpkg and, from TEST31.1, the note-routing delta through `Tools/ApplyFluidNoteRouting.py` to a private extracted source copy. Both patch files and the installer scripts are included in the distribution. The corresponding LGPL source and relinking obligations still apply.
 
 TEST31.2 uses vcpkg host-tool acquisition for Python 3 to apply the existing note-routing delta in the isolated build environment. No dependency source changes relative to TEST31.1.
+
+TEST31.3 generates an equivalent native CMake installer from the reviewed note-routing diff. Python is used only for overlay preparation and regression testing, never launched within the vcpkg port. No changes to the dependency source delta or its licensing.

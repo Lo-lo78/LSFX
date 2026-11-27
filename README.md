@@ -1,4 +1,4 @@
-# LSFX 0.99.2 TEST31.2 — SF2 note routing and keyboard navigation
+# LSFX 0.99.2 TEST31.3 — SF2 note routing and keyboard navigation
 
 27 November 2026 · Windows x64 VST3 · Lo-lo
 
@@ -56,3 +56,6 @@ The TEST31 build failed while vcpkg applied the voice-routing diff. The same cod
 
 ## TEST31.2 — vcpkg host Python fix
 The overlay now uses `vcpkg_find_acquire_program(PYTHON3)` instead of searching the sanitized Windows PATH. The VLA and note-routing patches and mandatory audio smoke tests are unchanged.
+
+## TEST31.3 — in-process CMake patch installation
+The TEST31.2 Windows regression failed to launch Python from CMake with an empty PATH even though an absolute interpreter path was found. The overlay generator now translates the same reviewed note-routing delta into a native CMake script at overlay preparation time. vcpkg includes it directly on the private source copy, with no child process or Python discovery. The independent Python implementation remains the reference for regression tests. All ten anchors must be unique; a failed check leaves the source files untouched. No DSP, VLA fix, or native audio smoke test changes. Windows dependency compilation and REAPER validation remain pending.

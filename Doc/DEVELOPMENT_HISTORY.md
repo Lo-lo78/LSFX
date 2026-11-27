@@ -193,3 +193,11 @@ Manual note learn, silent boundaries, direct Alt editing and experimental real S
 ### TEST31.1
 
 Fix installation of the FluidSynth note-routing patch using unique code anchors on a private source copy; keep the VLA fix, mandatory native tests and the TEST31 audio implementation unchanged.
+
+### TEST31.2
+
+Use vcpkg host-tool acquisition for Python; the Windows empty-PATH regression revealed that CMake still could not launch the interpreter.
+
+### TEST31.3
+
+Generate and include an in-process CMake installer for the identical ten note-routing edits, removing Python execution from the isolated vcpkg port. Preserve native audio tests and both reviewed patches.

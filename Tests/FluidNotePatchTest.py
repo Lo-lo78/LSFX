@@ -76,20 +76,47 @@ with tempfile.TemporaryDirectory() as tmp:
         extraction, rest = script.split('\n)\n', 1)
         assert 'fluidsynth-vla-size.patch' in extraction and 'vendor.patch' in extraction
         assert 'fluidsynth-note-routing.patch' not in extraction
-        assert 'vcpkg_find_acquire_program(PYTHON3)' in rest
-        assert 'find_program(LSFX_PYTHON' not in rest
-        assert 'ApplyFluidNoteRouting.py' in rest and 'set(SOURCE_PATH "${LSFX_PATCHED_SOURCE_PATH}")' in rest
-        assert (overlay / 'ApplyFluidNoteRouting.py').is_file()
-        # Execute the generated CMake insertion against a synthetic extraction.
-        original = tmp / f'extracted-{version}'; fixture(original, True, True)
-        before = snapshot(original)
-        cmake = tmp / 'test.cmake'
-        cmake.write_text(f'function(vcpkg_find_acquire_program name)\n  if(NOT name STREQUAL \"PYTHON3\")\n    message(FATAL_ERROR \"Unexpected host tool\")\n  endif()\n  set(PYTHON3 \"{Path(sys.executable).as_posix()}\" PARENT_SCOPE)\nendfunction()\nset(SOURCE_PATH "{original.as_posix()}")\nset(CURRENT_PORT_DIR "{overlay.as_posix()}")\n' + rest)
-        # Simulate vcpkg's sanitized PATH; only the acquired absolute Python is usable.
+        assert 'execute_process' not in rest and 'vcpkg_find_acquire_program' not in rest
+        assert 'ApplyFluidNoteRouting.cmake' in rest and 'set(SOURCE_PATH "${LSFX_PATCHED_SOURCE_PATH}")' in rest
+        assert (overlay / 'ApplyFluidNoteRouting.cmake').is_file()
         cmake_exe = shutil.which('cmake')
         assert cmake_exe
-        subprocess.run([cmake_exe, '-P', str(cmake)], check=True, env={**os.environ, 'PATH': ''})
-        assert snapshot(original) == before, 'shared source changed'
-        patched = Path(str(original) + '-lsfx-note-routing')
-        assert b'lsfx_note_gain' in (patched / 'src/synth/fluid_voice.c').read_bytes()
-print('PASS: LF, CRLF, changed context, repeat, missing/duplicate anchor, two supported versions, private CMake source copy with empty PATH and mocked host-tool acquisition, unsupported version rejection')
+        def run_cmake(code, success=True):
+            cmake = tmp / 'test.cmake'
+            cmake.write_text('cmake_minimum_required(VERSION 3.22)\n' + code, encoding='utf-8')
+            result = subprocess.run([cmake_exe, '-P', str(cmake)], capture_output=True, text=True, env={**os.environ, 'PATH': ''})
+            if success:
+                assert result.returncode == 0, result.stdout + result.stderr
+            else:
+                assert result.returncode != 0 and 'patch refused' in result.stderr, result.stdout + result.stderr
+            return result
+        def canonical(root):
+            return {p: b.replace(b'\r\n', b'\n') for p,b in snapshot(root).items()}
+        # Compare actual CMake output with the already reviewed Python reference.
+        for crlf, changed in [(False, False), (True, False), (True, True)]:
+            original = tmp / f'extracted {version}-{crlf}-{changed}'
+            fixture(original, crlf, changed)
+            before = snapshot(original)
+            reference = tmp / 'reference'
+            shutil.copytree(original, reference, dirs_exist_ok=True)
+            apply(reference)
+            code = f'set(SOURCE_PATH "{original.as_posix()}")\nset(CURRENT_PORT_DIR "{overlay.as_posix()}")\n' + rest
+            run_cmake(code)
+            assert snapshot(original) == before, 'shared source changed'
+            patched = Path(str(original) + '-lsfx-note-routing')
+            assert canonical(patched) == canonical(reference), 'native CMake differs from Python reference'
+            once = snapshot(patched)
+            direct = f'include("{(overlay / "ApplyFluidNoteRouting.cmake").as_posix()}")\nlsfx_apply_note_routing("{patched.as_posix()}")\n'
+            run_cmake(direct)
+            assert snapshot(patched) == once, 'native CMake is not idempotent'
+        for duplicate in (False, True):
+            broken = tmp / f'native-bad-{version}-{duplicate}'
+            fixture(broken)
+            path = broken / 'src/synth/fluid_voice.c'
+            text = path.read_text()
+            anchor = '        voice->pan = fluid_voice_gen_value(voice, GEN_PAN);'
+            path.write_text(text + anchor + '\n' if duplicate else text.replace(anchor, '        unsupported change;'))
+            before = snapshot(broken)
+            run_cmake(f'include("{(overlay / "ApplyFluidNoteRouting.cmake").as_posix()}")\nlsfx_apply_note_routing("{broken.as_posix()}")\n', success=False)
+            assert snapshot(broken) == before, 'failed native patch modified files'
+print('PASS: native CMake with empty PATH, LF/CRLF, changed context, paths with spaces, Python reference equality, repeat, missing/duplicate anchor, two supported versions, unmodified shared extraction, unsupported version rejection')
