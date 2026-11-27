@@ -4,7 +4,7 @@
 #include "VirtualProgramMap.h"
 #include "AudioRouting.h"
 namespace lsfx {
-// Draft per-program note mixer state. No dependency on a synthesis engine.
+// Per-program note mixer state. No dependency on a synthesis engine.
 // Output -1 inherits the channel route; 0 is Main. Level is tenths of dB.
 struct NoteAssignment {
     int output=-1, level=0, pan=0, pitch=0;

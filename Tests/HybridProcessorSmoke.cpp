@@ -81,6 +81,27 @@ void testAllSf2Outputs(const juce::File& source) {
     for(int ch=0;ch<16;++ch) require(restored.routeParameter(ch).getIndex()==lsfx::maxOutputRoute,"high route not restored");
     std::cout<<"PASS: SF2 all 63 auxiliary stereo pairs and shared destination, high route state\n";
 }
+void testNoteRouting(const juce::File& source) {
+    Processor p;p.prepareToPlay(48000,256);p.loadFile(source);waitReady(p);
+    setChoice(p.effectsParameter(),0);setChoice(p.midiFXParameter(),0);
+    p.setNote(pack(128,0),36,{1,0,0,0});
+    p.setNote(pack(128,0),38,{2,0,0,0});
+    juce::MidiBuffer midi;
+    midi.addEvent(juce::MidiMessage::noteOn(10,36,juce::uint8(100)),0);
+    midi.addEvent(juce::MidiMessage::noteOn(10,38,juce::uint8(100)),1);
+    auto peak=render(p,midi,24);
+    require(peak[1]>1e-6f&&peak[2]>1e-6f&&peak[0]<1e-7f,"two drum notes from channel 10 routed separately");
+    p.allOff();render(p,midi,8);
+    midi.addEvent(juce::MidiMessage::noteOn(10,40,juce::uint8(100)),0);
+    peak=render(p,midi,24);
+    require(peak[0]>1e-6f&&peak[1]<1e-7f&&peak[2]<1e-7f,"unassigned note inherits main");
+    juce::MemoryBlock state;p.getStateInformation(state);
+    Processor restored;restored.prepareToPlay(48000,256);restored.setStateInformation(state.getData(),int(state.getSize()));waitReady(restored);
+    midi.addEvent(juce::MidiMessage::noteOn(10,36,juce::uint8(100)),0);
+    peak=render(restored,midi,24);
+    require(peak[1]>1e-6f&&peak[0]<1e-7f&&peak[2]<1e-7f,"note route after state restore");
+    std::cout<<"PASS: SF2 note routing on MIDI channel 10, inheritance and saved state\n";
+}
 void testLastSfzOutput(const juce::File& source) {
     Processor p; p.prepareToPlay(44100,256);p.loadFile(source);waitReady(p);
     setChoice(p.effectsParameter(),0);setChoice(p.midiFXParameter(),0);
@@ -247,6 +268,6 @@ int main(int argc,char** argv) {
         require(deletedRestore.getView().presets.empty()&&deletedRestore.notesForProgram(pack(1,4)).empty(),"last deletion releases map and note state");
         std::cout<<"PASS: persistent virtual map deletion, refilling, draft note state and MIDI learn\n";
         testChannelCompression(one,true);testLastSfzOutput(one);
-        if constexpr(sf2MultiOutput) {testChannelCompression(sf2,false);testAllSf2Outputs(sf2);}
+        if constexpr(sf2MultiOutput) {testChannelCompression(sf2,false);testAllSf2Outputs(sf2);testNoteRouting(sf2);}
     } catch(const std::exception& e) {std::cerr<<"FAIL: "<<e.what()<<'\n';return 1;}
 }

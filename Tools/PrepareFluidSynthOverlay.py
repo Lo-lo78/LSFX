@@ -24,11 +24,12 @@ target = args.overlay_root / 'fluidsynth'
 if target.exists():
     shutil.rmtree(target)
 shutil.copytree(source, target)
-patch = Path(__file__).with_name('fluidsynth-vla-size.patch')
-shutil.copy2(patch, target / patch.name)
+patches = [Path(__file__).with_name(name) for name in ('fluidsynth-vla-size.patch', 'fluidsynth-note-routing.patch')]
+for patch in patches:
+    shutil.copy2(patch, target / patch.name)
 portfile = target / 'portfile.cmake'
 text = portfile.read_text(encoding='utf-8-sig')
-text, count = re.subn(r'(?m)^([ \t]*)PATCHES[ \t]*$', lambda m: m.group(0) + '\n' + m.group(1) + '    ' + patch.name, text, count=1)
+text, count = re.subn(r'(?m)^([ \t]*)PATCHES[ \t]*$', lambda m: m.group(0) + ''.join('\n' + m.group(1) + '    ' + patch.name for patch in patches), text, count=1)
 if count != 1:
     raise SystemExit('FluidSynth portfile has no PATCHES block; refusing unpatched build.')
 portfile.write_text(text, encoding='utf-8')

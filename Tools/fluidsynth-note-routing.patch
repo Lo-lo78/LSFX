@@ -1,0 +1,132 @@
+diff --git a/src/synth/fluid_synth.h b/src/synth/fluid_synth.h
+--- a/src/synth/fluid_synth.h
++++ b/src/synth/fluid_synth.h
+@@ -110,4 +110,8 @@
+ struct _fluid_synth_t
+ {
++    /* LSFX: transient context for the next MIDI note-on, zero means native defaults. */
++    int lsfx_group_plus_one, lsfx_dry_override;
++    float lsfx_note_gain, lsfx_note_pan, lsfx_note_pitch;
++    unsigned char lsfx_channel_dry[16];
+     fluid_rec_mutex_t mutex;           /**< Lock for public API */
+     int use_mutex;                     /**< Use mutex for all public API functions? */
+diff --git a/src/synth/fluid_voice.h b/src/synth/fluid_voice.h
+--- a/src/synth/fluid_voice.h
++++ b/src/synth/fluid_voice.h
+@@ -59,4 +59,7 @@
+ struct _fluid_voice_t
+ {
++    /* LSFX note offsets stay with the voice throughout its envelope. */
++    int lsfx_dry_override;
++    float lsfx_note_gain, lsfx_note_pan, lsfx_note_pitch;
+     unsigned char status;
+     unsigned char can_access_rvoice; /* False if rvoice is being rendered in separate thread */
+diff --git a/src/synth/fluid_voice.c b/src/synth/fluid_voice.c
+--- a/src/synth/fluid_voice.c
++++ b/src/synth/fluid_voice.c
+@@ -329,10 +329,15 @@
+     UPDATE_RVOICE_R1(fluid_rvoice_set_synth_gain, voice->synth_gain);
++    /* LSFX: keep logical channel identity for MIDI, choke and sustain. */
++    voice->lsfx_dry_override = channel->synth->lsfx_dry_override;
++    voice->lsfx_note_gain = channel->synth->lsfx_note_gain > 0.0f ? channel->synth->lsfx_note_gain : 1.0f;
++    voice->lsfx_note_pan = channel->synth->lsfx_note_pan;
++    voice->lsfx_note_pitch = channel->synth->lsfx_note_pitch;
+     /* Set up buffer mapping, should be done more flexible in the future. */
+     i = 2 * channel->synth->audio_groups;
+     i += (voice->chan % channel->synth->effects_groups) * channel->synth->effects_channels;
+     UPDATE_RVOICE_GENERIC_I2(fluid_rvoice_buffers_set_mapping, &voice->rvoice->buffers, 2, i + SYNTH_REVERB_CHANNEL);
+     UPDATE_RVOICE_GENERIC_I2(fluid_rvoice_buffers_set_mapping, &voice->rvoice->buffers, 3, i + SYNTH_CHORUS_CHANNEL);
+-    i = 2 * (voice->chan % channel->synth->audio_groups);
++    i = 2 * (channel->synth->lsfx_group_plus_one > 0 ? channel->synth->lsfx_group_plus_one - 1 : voice->chan % channel->synth->audio_groups);
+     UPDATE_RVOICE_GENERIC_I2(fluid_rvoice_buffers_set_mapping, &voice->rvoice->buffers, 0, i);
+     UPDATE_RVOICE_GENERIC_I2(fluid_rvoice_buffers_set_mapping, &voice->rvoice->buffers, 1, i + 1);
+ 
+@@ -438,5 +443,5 @@
+     /* we use 24bit samples in fluid_rvoice_dsp. in order to normalize float
+      * samples to [0.0;1.0] divide samples by the max. value of an int24 and
+      * amplify them with the gain */
+-    return gain * voice->synth_gain / (INT24_MAX * 1.0f);
++    return gain * voice->synth_gain * voice->lsfx_note_gain / (INT24_MAX * 1.0f);
+ }
+@@ -715,6 +720,6 @@
+     case GEN_PAN:
+     case GEN_CUSTOM_BALANCE:
+         /* range checking is done in the fluid_pan and fluid_balance functions */
+-        voice->pan = fluid_voice_gen_value(voice, GEN_PAN);
++        voice->pan = fluid_voice_gen_value(voice, GEN_PAN) + voice->lsfx_note_pan;
+         voice->balance = fluid_voice_gen_value(voice, GEN_CUSTOM_BALANCE);
+         /* left amp */
+@@ -744,18 +749,18 @@
+         /* The testing for allowed range is done in 'fluid_ct2hz' */
+         voice->pitch = (fluid_voice_gen_value(voice, GEN_PITCH)
+                         + 100.0f * fluid_voice_gen_value(voice, GEN_COARSETUNE)
+-                        + fluid_voice_gen_value(voice, GEN_FINETUNE));
++                        + fluid_voice_gen_value(voice, GEN_FINETUNE) + voice->lsfx_note_pitch);
+         UPDATE_RVOICE_R1(fluid_rvoice_set_pitch, voice->pitch);
+         break;
+     case GEN_REVERBSEND:
+         /* The generator unit is 'tenths of a percent'. */
+-        voice->reverb_send = x / 1000.0f;
++        voice->reverb_send = (voice->lsfx_dry_override == 2 || (voice->lsfx_dry_override == 0 && voice->chan < 16 && voice->channel->synth->lsfx_channel_dry[voice->chan])) ? 0.0f : x / 1000.0f;
+         fluid_clip(voice->reverb_send, 0.f, 1.f);
+         UPDATE_RVOICE_BUFFERS_AMP(fluid_rvoice_buffers_set_amp, 2, fluid_voice_calculate_gain_amplitude(voice, voice->reverb_send));
+         break;
+     case GEN_CHORUSSEND:
+         /* The generator unit is 'tenths of a percent'. */
+-        voice->chorus_send = x / 1000.0f;
++        voice->chorus_send = (voice->lsfx_dry_override == 2 || (voice->lsfx_dry_override == 0 && voice->chan < 16 && voice->channel->synth->lsfx_channel_dry[voice->chan])) ? 0.0f : x / 1000.0f;
+         fluid_clip(voice->chorus_send, 0.f, 1.f);
+         UPDATE_RVOICE_BUFFERS_AMP(fluid_rvoice_buffers_set_amp, 3, fluid_voice_calculate_gain_amplitude(voice, voice->chorus_send));
+         break;
+diff --git a/src/synth/fluid_synth.c b/src/synth/fluid_synth.c
+--- a/src/synth/fluid_synth.c
++++ b/src/synth/fluid_synth.c
+@@ -59,6 +59,48 @@
+ static int fluid_synth_noteon_LOCAL(fluid_synth_t *synth, int chan, int key,
+                                     int vel);
+ static int fluid_synth_noteoff_LOCAL(fluid_synth_t *synth, int chan, int key);
++
++/* Private LSFX API; callers serialize synthesis and MIDI operations. */
++FLUIDSYNTH_API int lsfx_fluid_noteon(fluid_synth_t *synth, int chan, int key, int vel,
++                                   int group, int dry_override, float gain, float pan, float pitch)
++{
++    int result;
++    if(!synth || group < 0 || group >= synth->audio_groups) return FLUID_FAILED;
++    fluid_synth_api_enter(synth);
++    synth->lsfx_group_plus_one = group + 1;
++    synth->lsfx_dry_override = dry_override;
++    synth->lsfx_note_gain = gain;
++    synth->lsfx_note_pan = pan;
++    synth->lsfx_note_pitch = pitch;
++    result = fluid_synth_noteon(synth, chan, key, vel);
++    synth->lsfx_group_plus_one = synth->lsfx_dry_override = 0;
++    synth->lsfx_note_gain = synth->lsfx_note_pan = synth->lsfx_note_pitch = 0;
++    fluid_synth_api_exit(synth);
++    return result;
++}
++
++/* Suppress shared sends for inherited auxiliary routes without changing SF2
++ * generator or controller values; explicit note routes retain their own state. */
++FLUIDSYNTH_API int lsfx_fluid_channel_dry(fluid_synth_t *synth, int chan, int dry)
++{
++    int i;
++    if(!synth || chan < 0 || chan >= 16 || chan >= synth->midi_channels) return FLUID_FAILED;
++    dry = dry != 0;
++    fluid_synth_api_enter(synth);
++    if(synth->lsfx_channel_dry[chan] == dry) { fluid_synth_api_exit(synth); return 0; }
++    synth->lsfx_channel_dry[chan] = (unsigned char)dry;
++    for(i = 0; i < synth->polyphony; ++i)
++    {
++        fluid_voice_t *voice = synth->voice[i];
++        if(voice && voice->chan == chan && fluid_voice_is_playing(voice) && voice->lsfx_dry_override == 0)
++        {
++            fluid_voice_update_param(voice, GEN_REVERBSEND);
++            fluid_voice_update_param(voice, GEN_CHORUSSEND);
++        }
++    }
++    fluid_synth_api_exit(synth);
++    return 1;
++}
+ static int fluid_synth_cc_LOCAL(fluid_synth_t *synth, int channum, int num, int old_value);
+ static int fluid_synth_sysex_midi_tuning(fluid_synth_t *synth, const char *data,
+         int len, char *response,

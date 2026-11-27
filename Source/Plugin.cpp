@@ -24,6 +24,9 @@
 #include <iterator>
 #include "VirtualProgramMap.h"
 #include "NoteAssignments.h"
+#include "NoteRouteGroups.h"
+extern "C" int lsfx_fluid_noteon(fluid_synth_t*,int,int,int,int,int,float,float,float);
+extern "C" int lsfx_fluid_channel_dry(fluid_synth_t*,int,int);
 #include "SoundFontExport.h"
 #include "SfzSoundFontExport.h"
 #if JUCE_WINDOWS
@@ -59,7 +62,7 @@ lsfx::sfzexport::Audio decodeSfzExportSample(juce::AudioFormatManager& formats,c
     return a;
 }
 constexpr int channels = 16;
-constexpr auto lsfxVersion="0.99.2 TEST30";
+constexpr auto lsfxVersion="0.99.2 TEST31";
 constexpr auto lsfxReleaseDate="27 November 2026 (test build)";
 constexpr auto lsfxProjectUrl="https://github.com/Lo-lo78/LSFX";
 constexpr auto lsfxContactEmail="vmanolo301@gmail.com";
@@ -72,6 +75,7 @@ bool insideLibrary(const juce::File& f) { const auto root=presetRoot(); return f
 juce::File savedDirectory() { const auto path=setting("saveDirectory"); if(juce::File::isAbsolutePath(path)) { juce::File f(path); if(insideLibrary(f)&&f.isDirectory()) return f; } return presetRoot(); }
 
 constexpr int stereoBuses=lsfx::stereoOutputCount, renderChunk=1024;
+constexpr int sf2Groups=lsfx::NoteRouteGroups::count;
 // TEST26.1: multigroup is the default validation build. The stereo-only
 // recovery build remains selectable at configure time. Windows host stability
 // is not established by the standalone tests.
@@ -294,11 +298,10 @@ struct Engine {
     FXValues lastFx{};
     lsfx::OutputStage output;
     // Distinct audio/FX planes; never alias pointers passed to FluidSynth.
-    std::array<std::array<float,renderChunk>,2*channels> dry{};
+    std::array<std::array<float,renderChunk>,2*sf2Groups> dry{};
+    lsfx::NoteRouteGroups noteGroups;
     std::array<std::array<float,renderChunk>,4> wet{};
     std::array<int,channels> routes{};
-    struct SendOffset { float original=0, written=0; bool engaged=false; };
-    std::array<std::array<SendOffset,2>,channels> sendOffsets{};
     // Preserve native voice trim and its MIDI semantics.
     std::array<lsfx::SF2ChannelTrim,channels> sf2Trims;
     std::array<lsfx::ChannelCompressor,channels> compressors;
@@ -491,9 +494,9 @@ public:
         auto it=noteAssignments.find(code);return it==noteAssignments.end()?std::map<int,lsfx::NoteAssignment>{}:it->second;
     }
     void setNote(int code,int note,lsfx::NoteAssignment value) {
-        std::lock_guard<std::mutex> lock(noteMutex);lsfx::setNoteAssignment(noteAssignments,code,note,value);
+        std::lock_guard<std::mutex> audio(engineMutex);std::lock_guard<std::mutex> lock(noteMutex);lsfx::setNoteAssignment(noteAssignments,code,note,value);
     }
-    void clearNotes(int code) {std::lock_guard<std::mutex> lock(noteMutex);noteAssignments.erase(code);}
+    void clearNotes(int code) {std::lock_guard<std::mutex> audio(engineMutex);std::lock_guard<std::mutex> lock(noteMutex);noteAssignments.erase(code);}
     void setNoteLearnChannel(int ch) noexcept {noteLearnChannel.store(ch);}
     uint64_t lastLearnedNote() const noexcept {return learnedNote.load();}
     juce::File currentPresetFile() { std::lock_guard<std::mutex> lock(presetMutex); return currentPreset; }
@@ -545,7 +548,7 @@ public:
     juce::AudioParameterChoice& midiFXParameter() { return *midiFX; }
     juce::AudioParameterChoice& sfzQualityParameter() { return *sfzQuality; }
     juce::RangedAudioParameter& fxParameter(int i) { return *fxParams[i]; }
-    juce::String diagnostic() const { return "Active voices: "+juce::String(activeVoices.load())+"; SF2 idle sleep: "+(sleeping.load()?juce::String("yes"):juce::String("no"))+"; dropped engine-swap blocks: "+juce::String(droppedBlocks.load())+"; MIDI program changes: "+juce::String(programChanges.load())+"; last program change: "+lastProgramText()+"; CH 10 CC7: "+juce::String(getControl(9,7))+"; CH 10 CC11: "+juce::String(getControl(9,11))+"; CH 10 bank/program: "+juce::String(current(9)>>7)+"/"+juce::String(current(9)&127)+"; CH 10 reverb send: "+juce::String(getControl(9,91))+"; CH 10 chorus send: "+juce::String(getControl(9,93))+"; MIDI CC91: "+juce::String(reverbCC.load())+"; MIDI CC93: "+juce::String(chorusCC.load())+"; SysEx received: "+juce::String(sysexCount.load())+"; FX SysEx applied: "+juce::String(fxSysexCount.load()); }
+    juce::String diagnostic() const { return "Note route pool misses: "+juce::String(noteRouteOverflow.load())+"; Active voices: "+juce::String(activeVoices.load())+"; SF2 idle sleep: "+(sleeping.load()?juce::String("yes"):juce::String("no"))+"; dropped engine-swap blocks: "+juce::String(droppedBlocks.load())+"; MIDI program changes: "+juce::String(programChanges.load())+"; last program change: "+lastProgramText()+"; CH 10 CC7: "+juce::String(getControl(9,7))+"; CH 10 CC11: "+juce::String(getControl(9,11))+"; CH 10 bank/program: "+juce::String(current(9)>>7)+"/"+juce::String(current(9)&127)+"; CH 10 reverb send: "+juce::String(getControl(9,91))+"; CH 10 chorus send: "+juce::String(getControl(9,93))+"; MIDI CC91: "+juce::String(reverbCC.load())+"; MIDI CC93: "+juce::String(chorusCC.load())+"; SysEx received: "+juce::String(sysexCount.load())+"; FX SysEx applied: "+juce::String(fxSysexCount.load()); }
     int getControl(int ch,int id) const {
         const int i=controlIndex(ch,id), pendingValue=controlCommands[i].load();
         return pendingValue==unset?controlValues[i].load():pendingValue;
@@ -612,6 +615,7 @@ public:
         for(const auto m:midi) if(m.numBytes>0&&m.data[0]<0xf8) { relevantMidi=true; break; }
         const int before=fluid_synth_get_active_voice_count(s);
         const int sleepAfter=int(engine->rate*2.0);
+        if(before==0&&engine->quietSamples>=sleepAfter) engine->noteGroups.reset();
         if(!engine->hasSFZ()&&!controlChanged&&!relevantMidi&&before==0&&engine->quietSamples>=sleepAfter) { activeVoices.store(0); sleeping.store(true); midi.clear(); return; }
         sleeping.store(false);
         if(controlChanged||relevantMidi||before>0) engine->quietSamples=0;
@@ -635,18 +639,25 @@ public:
             } else {
                 for(int offset=0;offset<count;) {
                     const int n=juce::jmin(renderChunk,count-offset), pos=start+offset;
-                    std::array<float*,2*channels> dryPtrs{};
+                    std::array<float*,2*sf2Groups> dryPtrs{};
                     std::array<float*,4> wetPtrs{};
-                    for(size_t i=0;i<dryPtrs.size();++i) { dryPtrs[i]=engine->dry[i].data(); std::fill_n(dryPtrs[i],n,0.0f); }
+                    for(int i=0;i<2*engine->noteGroups.used;++i) { dryPtrs[size_t(i)]=engine->dry[size_t(i)].data(); std::fill_n(dryPtrs[size_t(i)],n,0.0f); }
                     for(size_t i=0;i<wetPtrs.size();++i) { wetPtrs[i]=engine->wet[i].data(); std::fill_n(wetPtrs[i],n,0.0f); }
                     if(engine->hasSF2&&fluid_synth_process(s,n,int(wetPtrs.size()),wetPtrs.data(),int(dryPtrs.size()),dryPtrs.data())!=FLUID_OK) { offset+=n; continue; }
                     if(engine->hasSF2) for(int ch=0;ch<channels;++ch) {
-                        if(engine->sfzActive[ch]) continue; // same MIDI channel must not process its detector twice
-                        engine->compressors[ch].process(dryPtrs[2*ch],dryPtrs[2*ch+1],n);
-                        const int index=dest[engine->routes[ch]];
-                        if(index<0) continue; // inactive host bus: never leak to Main
-                        b.addFrom(index,pos,dryPtrs[2*ch],n);
-                        b.addFrom(index+1,pos,dryPtrs[2*ch+1],n);
+                        if(engine->sfzActive[ch]) continue;
+                        std::array<float*,sf2Groups> left{},right{};
+                        std::array<int,sf2Groups> routes{};
+                        int pairs=1;left[0]=dryPtrs[2*ch];right[0]=dryPtrs[2*ch+1];routes[0]=engine->routes[ch];
+                        for(int group=channels;group<engine->noteGroups.used;++group) if(engine->noteGroups.owner[group]==ch) {
+                            left[pairs]=dryPtrs[2*group];right[pairs]=dryPtrs[2*group+1];routes[pairs]=engine->noteGroups.destination[group];++pairs;
+                        }
+                        engine->compressors[ch].processSplit(left.data(),right.data(),pairs,n);
+                        for(int pair=0;pair<pairs;++pair) {
+                            const int index=dest[routes[pair]];
+                            if(index<0) continue;
+                            b.addFrom(index,pos,left[pair],n);b.addFrom(index+1,pos,right[pair],n);
+                        }
                     }
                     // One shared native reverb/chorus group; only Main receives returns.
                     if(engine->hasSF2) for(int i=0;i<4;++i) b.addFrom(i%2,pos,wetPtrs[i],n);
@@ -691,7 +702,16 @@ public:
                             learnedNote.store((uint64_t(++noteEventSerial)<<32)|(address<<7)|uint64_t(a),std::memory_order_relaxed);
                         }
                         if(auto* z=engine->sfzActive[ch]) { if(v) sfizz_send_note_on(z->synth,0,a,v); else sfizz_send_note_off(z->synth,0,a,0); }
-                        else if(const auto* preset=findPreset(engine->map,selected[ch].load());preset&&preset->sfzIndex<0) { if(v) fluid_synth_noteon(s,ch,a,v); else fluid_synth_noteoff(s,ch,a); }
+                        else if(const auto* preset=findPreset(engine->map,selected[ch].load());preset&&preset->sfzIndex<0) {
+                            if(!v) fluid_synth_noteoff(s,ch,a);
+                            else if constexpr (sf2MultiOutput) {
+                                const auto assignment=lsfx::noteAssignment(noteAssignments,selected[ch].load(),a);
+                                const int group=assignment.output<0?ch:engine->noteGroups.acquire(ch,assignment.output);
+                                if(group<0) {++noteRouteOverflow;} // do not send an explicitly routed note to the wrong bus
+                                else lsfx_fluid_noteon(s,ch,a,v,group,assignment.output<0?0:assignment.output==0?1:2,
+                                    juce::Decibels::decibelsToGain(float(assignment.level)*.1f),float(assignment.pan)*5.0f,float(assignment.pitch));
+                            } else fluid_synth_noteon(s,ch,a,v);
+                        }
                     } break;
                     case 0xa0: if(n>=3) {if(auto* z=engine->sfzActive[ch]) sfizz_send_poly_aftertouch(z->synth,0,a,v); else fluid_synth_key_pressure(s,ch,a,v);} break;
                     case 0xb0: if(n>=3) { receiveFluidCC(*engine,ch,a,v,f,fx); if(a==121||a==6||a==38||a==96||a==97) { if(!engine->sfzActive[ch]) refreshFluidControls(s,ch); updateSF2Trim(*engine,ch); } if constexpr (sf2MultiOutput) updateRouteSend(*engine,ch); } break;
@@ -1017,24 +1037,7 @@ private:
     std::array<juce::AudioParameterChoice*,channels> channelRoute{};
     std::array<std::array<juce::RangedAudioParameter*,lsfx::compCount>,channels> compParams{};
     static bool updateRouteSend(Engine& e,int ch) {
-        bool changed=false;
-        const int generators[]={GEN_REVERBSEND,GEN_CHORUSSEND};
-        for(int i=0;i<2;++i) {
-            auto& state=e.sendOffsets[ch][i]; const int gen=generators[i];
-            const bool bypass=e.routes[ch]!=0;
-            if(!bypass&&!state.engaged) continue;
-            const float current=fluid_synth_get_gen(e.synth,ch,gen);
-            if(!std::isfinite(current)) continue;
-            if(!state.engaged||std::abs(current-state.written)>0.001f) state.original=current;
-            // Negative absolute offset suppresses SF2 preset, instrument and CC sends.
-            const float next=bypass?-10000.0f:state.original;
-            if(std::abs(current-next)>0.001f) {
-                if(fluid_synth_set_gen(e.synth,ch,gen,next)!=FLUID_OK) continue;
-                changed=true;
-            }
-            state.written=next; state.engaged=bypass;
-        }
-        return changed;
+        return lsfx_fluid_channel_dry(e.synth,ch,e.routes[ch]!=0?1:0)>0;
     }
     static bool updateRouteSends(Engine& e) {
         bool changed=false; for(int ch=0;ch<channels;++ch) changed=updateRouteSend(e,ch)||changed; return changed;
@@ -1089,6 +1092,7 @@ private:
     std::mutex noteMutex;
     lsfx::NoteAssignments noteAssignments;
     std::atomic<int> noteLearnChannel{-1};
+    std::atomic<int> noteRouteOverflow{0};
     std::atomic<uint64_t> learnedNote{0};
     uint32_t noteEventSerial=0; // written only by processBlock
     std::condition_variable cv;
@@ -1210,8 +1214,8 @@ private:
                         // Unity native gain, as in Scoring Synth. No artificial per-voice boost.
                         fluid_settings_setnum(fresh->settings,"synth.gain",1.0);
                         fluid_settings_setint(fresh->settings,"synth.midi-channels",16);
-                        fluid_settings_setint(fresh->settings,"synth.audio-channels",sf2MultiOutput?channels:1);
-                        fluid_settings_setint(fresh->settings,"synth.audio-groups",sf2MultiOutput?channels:1);
+                        fluid_settings_setint(fresh->settings,"synth.audio-channels",sf2MultiOutput?sf2Groups:1);
+                        fluid_settings_setint(fresh->settings,"synth.audio-groups",sf2MultiOutput?sf2Groups:1);
                         fluid_settings_setint(fresh->settings,"synth.effects-groups",1);
                         fluid_settings_setint(fresh->settings,"synth.polyphony",256);
                         fluid_settings_setint(fresh->settings,"synth.reverb.active",0);
@@ -1222,7 +1226,7 @@ private:
                         fresh->synth=new_fluid_synth(fresh->settings);
                     }
                     if(!fresh->synth) error="Unable to create FluidSynth";
-                    else if(sf2MultiOutput&&(fluid_synth_count_audio_channels(fresh->synth)!=channels||fluid_synth_count_audio_groups(fresh->synth)!=channels||fluid_synth_count_effects_groups(fresh->synth)!=1||fluid_synth_count_effects_channels(fresh->synth)!=2)) {
+                    else if(sf2MultiOutput&&(fluid_synth_count_audio_channels(fresh->synth)!=sf2Groups||fluid_synth_count_audio_groups(fresh->synth)!=sf2Groups||fluid_synth_count_effects_groups(fresh->synth)!=1||fluid_synth_count_effects_channels(fresh->synth)!=2)) {
                         error="Unsupported FluidSynth multigroup layout";
                     } else {
                         // Every distinct source is loaded once into the validated stereo synth.
@@ -1324,16 +1328,16 @@ private:
                 }
                 for(int i=0;i<channels;++i) { commands[i].store(-1); sfzNeeded[i].store(-1); sfzRetry[i].store(-1); selected[i].store(r.programs[i]); }
                 if(empty) {
-                    activeVoices.store(0); sleeping.store(false); droppedBlocks.store(0);
+                    activeVoices.store(0); sleeping.store(false); droppedBlocks.store(0); noteRouteOverflow.store(0);
                     programChanges.store(0); lastProgram.store(-1); reverbCC.store(0);
                     chorusCC.store(0); sysexCount.store(0); fxSysexCount.store(0);
                     panic.store(false);
                 }
                 clearing.store(false);
-              }
               { std::lock_guard<std::mutex> notes(noteMutex);
                 if(r.restoredNotes) noteAssignments=std::move(*r.restoredNotes);
                 if(error.isEmpty()&&r.resetGainBank>=0) lsfx::clearAddress(noteAssignments,r.resetGainBank,r.resetGainProgram);
+              }
               }
               latest.restoredNotes.reset(); latest.restoredGains.reset(); latest.resetGainBank=-1; latest.resetGainProgram=-1;
               loadingSerial=0; failedSerial=error.isNotEmpty()?r.serial:~uint64_t(0);
@@ -1416,7 +1420,7 @@ public:
     explicit Editor(Processor& p) : AudioProcessorEditor(p), proc(p) {
         setWantsKeyboardFocus(true);
         setFocusContainerType(juce::Component::FocusContainerType::keyboardFocusContainer);
-        title.setText(sf2MultiOutput?"LSFX 0.99.2 TEST30":"LSFX 0.99.2 TEST30 SF2 stereo recovery",juce::dontSendNotification); title.setFont(juce::FontOptions(21.0f)); title.setAccessible(false); addAndMakeVisible(title);
+        title.setText(sf2MultiOutput?"LSFX 0.99.2 TEST31":"LSFX 0.99.2 TEST31 SF2 stereo recovery",juce::dontSendNotification); title.setFont(juce::FontOptions(21.0f)); title.setAccessible(false); addAndMakeVisible(title);
         status.setText("No SoundFont loaded",juce::dontSendNotification); status.setTitle("Instrument status"); addAndMakeVisible(status);
         setup(open,"Open SF2 or SFZ",1); setup(parameters,"Parameters",2); setup(channel,"MIDI channel",3); setup(bank,"Bank",37); setup(program,"Program",38); setup(level,"Master output gain",36);
         setup(grid,"Parameter grid",1); setup(value,"Parameter value",2); setup(closeGrid,"Close parameters",3);
@@ -1476,7 +1480,7 @@ public:
         setup(parentButton,"Back",2); parentButton.onClick=[this]{parentFolder();};
         setup(panelOK,"OK",2); panelOK.onClick=[this]{if(panelAction) { auto action=panelAction; action(); }};
         setup(panelCancel,"Cancel",3); panelCancel.onClick=[this]{cancelPanel();};
-        setup(noteCell,"Note assignments",1);noteCell.onClick=[this]{noteEditing=!noteEditing;updateNoteCell(true);};
+        setup(noteCell,"Note assignments",1);noteCell.onClick=[this]{updateNoteCell(true);};
         panelText.setTitle("Preset name"); panelText.setWantsKeyboardFocus(true); panelText.setExplicitFocusOrder(1); panelText.addKeyListener(this); addAndMakeVisible(panelText);
         panelText.onReturnKey=[this]{if(panelMode==Panel::name&&panelAction) {auto action=panelAction;action();}};
         panelText.onEscapeKey=[this]{cancelPanel();};
@@ -1552,7 +1556,7 @@ public:
                 const auto list=visibleNoteRows();const auto first=notePageStart(list);
                 const int row=(e.getPosition().y-noteArea.getY())/25-1;
                 const int col=(e.getPosition().x-noteArea.getX())/juce::jmax(1,noteArea.getWidth()/4);
-                if(row>=0&&row<12&&first+row<int(list.size())) {noteSelected=list[size_t(first+row)];noteColumn=juce::jlimit(0,3,col);noteEditing=false;focus(noteCell);updateNoteCell(true);}
+                if(row>=0&&row<12&&first+row<int(list.size())) {noteSelected=list[size_t(first+row)];noteColumn=juce::jlimit(0,3,col);focus(noteCell);updateNoteCell(true);}
             }
             return;
         }
@@ -1626,7 +1630,7 @@ private:
     enum class Panel {none,browser,name,confirm,source,about,exportProgress,notes};
     Keyed<juce::TextButton> noteCell{"Note assignments"};
     int noteProgram=0,noteChannel=0,noteSelected=-1,noteColumn=0;
-    bool noteEditing=false,noteLearn=true;
+    bool noteLearn=false;
     uint64_t noteEventSeen=0;
     std::map<int,lsfx::NoteAssignment> noteRows;
     juce::Rectangle<int> noteArea;
@@ -2534,8 +2538,8 @@ private:
         }
     }
     void updateNoteCell(bool announceValue) {
-        const auto text=noteSelected<0?juce::String("No assigned notes. Play a MIDI note to select it."):
-            noteName(noteSelected)+", "+noteColumnName(noteColumn)+", "+noteValue(selectedNoteValue(noteSelected),noteColumn)+(noteEditing?", Edit":"");
+        const auto text=noteSelected<0?juce::String("No assigned notes. Alt+M enables MIDI learn."):
+            noteName(noteSelected)+", "+noteColumnName(noteColumn)+", "+noteValue(selectedNoteValue(noteSelected),noteColumn);
         noteCell.setButtonText(text);noteCell.setName(text);noteCell.setTitle(text);repaint();
         if(announceValue)speak(noteCell,text);
     }
@@ -2543,29 +2547,33 @@ private:
         if(chooser||catalogBusy||importInProgress||cached.loading)return;
         noteChannel=selectedChannel();noteProgram=proc.current(noteChannel);
         if(!findPreset(cached.presets,noteProgram)) {announce("Select a mapped program first");return;}
-        noteRows=proc.notesForProgram(noteProgram);noteSelected=noteRows.empty()?-1:noteRows.begin()->first;noteColumn=0;noteEditing=false;noteLearn=true;
+        noteRows=proc.notesForProgram(noteProgram);noteSelected=noteRows.empty()?-1:noteRows.begin()->first;noteColumn=0;noteLearn=false;
         hideMainForPanel();hidePanelControls();panelMode=Panel::notes;
-        setPanelLabel("Note mixer draft. Audio not yet affected. Bank "+number(noteProgram>>7)+", Program "+number(noteProgram&127)+", Channel "+juce::String(noteChannel+1)+". MIDI learn on. Enter edits; Alt+M toggles learn.");
+        const auto* preset=findPreset(cached.presets,noteProgram);
+        setPanelLabel(juce::String(preset&&preset->sfzIndex<0&&sf2MultiOutput?"SF2 note mixer. ":"Note mixer: audio not yet supported for this engine. ")+"Bank "+number(noteProgram>>7)+", Program "+number(noteProgram&127)+", Channel "+juce::String(noteChannel+1)+". MIDI learn off. Alt+M toggles learn. Alt+arrows edit.");
         noteCell.setVisible(true);panelLabel.setVisible(true);panelCancel.setButtonText("Close");panelCancel.setTitle("Close");panelCancel.setVisible(true);
-        noteEventSeen=proc.lastLearnedNote();proc.setNoteLearnChannel(noteChannel);startTimerHz(30);
+        noteEventSeen=proc.lastLearnedNote();proc.setNoteLearnChannel(-1);startTimerHz(30);
         resized();updateNoteCell(false);focus(noteCell);announce(panelLabel.getText());
     }
     void pollNoteLearn() {
         const auto event=proc.lastLearnedNote();if(event==noteEventSeen)return;noteEventSeen=event;
         if(!noteLearn||!hasKeyboardFocus(true)||int((event&0xffffffffull)>>7)!=noteProgram)return;
-        noteSelected=int(event&127u);noteColumn=0;noteEditing=true;focus(noteCell);updateNoteCell(true);
+        const int next=int(event&127u);if(next==noteSelected&&noteColumn==0)return;
+        noteSelected=next;noteColumn=0;focus(noteCell);updateNoteCell(true);
     }
-    void changeNoteValue(int direction,bool reset=false) {
+    void changeNoteValue(int direction,bool reset=false,bool coarse=false,bool boundary=false) {
         if(noteSelected<0)return;
         auto value=selectedNoteValue(noteSelected);const auto before=value;const lsfx::NoteAssignment defaults;
+        const int delta=direction*stepWidths[stepIndex]*(coarse?pageMultiplier:1);
+        auto adjust=[&](int old,int low,int high,int amount) {return boundary?(direction>0?high:low):juce::jlimit(low,high,old+amount);};
         switch(noteColumn) {
-            case 0:value.output=reset?defaults.output:juce::jlimit(-1,stereoBuses-1,value.output+direction);break;
-            case 1:value.level=reset?0:juce::jlimit(-600,240,value.level+direction);break;
-            case 2:value.pan=reset?0:juce::jlimit(-100,100,value.pan+direction);break;
-            default:value.pitch=reset?0:juce::jlimit(-1200,1200,value.pitch+direction);break;
+            case 0:value.output=reset?defaults.output:adjust(value.output,-1,stereoBuses-1,direction);break;
+            case 1:value.level=reset?0:adjust(value.level,-600,240,delta);break;
+            case 2:value.pan=reset?0:adjust(value.pan,-100,100,delta);break;
+            default:value.pitch=reset?0:adjust(value.pitch,-1200,1200,delta);break;
         }
         if(value.output==before.output&&value.level==before.level&&value.pan==before.pan&&value.pitch==before.pitch)return;
-        proc.setNote(noteProgram,noteSelected,value);noteRows=proc.notesForProgram(noteProgram);updateNoteCell(true);
+        proc.setNote(noteProgram,noteSelected,value);noteRows=proc.notesForProgram(noteProgram);updateNoteCell(false);speak(noteCell,noteValue(value,noteColumn));
     }
     bool handleNoteKey(const juce::KeyPress& k) {
         const auto key=k.getKeyCode();const auto m=k.getModifiers();const bool alt=m.isAltDown(),ctrl=m.isCtrlDown()||m.isCommandDown();
@@ -2577,27 +2585,37 @@ private:
         }
         if(key==juce::KeyPress::tabKey) {focus(panelCancel.hasKeyboardFocus(true)?static_cast<juce::Component&>(noteCell):static_cast<juce::Component&>(panelCancel));return true;}
         if(panelCancel.hasKeyboardFocus(true)) {if(enter||key==juce::KeyPress::spaceKey)closePanel();return true;}
-        if(enter||key==juce::KeyPress::spaceKey) {if(noteSelected>=0){noteEditing=!noteEditing;updateNoteCell(true);}return true;}
+        if(enter||key==juce::KeyPress::spaceKey) {if(noteSelected>=0)updateNoteCell(true);return true;}
         if(key==juce::KeyPress::backspaceKey&&!ctrl) {changeNoteValue(0,true);return true;}
         if(key==juce::KeyPress::deleteKey&&noteSelected>=0) {
             const int old=noteSelected;proc.setNote(noteProgram,old,{});noteRows=proc.notesForProgram(noteProgram);
             auto next=noteRows.lower_bound(old);if(next==noteRows.end()&&!noteRows.empty())next=std::prev(noteRows.end());
-            noteSelected=next==noteRows.end()?-1:next->first;noteEditing=false;updateNoteCell(true);return true;
+            noteSelected=next==noteRows.end()?-1:next->first;updateNoteCell(true);return true;
         }
-        if(key==juce::KeyPress::upKey||key==juce::KeyPress::downKey) {
-            if(!ctrl&&(alt||noteEditing)) {changeNoteValue(key==juce::KeyPress::upKey?1:-1);return true;}
+        const bool horizontal=key==juce::KeyPress::leftKey||key==juce::KeyPress::rightKey;
+        const bool vertical=key==juce::KeyPress::upKey||key==juce::KeyPress::downKey;
+        const bool page=key==juce::KeyPress::pageUpKey||key==juce::KeyPress::pageDownKey;
+        const bool boundary=key==juce::KeyPress::homeKey||key==juce::KeyPress::endKey;
+        const int direction=key==juce::KeyPress::upKey||key==juce::KeyPress::pageUpKey||key==juce::KeyPress::homeKey||key==juce::KeyPress::rightKey?1:-1;
+        // Same direct Alt gestures as Alt+L. Plain arrows always navigate rows/columns.
+        if(alt&&!ctrl&&!m.isShiftDown()) {
+            if(horizontal) {changeStep(noteCell,direction);return true;}
+            if(vertical||page||boundary) {changeNoteValue(direction,false,page,boundary);return true;}
         }
-        if(key==juce::KeyPress::leftKey||key==juce::KeyPress::rightKey) {
-            noteColumn=juce::jlimit(0,3,noteColumn+(key==juce::KeyPress::leftKey?-1:1));updateNoteCell(true);return true;
+        if(alt|| (ctrl&&!boundary)) return true;
+        if(horizontal) {
+            const int next=juce::jlimit(0,3,noteColumn+direction);
+            if(next!=noteColumn) {noteColumn=next;updateNoteCell(true);}return true;
         }
-        if(key==juce::KeyPress::homeKey||key==juce::KeyPress::endKey||key==juce::KeyPress::upKey||key==juce::KeyPress::downKey||key==juce::KeyPress::pageUpKey||key==juce::KeyPress::pageDownKey) {
+        if(boundary||vertical||page) {
             const auto list=visibleNoteRows();if(list.empty())return true;
             int index=int(std::find(list.begin(),list.end(),noteSelected)-list.begin());
+            const int oldColumn=noteColumn;
             if(key==juce::KeyPress::homeKey) {index=0;if(ctrl)noteColumn=0;}
             else if(key==juce::KeyPress::endKey) {index=int(list.size())-1;if(ctrl)noteColumn=3;}
             else index+=key==juce::KeyPress::upKey?-1:key==juce::KeyPress::downKey?1:key==juce::KeyPress::pageUpKey?-12:12;
             const int next=list[size_t(juce::jlimit(0,int(list.size())-1,index))];
-            if(next!=noteSelected||ctrl) {noteSelected=next;noteEditing=false;updateNoteCell(true);}return true;
+            if(next!=noteSelected||noteColumn!=oldColumn) {noteSelected=next;updateNoteCell(true);}return true;
         }
         return true;
     }

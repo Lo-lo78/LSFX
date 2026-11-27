@@ -31,3 +31,7 @@ About panel and caret navigation adapted from LJuno-116 0.99.67 (AGPL-3.0-or-lat
 ## TEST27.1: FluidSynth 2.6.3
 
 The runner now supplies FluidSynth 2.6.3. The upstream header in [v2.6.3](https://github.com/FluidSynth/fluidsynth/blob/v2.6.3/src/utils/fluidsynth_priv.h) still contains the same non-VLA allocation expression. The existing patch is retained for both 2.6.2 and 2.6.3; unknown versions are rejected. The mandatory native multigroup and hybrid processor tests remain enabled.
+
+## TEST31 — FluidSynth note routing extension
+
+`Tools/fluidsynth-note-routing.patch` modifies the pinned FluidSynth 2.6.2/2.6.3 LGPL library: private note-on context, voice mixer mapping, per-note gain/pan/pitch, and per-voice send suppression. The overlay applies both this patch and the VLA fix. The corresponding LGPL source and relinking obligations still apply.

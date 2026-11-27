@@ -42,6 +42,30 @@ struct ChannelCompressor {
         release=float(-std::expm1(-1.0/(rate*p[compRelease]*.001)));
         threshold=p[compThreshold]; makeup=p[compMakeup]; mix=p[compMix]*.01f;
     }
+    // One detector for the sum of all outputs of the original MIDI channel;
+    // apply the same gain to each stereo pair, preserving independent routing.
+    void processSplit(float* const* left,float* const* right,int pairs,int n) noexcept {
+        if(mix<=0||pairs<=0)return;
+        if(pairs==1){process(left[0],right[0],n);return;}
+        constexpr float dbToLog=0.1151292546497023f;
+        for(int i=0;i<n;++i) {
+            float l=0,r=0;
+            for(int p=0;p<pairs;++p) {
+                auto& a=left[p][i];auto& b=right[p][i];
+                if(!std::isfinite(a))a=0;if(!std::isfinite(b))b=0;
+                l+=a;r+=b;
+            }
+            const float peak=(std::min)((std::max)(std::abs(l),std::abs(r)),1000.0f);
+            const float squared=peak*peak;
+            average=squared+rms*(average-squared);
+            if(average<1e-18f)average=0;
+            const float target=(std::max)(0.0f,10.0f*std::log10((std::max)(1e-18f,average))-threshold);
+            over+=(target-over)*(target>over?attack:release);
+            if(over<1e-12f)over=0;
+            const float scale=1.0f+mix*(std::exp((makeup-over*ratio)*dbToLog)-1.0f);
+            for(int p=0;p<pairs;++p){left[p][i]*=scale;right[p][i]*=scale;}
+        }
+    }
     void process(float* l,float* r,int n) noexcept {
         if(mix<=0) return;
         constexpr float dbToLog=0.1151292546497023f;

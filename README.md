@@ -1,4 +1,4 @@
-# LSFX 0.99.2 TEST30 — 64 stereo outputs
+# LSFX 0.99.2 TEST31 — SF2 note routing and keyboard navigation
 
 27 November 2026 · Windows x64 VST3 · Lo-lo
 
@@ -41,3 +41,11 @@ TEST27.1 build fix: accept the reviewed FluidSynth 2.6.3 vcpkg port while retain
 
 - 64 stereo buses (128 mono pins) including Main 1/2. All sixteen MIDI channels may select any destination; existing integer route indices retain their meaning. The FluidSynth internal dry groups and channel compressors remain at 16. The note mixer draft accepts all new destinations but is still not applied to audio.
 - Old preset/project route indices are preserved. Previously recorded host automation for routing may need to be recreated because the normalized choice range has changed.
+
+## TEST31: SF2 note mixer implementation (validation build)
+
+- Alt+Enter opens the note grid for the selected program, with MIDI learn **off**. Alt+M toggles learning manually. Plain Up/Down navigates notes; Left/Right navigates Output, Level, Pan and Pitch. Alt+Up/Down changes the value, Alt+Page Up/Down changes numeric values coarsely, Alt+Home/End sets maximum/minimum, Alt+Left/Right changes the shared step. Plain Home/End goes to the first/last row of the column, Ctrl+Home/End to the first/last grid cell. Boundaries are silent. Backspace resets the cell, Delete removes the note. Esc closes.
+- The patched FluidSynth 2.6.2/2.6.3 retains the original MIDI channel and assigns newly started SF2 voices to individual mixer groups. Output, Level, Pan and Pitch apply to new SF2 notes, not notes already ringing. Inherited routes still follow the channel; explicit routes stay fixed. Auxiliary voices do not send to shared effects. A single compressor per original channel uses a detector based on its summed signals and applies the same gain to each separated pair.
+- 64 stereo host destinations remain unchanged. The synth has 128 internal groups (16 inherited and 112 extra channel/destination combinations). Slots are retained until a period of silence/reload, not recycled while voices can ring. On exhaustion, a newly assigned note is not played on the wrong bus; Alt+S reports pool misses. CPU and Windows stability need validation.
+- SFZ per-note audio processing is not implemented in this build. Its assignments remain saved for future use and the editor explicitly reports the limitation. Existing SFZ channel routing and export remain unchanged. EQ is not part of this test.
+- This is a validation build: native dependency and processor tests must pass on Windows before packaging. The SF2 stereo recovery build retains the original channel-only behavior. Special FluidSynth legato modes that reuse a voice have not been verified.

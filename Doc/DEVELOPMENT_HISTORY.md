@@ -185,3 +185,7 @@ Convert each distinct sampled SFZ into one standard SF2 preset, then merge into 
 ### TEST30
 
 Expand host routing to 64 stereo buses including Main, retaining 16 internal MIDI groups, channel compressors, existing destination indices and the note editor draft.
+
+### TEST31
+
+Manual note learn, silent boundaries, direct Alt editing and experimental real SF2 per-voice routing with shared channel compressor. SFZ note DSP remains pending.

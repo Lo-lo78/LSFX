@@ -105,3 +105,13 @@ endif()
 add_executable(LSFXSoundFontExportTest Tests/SoundFontExportTest.cpp)
 
 add_executable(LSFXSfzSoundFontExportTest Tests/SfzSoundFontExportTest.cpp)
+
+add_executable(LSFXFluidNoteRoutingSmoke Tests/FluidNoteRoutingSmoke.cpp)
+target_link_libraries(LSFXFluidNoteRoutingSmoke PRIVATE FluidSynth::libfluidsynth)
+
+add_executable(LSFXNoteRouteGroupsTest Tests/NoteRouteGroupsTest.cpp)
+if(MSVC)
+    target_compile_options(LSFXNoteRouteGroupsTest PRIVATE /UNDEBUG)
+else()
+    target_compile_options(LSFXNoteRouteGroupsTest PRIVATE -UNDEBUG)
+endif()
