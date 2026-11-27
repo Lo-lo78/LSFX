@@ -2761,7 +2761,7 @@ private:
                         warnings.insert(report.warnings.begin(),report.warnings.end());
                         it=converted.emplace(entry.path,std::move(intermediate)).first;
                     }
-                    entry.path=exportPath(it->second->getFile()); entry.sourceBank=0; entry.sourceProgram=0;
+                    entry.fromSfz=true; entry.path=exportPath(it->second->getFile()); entry.sourceBank=0; entry.sourceProgram=0;
                 }
                 auto result=lsfx::sf2export::exportFile(std::move(entries),exportPath(temp.getFile()),&job->cancel,&job->progress);
                 lsfx::sf2export::checkCancel(&job->cancel);

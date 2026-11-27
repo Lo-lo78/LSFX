@@ -192,3 +192,7 @@ Run `python Tests/FluidNotePatchTest.py`. The generated CMake implementation exe
 - Tab order: Save preset as, Export SoundFont, About. Test reverse Tab as well.
 - Recheck SF2 per-note routing, channel routing and hybrid export; no audio-path changes in TEST32.
 - LSFXGridNavigationTest is included in Windows CI, with assertions enabled in Release. This is a keyboard-destination unit test, not a substitute for NVDA/REAPER verification.
+
+### 0.99.2 – Export preset source labels
+
+- Verify preset names in exported SF2 include a short source filename label, or SFZ for converted programs; long names retain the suffix within 19 ASCII characters plus NUL. Distinct source filename prefixes are disambiguated. Verify bank/program numbers, PCM and dependency reuse remain unchanged.

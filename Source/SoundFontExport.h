@@ -32,7 +32,31 @@ inline Bytes record(size_t n,const char* name) {Bytes b(n);for(size_t i=0;i<20&&
 inline uint32_t size32(U64 n) {require(n<=0xffffffffULL,"SF2 RIFF size limit exceeded");return uint32_t(n);}
 inline uint16_t index16(size_t n) {require(n<=65535,"SF2 16-bit table index limit exceeded");return uint16_t(n);}
 inline void checkCancel(const std::atomic<bool>* c) {if(c&&c->load())throw std::runtime_error("Export cancelled");}
-struct Entry { Path path; int sourceBank,sourceProgram,bank,program; };
+// fromSfz survives the replacement of the original path with a temporary SF2.
+struct Entry { Path path; int sourceBank,sourceProgram,bank,program; bool fromSfz=false; };
+inline std::string asciiName(std::string value) {
+    for(auto& c:value) if(static_cast<unsigned char>(c)<32||static_cast<unsigned char>(c)>126)c=' ';
+    auto first=value.find_first_not_of(' ');if(first==std::string::npos)return {};
+    return value.substr(first,value.find_last_not_of(' ')-first+1);
+}
+inline std::string namePrefix(std::string value,size_t limit) {return asciiName(value.substr(0,limit));}
+inline std::string nameKey(std::string value) {for(auto& c:value)if(c>='A'&&c<='Z')c=char(c-'A'+'a');return value;}
+inline std::string allocateSourceLabel(const Path& path,std::set<std::string>& used) {
+    auto base=asciiName(path.stem().u8string());if(base.empty())base="SF2";
+    auto label=namePrefix(base,8);if(label.empty())label="SF2";
+    for(size_t n=2;!used.insert(nameKey(label)).second;++n) {
+        auto suffix=std::to_string(n);require(suffix.size()<8,"Too many source label collisions");
+        label=namePrefix(base,8-suffix.size())+suffix;
+    }
+    return label;
+}
+inline std::string taggedPresetName(const Bytes& r,const std::string& label) {
+    std::string original;for(size_t i=0;i<20&&r.at(i);++i)original+=char(r[i]);
+    original=asciiName(original);if(original.empty())original="Preset";
+    // Leave room for a terminator. The source suffix is never truncated.
+    require(!label.empty()&&label.size()<=8,"Invalid source label");
+    return namePrefix(original,19-1-label.size())+" "+label;
+}
 struct Result {size_t presets=0,instruments=0,samples=0,sources=0;U64 bytes=0;};
 struct Chunk {U64 pos=0,size=0;};
 struct Source {
@@ -67,6 +91,7 @@ struct Source {
 struct SampleCopy {Source* source;U64 start,count;};
 class Builder {
     std::map<Path,std::unique_ptr<Source>> sources;
+    std::map<Path,std::string> sourceLabels;
     Bytes ph,pb,pm,pg,ih,ib,im,ig,sh;
     std::vector<SampleCopy> copies;
     U64 sampleCount=0;
@@ -123,6 +148,8 @@ class Builder {
     }
     void preset(const Entry& e) {
         auto& s=get(e.path);auto it=s.presets.find({e.sourceBank,e.sourceProgram});require(it!=s.presets.end(),"Source preset no longer exists");size_t id=it->second;auto r=slice(s.ph,id*38,38);auto a=u16(r,24),b=u16(s.ph,(id+1)*38+24);
+        auto name=taggedPresetName(r,e.fromSfz?"SFZ":sourceLabels.at(e.path));
+        std::fill_n(r.begin(),20,uint8_t(0));std::copy(name.begin(),name.end(),r.begin());
         put16(r,20,uint16_t(e.program));put16(r,22,uint16_t(e.bank));put16(r,24,index16(pb.size()/4));append(ph,r);
         zones(s.pb,s.pg,s.pm,a,b,pb,pg,pm,[&](Bytes& g,bool){for(size_t k=0;k<g.size();k+=4)if(u16(g,k)==41)put16(g,k+2,instrument(s,u16(g,k+2)));});
     }
@@ -133,6 +160,9 @@ public:
     Builder(const std::atomic<bool>* c,std::atomic<int>* p):cancel(c),progress(p){}
     Result run(std::vector<Entry> entries,const Path& output) {
         require(!entries.empty(),"The map is empty");std::sort(entries.begin(),entries.end(),[](auto& a,auto& b){return std::tie(a.bank,a.program)<std::tie(b.bank,b.program);});
+        std::set<std::string> usedLabels{"sfz"};
+        std::set<Path> namedSources;for(const auto& e:entries)if(!e.fromSfz)namedSources.insert(e.path);
+        for(const auto& p:namedSources)sourceLabels.emplace(p,allocateSourceLabel(p,usedLabels));
         std::set<std::pair<int,int>> addresses;
         for(size_t i=0;i<entries.size();++i) {checkCancel(cancel);auto& e=entries[i];require(e.bank>=0&&e.bank<=128&&e.program>=0&&e.program<=127,"Bank outside standard SF2 range 0-128");require(addresses.emplace(e.bank,e.program).second,"Duplicate destination address");preset(e);if(progress)progress->store(int(30*(i+1)/entries.size()));}
         index16(ih.size()/22);index16(sh.size()/46);
@@ -140,7 +170,7 @@ public:
         auto p=record(38,"EOP");put16(p,24,index16(pb.size()/4));append(ph,p);auto i=record(22,"EOI");put16(i,20,index16(ib.size()/4));append(ih,i);append(sh,record(46,"EOS"));
         add16(pb,index16(pg.size()/4));add16(pb,index16(pm.size()/10));add16(ib,index16(ig.size()/4));add16(ib,index16(im.size()/10));pg.resize(pg.size()+4);ig.resize(ig.size()+4);pm.resize(pm.size()+10);im.resize(im.size()+10);
         Bytes info;tag(info,"INFO");Bytes version;add16(version,2);add16(version,1);append(info,chunk("ifil",version));append(info,chunk("isng",text("EMU8000")));append(info,chunk("INAM",text("LSFX exported SoundFont")));append(info,chunk("ISFT",text("LSFX")));std::string comment="Assembled from selected user sources. Original source licenses apply.";
-        for(auto& item:sources) {auto& src=*item.second;auto line="\n"+src.name+"; "+src.author+"; "+src.copyright;if(comment.size()+line.size()<65000)comment+=line;}
+        for(auto& item:sources) {auto& src=*item.second;auto label=sourceLabels.find(item.first);auto line="\n"+(label==sourceLabels.end()?std::string("SFZ"):label->second)+": "+src.name+"; "+src.author+"; "+src.copyright;if(comment.size()+line.size()<65000)comment+=line;}
         append(info,chunk("ICMT",text(comment)));info=chunk("LIST",info);
         Bytes pd;tag(pd,"pdta");append(pd,chunk("phdr",ph));append(pd,chunk("pbag",pb));append(pd,chunk("pmod",pm));append(pd,chunk("pgen",pg));append(pd,chunk("inst",ih));append(pd,chunk("ibag",ib));append(pd,chunk("imod",im));append(pd,chunk("igen",ig));append(pd,chunk("shdr",sh));pd=chunk("LIST",pd);
         U64 pcmBytes=sampleCount*2,sdtaBytes=12+pcmBytes;Bytes header;tag(header,"RIFF");add32(header,size32(4+info.size()+8+sdtaBytes+pd.size()));tag(header,"sfbk");append(header,info);tag(header,"LIST");add32(header,size32(sdtaBytes));tag(header,"sdta");tag(header,"smpl");add32(header,size32(pcmBytes));

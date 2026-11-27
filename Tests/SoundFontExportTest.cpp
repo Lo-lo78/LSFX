@@ -12,6 +12,13 @@ int main(int argc,char** argv) {
         require(r.presets==3&&r.sources==2&&r.instruments==2&&r.samples==2,"Dependency reuse or source selection failed");
         Source result(out);require(result.presets.size()==3&&result.presets.count({0,0})&&result.presets.count({3,7})&&result.presets.count({128,0}),"Wrong destination map");
         require(!result.presets.count({0,1}),"Unexpected program");
+        std::set<std::string> labels{"sfz"};auto first=allocateSourceLabel(Path("FluidR3 GM.sf2"),labels);auto second=allocateSourceLabel(Path("FluidR3 GS.sf2"),labels);
+        require(first=="FluidR3"&&second!=first&&second.size()<=8,"Source label collision");
+        require(taggedPresetName(record(38,"Very long grand piano"),"FluidR3")=="Very long g FluidR3","Source suffix truncated or long name invalid");
+        require(taggedPresetName(record(38,"Piano"),"SFZ")=="Piano SFZ","SFZ suffix missing");
+        std::set<Path> paths{a,b};std::map<Path,std::string> expected;labels={"sfz"};for(const auto& p:paths)expected.emplace(p,allocateSourceLabel(p,labels));
+        for(const auto& e:map) {Source src(e.path);auto original=slice(src.ph,src.presets.at({e.sourceBank,e.sourceProgram})*38,38);auto name=taggedPresetName(original,expected.at(e.path));auto dest=result.presets.at({e.bank,e.program})*38;require(slice(result.ph,dest,20)==slice(record(38,name.c_str()),0,20),"Wrong exported preset provenance");}
+
         require(result.ih.size()/22==3&&result.sh.size()/46==3,"Wrong terminal records");
         require(std::filesystem::file_size(out)==r.bytes,"Wrong RIFF size");
         Source original(a);auto n=u32(original.sh,24)-u32(original.sh,20);auto start=u32(result.sh,20);

@@ -14,7 +14,8 @@ int main(int argc,char** argv) {
         Source c(converted);require(c.presets.size()==1&&c.sh.size()/46==3&&c.ib.size()/4==5,"Invalid stereo/velocity region tables");require(u16(c.sh,44)==4&&u16(c.sh,46+44)==2&&u16(c.sh,42)==1&&u16(c.sh,46+42)==0,"Wrong stereo sample links");
         require(u32(c.sh,28)-u32(c.sh,20)==128&&u32(c.sh,32)-u32(c.sh,20)==896,"Loop points lost");
         require(u16(c.ig,0)==43&&u16(c.ig,2)==(48|(71<<8))&&u16(c.ig,4)==44&&u16(c.ig,6)==(1|(63<<8)),"Key or velocity range lost");
-        auto r=exportFile({{sf2,0,0,0,0},{converted,0,0,0,3},{converted,0,0,1,7},{sf2,128,0,128,0}},out);Source result(out);require(r.presets==4&&r.samples==3&&result.presets.count({0,3})&&result.presets.count({1,7}),"Mixed SFZ and SF2 export failed");
+        auto r=exportFile({{sf2,0,0,0,0},{converted,0,0,0,3,true},{converted,0,0,1,7,true},{sf2,128,0,128,0}},out);Source result(out);require(r.presets==4&&r.samples==3&&result.presets.count({0,3})&&result.presets.count({1,7}),"Mixed SFZ and SF2 export failed");
+        for(auto address:{std::make_pair(0,3),std::make_pair(1,7)}) {auto pos=result.presets.at(address)*38;auto expected=taggedPresetName(slice(c.ph,0,38),"SFZ");require(slice(result.ph,pos,20)==slice(record(38,expected.c_str()),0,20),"SFZ provenance lost during assembly");}
         std::atomic<bool> cancel{true};bool rejected=false;try{lsfx::sfzexport::Report tmp;lsfx::sfzexport::convert(sfz,root/"cancel.sf2",decode,tmp,&cancel);}catch(const std::exception&){rejected=true;}require(rejected,"Cancellation ignored");
         std::cout<<"PASS: SFZ include, macro, path, inheritance, stereo samples, velocity layers, loop, warnings, mixed SF2 export and cancellation\n";
     } catch(const std::exception& e){std::cerr<<"FAIL: "<<e.what()<<'\n';return 1;}
