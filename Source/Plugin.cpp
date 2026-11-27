@@ -22,6 +22,7 @@
 #include <functional>
 #include <map>
 #include "VirtualProgramMap.h"
+#include "SoundFontExport.h"
 #if JUCE_WINDOWS
  #include <Windows.h>
  #include <UIAutomation.h>
@@ -30,8 +31,8 @@
 
 namespace {
 constexpr int channels = 16;
-constexpr auto lsfxVersion="0.99.1";
-constexpr auto lsfxReleaseDate="26 November 2026";
+constexpr auto lsfxVersion="0.99.2 TEST27";
+constexpr auto lsfxReleaseDate="27 November 2026 (test build)";
 constexpr auto lsfxProjectUrl="https://github.com/Lo-lo78/LSFX";
 constexpr auto lsfxContactEmail="vmanolo301@gmail.com";
 constexpr auto lsfxLicense="GNU Affero General Public License v3 or later (AGPL-3.0-or-later)";
@@ -1318,7 +1319,7 @@ public:
     explicit Editor(Processor& p) : AudioProcessorEditor(p), proc(p) {
         setWantsKeyboardFocus(true);
         setFocusContainerType(juce::Component::FocusContainerType::keyboardFocusContainer);
-        title.setText(sf2MultiOutput?"LSFX 0.99.1":"LSFX 0.99.1 SF2 stereo recovery",juce::dontSendNotification); title.setFont(juce::FontOptions(21.0f)); title.setAccessible(false); addAndMakeVisible(title);
+        title.setText(sf2MultiOutput?"LSFX 0.99.2 TEST27":"LSFX 0.99.2 TEST27 SF2 stereo recovery",juce::dontSendNotification); title.setFont(juce::FontOptions(21.0f)); title.setAccessible(false); addAndMakeVisible(title);
         status.setText("No SoundFont loaded",juce::dontSendNotification); status.setTitle("Instrument status"); addAndMakeVisible(status);
         setup(open,"Open SF2 or SFZ",1); setup(parameters,"Parameters",2); setup(channel,"MIDI channel",3); setup(bank,"Bank",37); setup(program,"Program",38); setup(level,"Master output gain",36);
         setup(grid,"Parameter grid",1); setup(value,"Parameter value",2); setup(closeGrid,"Close parameters",3);
@@ -1382,6 +1383,7 @@ public:
         panelText.onReturnKey=[this]{if(panelMode==Panel::name&&panelAction) {auto action=panelAction;action();}};
         panelText.onEscapeKey=[this]{cancelPanel();};
         panelLabel.setTitle("Preset information"); panelLabel.setJustificationType(juce::Justification::centredLeft); addAndMakeVisible(panelLabel);
+        setup(exportButton,"Export SoundFont",43); exportButton.setDescription("Alt+E"); exportButton.onClick=[this]{browseExport();};
         setup(aboutButton,"About",42); aboutButton.setDescription("Alt+A"); aboutButton.onClick=[this]{openAbout();};
         const auto aboutText=juce::String("LSFX\nVersion: ")+lsfxVersion+"\nRelease date: "+lsfxReleaseDate+"\nLicense: "+lsfxLicense+"\nProject: "+lsfxProjectUrl+"\nContact: "+lsfxContactEmail;
         setup(aboutInfo,"About LSFX",1);
@@ -1409,7 +1411,7 @@ public:
         startTimerHz(5);
         scheduleInitialFocus();
     }
-    ~Editor() override { if(panelMode==Panel::none&&!initialFocusPending&&!returnFromChooser&&!chooser&&!importInProgress) rememberFocus(focusId(juce::Component::getCurrentlyFocusedComponent())); juce::Desktop::getInstance().removeFocusChangeListener(this); stopTimer(); removeKeyListener(this); panelText.removeKeyListener(this); presetList.removeKeyListener(this); presetList.setModel(nullptr); chooser.reset(); if(catalogThread.joinable()) catalogThread.join(); }
+    ~Editor() override { if(panelMode==Panel::none&&!initialFocusPending&&!returnFromChooser&&!chooser&&!importInProgress) rememberFocus(focusId(juce::Component::getCurrentlyFocusedComponent())); juce::Desktop::getInstance().removeFocusChangeListener(this); stopTimer(); removeKeyListener(this); panelText.removeKeyListener(this); presetList.removeKeyListener(this); presetList.setModel(nullptr); chooser.reset(); if(catalogThread.joinable()) catalogThread.join(); if(exportJob) exportJob->cancel.store(true); if(exportThread.joinable()) exportThread.join(); }
     void paint(juce::Graphics& g) override {
         g.fillAll(juce::Colour(0xff202429));
         if(panelMode!=Panel::none) return;
@@ -1492,7 +1494,7 @@ public:
         for(int ch=0;ch<channels;++ch) routeLevels[ch].setBounds(routes.getX()+ch*cellWidth,routes.getY(),cellWidth,routes.getHeight());
         auto lv=r.removeFromTop(38); levelLabel.setBounds(lv.removeFromLeft(200)); levelReadout.setBounds(lv.removeFromRight(100)); level.setBounds(lv.reduced(0,3));
         line(bankLabel,bank);line(programLabel,program);
-        auto buttons=r.removeFromTop(34); presetsButton.setBounds(buttons.removeFromLeft(210)); saveButton.setBounds(buttons.removeFromLeft(210)); saveAsButton.setBounds(buttons.removeFromLeft(210)); aboutButton.setBounds(buttons.removeFromLeft(150));
+        auto buttons=r.removeFromTop(34); presetsButton.setBounds(buttons.removeFromLeft(170)); saveButton.setBounds(buttons.removeFromLeft(150)); saveAsButton.setBounds(buttons.removeFromLeft(170)); aboutButton.setBounds(buttons.removeFromLeft(120)); exportButton.setBounds(buttons.removeFromLeft(250));
     }
 private:
     Processor& proc;
@@ -1507,7 +1509,12 @@ private:
     Keyed<juce::TextButton> parentButton{"Back"},panelOK{"OK"},panelCancel{"Cancel"};
     juce::TextEditor panelText;
     juce::Label panelLabel;
-    enum class Panel {none,browser,name,confirm,source,about};
+    enum class Panel {none,browser,name,confirm,source,about,exportProgress};
+    Keyed<juce::TextButton> exportButton{"Export SoundFont"};
+    struct ExportJob {std::atomic<bool> cancel{false},done{false}; std::atomic<int> progress{0}; juce::String message;};
+    std::shared_ptr<ExportJob> exportJob;
+    std::thread exportThread;
+    int exportProgressShown=-1;
     Keyed<juce::TextButton> aboutButton{"About"},aboutProject{"Project"},aboutContact{"Contact"},aboutClose{"Close"};
     Keyed<juce::TextEditor> aboutInfo{"About LSFX"};
     Panel panelMode=Panel::none;
@@ -1554,14 +1561,14 @@ private:
         for(;c&&c!=this;c=c->getParentComponent()) {
             if(c==&open)return 1; if(c==&parameters)return 2; if(c==&channel)return 3;
             if(c==&level)return 36; if(c==&bank)return 37; if(c==&program)return 38;
-            if(c==&presetsButton)return 39; if(c==&saveButton)return 40; if(c==&saveAsButton)return 41; if(c==&aboutButton)return 42;
+            if(c==&presetsButton)return 39; if(c==&saveButton)return 40; if(c==&saveAsButton)return 41; if(c==&aboutButton)return 42; if(c==&exportButton)return 43;
             if(c==&grid)return 50; if(c==&value)return 51; if(c==&closeGrid)return 52;
             for(int i=0;i<channels;++i) {if(c==&channelLevels[i])return 4+i; if(c==&routeLevels[i])return 20+i;}
         } return 0;
     }
     juce::Component& focusTarget(int id) {
         if(id>=4&&id<20)return channelLevels[id-4]; if(id>=20&&id<36)return routeLevels[id-20];
-        switch(id) {case 2:return parameters;case 3:return channel;case 36:return level;case 37:return bank;case 38:return program;case 39:return presetsButton;case 40:return saveButton;case 41:return saveAsButton;case 42:return aboutButton;case 50:return grid;case 51:return value;case 52:return closeGrid;default:return open;}
+        switch(id) {case 2:return parameters;case 3:return channel;case 36:return level;case 37:return bank;case 38:return program;case 39:return presetsButton;case 40:return saveButton;case 41:return saveAsButton;case 42:return aboutButton;case 43:return exportButton;case 50:return grid;case 51:return value;case 52:return closeGrid;default:return open;}
     }
     void rememberFocus(int id) {
         if(!id)return;
@@ -1655,7 +1662,7 @@ private:
     }
     void showGrid(bool show,juce::Component* destination=nullptr) {
         gridOpen=show; search.reset();
-        const auto main=std::array<juce::Component*,17>{&open,&parameters,&channel,&bank,&program,&level,&channelLabel,&bankLabel,&programLabel,&levelLabel,&levelReadout,&channelGainLabel,&routingLabel,&presetsButton,&saveButton,&saveAsButton,&aboutButton};
+        const auto main=std::array<juce::Component*,18>{&open,&parameters,&channel,&bank,&program,&level,&channelLabel,&bankLabel,&programLabel,&levelLabel,&levelReadout,&channelGainLabel,&routingLabel,&presetsButton,&saveButton,&saveAsButton,&aboutButton,&exportButton};
         const auto panel=std::array<juce::Component*,6>{&grid,&value,&closeGrid,&gridTitle,&hint,&valueReadout};
         // Reveal the destination before hiding the old focused controls.
         if(show) for(auto* c:panel) c->setVisible(true);
@@ -1932,6 +1939,7 @@ private:
             if(ch=='i') { requestInitialize(origin); return true; }
             if(code==juce::KeyPress::returnKey) {proc.allOff(); if(origin) speak(*origin,"All sounds off"); return true;}
             if(ch=='a') {openAbout(); return true;}
+            if(ch=='e') {browseExport();return true;}
             if(ch=='s') {showStatus(); return true;}
             if(ch=='l') {openParameters();return true;}
             if(ch=='o') {browse();return true;}
@@ -2130,13 +2138,14 @@ private:
         return false;
     }
     void hidePanelControls() {
+        panelCancel.setDescription({});
         for(auto* c:std::array<juce::Component*,10>{&presetList,&parentButton,&panelOK,&panelCancel,&panelText,&panelLabel,&aboutInfo,&aboutProject,&aboutContact,&aboutClose}) c->setVisible(false);
     }
     void hideMainForPanel() {
         if(panelMode==Panel::none) {const int id=focusId(juce::Component::getCurrentlyFocusedComponent());panelReturn=id?id:proc.editorMemory.focus;}
         juce::ScopedValueSetter<bool> guard(focusTransition,true);
         if(gridOpen) showGrid(false);
-        for(auto* c:std::array<juce::Component*,17>{&open,&parameters,&channel,&bank,&program,&level,&channelLabel,&bankLabel,&programLabel,&levelLabel,&levelReadout,&channelGainLabel,&routingLabel,&presetsButton,&saveButton,&saveAsButton,&aboutButton}) c->setVisible(false);
+        for(auto* c:std::array<juce::Component*,18>{&open,&parameters,&channel,&bank,&program,&level,&channelLabel,&bankLabel,&programLabel,&levelLabel,&levelReadout,&channelGainLabel,&routingLabel,&presetsButton,&saveButton,&saveAsButton,&aboutButton,&exportButton}) c->setVisible(false);
         for(auto& c:channelLevels) c.setVisible(false);
         for(auto& c:routeLevels) c.setVisible(false);
         initialFocusPending=false; returnFromChooser=false;
@@ -2149,6 +2158,7 @@ private:
     }
     void cancelPanel() {
         if(panelMode==Panel::none) return;
+        if(panelMode==Panel::exportProgress&&exportJob) {if(!exportJob->done.load()) {exportJob->cancel.store(true); setPanelLabel("Cancelling SoundFont export..."); announce("Cancelling SoundFont export");} return;}
         if(panelCancelAction) { auto action=panelCancelAction; action(); }
         else closePanel();
     }
@@ -2313,6 +2323,7 @@ private:
         const auto code=k.getKeyCode();const auto mods=k.getModifiers();const bool ctrl=mods.isCtrlDown()||mods.isCommandDown();
         const auto ch=juce::CharacterFunctions::toLowerCase(static_cast<juce::juce_wchar>(code));
         if(code==juce::KeyPress::escapeKey) {cancelPanel();return true;}
+        if(panelMode==Panel::exportProgress) {if(code==juce::KeyPress::returnKey)cancelPanel();return true;}
         if(panelMode==Panel::source) {
             if(code==juce::KeyPress::tabKey) {focus(presetList.hasKeyboardFocus(true)?static_cast<juce::Component&>(panelCancel):static_cast<juce::Component&>(presetList));return true;}
             if(code==juce::KeyPress::returnKey) {if(panelCancel.hasKeyboardFocus(true))cancelPanel();else activateSource(presetList.getSelectedRow());return true;}
@@ -2380,6 +2391,76 @@ private:
         const auto text=proc.getView().status+". "+proc.diagnostic();
         if(auto* current=juce::Component::getCurrentlyFocusedComponent(); current!=nullptr&&isParentOf(current)) speak(*current,text);
         // No speech if there is no focused accessible control.
+    }
+    static lsfx::sf2export::Path exportPath(const juce::File& f) {return std::filesystem::u8path(f.getFullPathName().toRawUTF8());}
+    void exportMessage(const juce::String& text,int from) {
+        hideMainForPanel(); hidePanelControls(); panelMode=Panel::exportProgress; panelReturn=from;
+        setPanelLabel(text); panelCancel.setButtonText("OK"); panelCancel.setTitle("OK"); panelCancel.setDescription(text);
+        panelLabel.setVisible(true); panelCancel.setVisible(true); resized(); repaint(); focus(panelCancel); announce(text);
+        juce::Component::SafePointer<Editor> safe(this);
+        juce::Timer::callAfterDelay(150,[safe]{if(auto* e=safe.getComponent();e&&e->panelMode==Panel::exportProgress&&e->isShowing()&&e->getPeer()&&e->getPeer()->isFocused()&&!e->panelCancel.hasKeyboardFocus(true)) {e->focus(e->panelCancel);e->announce(e->panelLabel.getText());}});
+    }
+    void browseExport() {
+        if(chooser||catalogBusy||importInProgress||exportJob||panelMode!=Panel::none) return;
+        const int id=focusId(juce::Component::getCurrentlyFocusedComponent()); const int from=id?id:proc.editorMemory.focus;
+        const auto snapshot=proc.getView();
+        if(snapshot.loading) {exportMessage("Wait until instrument loading has completed before exporting.",from);return;}
+        if(!snapshot.ready||snapshot.presets.empty()) {exportMessage("The map is empty. Nothing to export.",from);return;}
+        std::vector<lsfx::sf2export::Entry> entries;
+        for(const auto& p:snapshot.presets) {
+            if(p.sfzIndex>=0||juce::File(p.path).hasFileExtension("sfz")) {exportMessage("TEST27 exports SF2 only. The map contains SFZ instruments. Nothing was exported; SFZ conversion is not yet available.",from);return;}
+            if(!juce::File(p.path).hasFileExtension("sf2")) {exportMessage("TEST27 exports uncompressed SF2 sources only. Nothing was exported.",from);return;}
+            if(p.bank>128) {exportMessage("A mapped bank is outside the standard SF2 range 0 to 128. Nothing was exported.",from);return;}
+            entries.push_back({exportPath(juce::File(p.path)),p.sourceBank,p.sourceProgram,p.bank,p.program});
+        }
+        rememberFocus(from); initialFocusPending=false; returnFromChooser=false; pendingReturnMessage.clear();
+        auto dir=juce::File::getSpecialLocation(juce::File::userDocumentsDirectory);
+        const auto saved=setting("exportDirectory"); if(juce::File::isAbsolutePath(saved)&&juce::File(saved).isDirectory()) dir=juce::File(saved);
+        chooser=std::make_unique<juce::FileChooser>("Export SoundFont",dir.getChildFile("My SoundFont.sf2"),"*.sf2",true,false,this);
+        juce::Component::SafePointer<Editor> safe(this);
+        chooser->launchAsync(juce::FileBrowserComponent::saveMode|juce::FileBrowserComponent::canSelectFiles|juce::FileBrowserComponent::warnAboutOverwriting,[safe,from,entries=std::move(entries)](const juce::FileChooser& fc) mutable {
+            auto file=fc.getResult();
+            juce::MessageManager::callAsync([safe,from,file,entries=std::move(entries)]() mutable {if(auto* e=safe.getComponent()) {
+                e->chooser.reset();
+                if(file==juce::File{}) {e->returnTo(from);return;}
+                if(!file.hasFileExtension("sf2")) {e->exportMessage("Please choose a filename ending in .sf2. Nothing was exported.",from);return;}
+                e->startExport(file,std::move(entries),from);
+            }});
+        });
+    }
+    void startExport(juce::File file,std::vector<lsfx::sf2export::Entry> entries,int from) {
+        const auto destination=exportPath(file);
+        for(const auto& p:entries) {std::error_code ec;if(destination==p.path||std::filesystem::equivalent(destination,p.path,ec)) {exportMessage("Cannot overwrite a source SoundFont. Choose a new filename.",from);return;}}
+        rememberSetting("exportDirectory",file.getParentDirectory().getFullPathName());
+        if(exportThread.joinable()) exportThread.join();
+        auto job=std::make_shared<ExportJob>(); exportJob=job;exportProgressShown=-1;
+        hideMainForPanel(); hidePanelControls();panelMode=Panel::exportProgress;panelReturn=from;
+        setPanelLabel("Exporting SoundFont, 0 percent"); panelCancel.setButtonText("Cancel"); panelCancel.setTitle("Cancel"); panelCancel.setDescription("Cancels SoundFont export");
+        panelLabel.setVisible(true);panelCancel.setVisible(true);resized();repaint();focus(panelCancel);announce(panelLabel.getText());
+        try {exportThread=std::thread([job,file,entries=std::move(entries)]() mutable {
+            try {
+                juce::TemporaryFile temp(file);
+                auto result=lsfx::sf2export::exportFile(std::move(entries),exportPath(temp.getFile()),&job->cancel,&job->progress);
+                lsfx::sf2export::checkCancel(&job->cancel);
+                if(!temp.overwriteTargetFileWithTemporary()) throw std::runtime_error("Unable to replace destination file");
+                job->message="SoundFont export completed. Presets: "+juce::String(static_cast<juce::int64>(result.presets))+", instruments: "+juce::String(static_cast<juce::int64>(result.instruments))+", samples: "+juce::String(static_cast<juce::int64>(result.samples))+", sources: "+juce::String(static_cast<juce::int64>(result.sources))+", size: "+juce::String(double(result.bytes)/1000000.0,2)+" MB.";
+            } catch(const std::exception& e) {job->message=job->cancel.load()?juce::String("SoundFont export cancelled."):juce::String("SoundFont export failed: ")+juce::String::fromUTF8(e.what());}
+            catch(...) {job->message="SoundFont export failed.";}
+            job->done.store(true);
+        });} catch(const std::exception&) {job->message="Cannot start SoundFont export.";job->done.store(true);}
+        // Native dialog release may lag behind the JUCE callback.
+        juce::Component::SafePointer<Editor> safe(this);
+        juce::Timer::callAfterDelay(150,[safe]{if(auto* e=safe.getComponent();e&&e->panelMode==Panel::exportProgress&&e->isShowing()&&e->getPeer()&&e->getPeer()->isFocused()) {e->focus(e->panelCancel);e->announce(e->panelLabel.getText());}});
+    }
+    void pollExport() {
+        if(!exportJob)return;
+        if(exportJob->done.load()) {
+            if(exportThread.joinable())exportThread.join();
+            auto text=exportJob->message;exportJob.reset();
+            if(panelMode==Panel::exportProgress) {setPanelLabel(text);panelCancel.setButtonText("OK");panelCancel.setTitle("OK");panelCancel.setDescription(text);if(hasKeyboardFocus(true)) {focus(panelCancel);announce(text);}}
+        } else if(!exportJob->cancel.load()) {
+            int p=exportJob->progress.load();if(p/10!=exportProgressShown/10||exportProgressShown<0) {exportProgressShown=p;setPanelLabel("Exporting SoundFont, "+juce::String(p)+" percent");}
+        }
     }
     void browse() {
         if(chooser||catalogBusy||importInProgress||panelMode!=Panel::none) return;
@@ -2544,6 +2625,7 @@ private:
         }
     }
     void timerCallback() override {
+        pollExport();
         if(returnFromChooser&&juce::Time::getMillisecondCounter()-chooserReturnedAt>5000u) returnFromChooser=false;
         refresh(false); maybePromptMissing();
         if(panelMode==Panel::none&&(initialFocusPending||returnFromChooser)&&isShowing()&&getPeer()!=nullptr&&(returnFromChooser||getPeer()->isFocused())) scheduleInitialFocus();

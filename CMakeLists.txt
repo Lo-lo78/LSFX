@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.22)
 cmake_policy(SET CMP0091 NEW)
 set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL")
-project(LSFX VERSION 0.99.1 LANGUAGES C CXX)
+project(LSFX VERSION 0.99.2 LANGUAGES C CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 option(LSFX_EXPERIMENTAL_SF2_MULTIGROUP "Enable SF2 multi-output and channel compressors (validation build)" ON)
@@ -100,3 +100,6 @@ if(MSVC)
 else()
     target_compile_options(LSFXChannelCompressorTest PRIVATE -UNDEBUG)
 endif()
+
+# TEST27: validate the SF2 writer without the DAW or JUCE.
+add_executable(LSFXSoundFontExportTest Tests/SoundFontExportTest.cpp)
