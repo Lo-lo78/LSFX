@@ -189,3 +189,7 @@ Expand host routing to 64 stereo buses including Main, retaining 16 internal MID
 ### TEST31
 
 Manual note learn, silent boundaries, direct Alt editing and experimental real SF2 per-voice routing with shared channel compressor. SFZ note DSP remains pending.
+
+### TEST31.1
+
+Fix installation of the FluidSynth note-routing patch using unique code anchors on a private source copy; keep the VLA fix, mandatory native tests and the TEST31 audio implementation unchanged.

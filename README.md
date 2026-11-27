@@ -1,4 +1,4 @@
-# LSFX 0.99.2 TEST31 — SF2 note routing and keyboard navigation
+# LSFX 0.99.2 TEST31.1 — SF2 note routing and keyboard navigation
 
 27 November 2026 · Windows x64 VST3 · Lo-lo
 
@@ -49,3 +49,7 @@ TEST27.1 build fix: accept the reviewed FluidSynth 2.6.3 vcpkg port while retain
 - 64 stereo host destinations remain unchanged. The synth has 128 internal groups (16 inherited and 112 extra channel/destination combinations). Slots are retained until a period of silence/reload, not recycled while voices can ring. On exhaustion, a newly assigned note is not played on the wrong bus; Alt+S reports pool misses. CPU and Windows stability need validation.
 - SFZ per-note audio processing is not implemented in this build. Its assignments remain saved for future use and the editor explicitly reports the limitation. Existing SFZ channel routing and export remain unchanged. EQ is not part of this test.
 - This is a validation build: native dependency and processor tests must pass on Windows before packaging. The SF2 stereo recovery build retains the original channel-only behavior. Special FluidSynth legato modes that reuse a voice have not been verified.
+
+## TEST31.1 — FluidSynth patch installation fix
+
+The TEST31 build failed while vcpkg applied the voice-routing diff. The same code changes are now applied to a private copy of the extracted FluidSynth sources using ten unique code anchors, independent of unrelated diff context and LF/CRLF line endings. Missing or ambiguous anchors abort the build. The VLA patch and native SF2 note routing / hybrid processor tests remain mandatory. No change to LSFX DSP or keyboard behavior. The installer regression test passes locally with synthetic source fixtures; a complete Windows dependency build and audio verification remain required.

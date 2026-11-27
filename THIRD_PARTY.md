@@ -34,4 +34,4 @@ The runner now supplies FluidSynth 2.6.3. The upstream header in [v2.6.3](https:
 
 ## TEST31 — FluidSynth note routing extension
 
-`Tools/fluidsynth-note-routing.patch` modifies the pinned FluidSynth 2.6.2/2.6.3 LGPL library: private note-on context, voice mixer mapping, per-note gain/pan/pitch, and per-voice send suppression. The overlay applies both this patch and the VLA fix. The corresponding LGPL source and relinking obligations still apply.
+`Tools/fluidsynth-note-routing.patch` modifies the pinned FluidSynth 2.6.2/2.6.3 LGPL library: private note-on context, voice mixer mapping, per-note gain/pan/pitch, and per-voice send suppression. The overlay applies the VLA fix through vcpkg and, from TEST31.1, the note-routing delta through `Tools/ApplyFluidNoteRouting.py` to a private extracted source copy. Both patch files and the installer scripts are included in the distribution. The corresponding LGPL source and relinking obligations still apply.

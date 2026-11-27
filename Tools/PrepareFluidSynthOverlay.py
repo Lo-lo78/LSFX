@@ -1,4 +1,4 @@
-"""Copy the runner's vcpkg port and add the FluidSynth 2.6.2/2.6.3 MSVC VLA fix.
+"""Copy the vcpkg port and apply the reviewed VLA and note routing fixes.
 
 Fail explicitly if the port has changed rather than silently building an
 unpatched dependency. The patch is part of the vcpkg ABI/cache key.
@@ -24,13 +24,36 @@ target = args.overlay_root / 'fluidsynth'
 if target.exists():
     shutil.rmtree(target)
 shutil.copytree(source, target)
-patches = [Path(__file__).with_name(name) for name in ('fluidsynth-vla-size.patch', 'fluidsynth-note-routing.patch')]
-for patch in patches:
-    shutil.copy2(patch, target / patch.name)
+# The VLA patch is still applied by vcpkg. The note-routing patch is applied
+# using unique C code anchors after source extraction, not unified diff context.
+for name in ('fluidsynth-vla-size.patch', 'fluidsynth-note-routing.patch', 'ApplyFluidNoteRouting.py'):
+    item = Path(__file__).with_name(name)
+    (target / name).write_bytes(item.read_text(encoding='utf-8-sig').encode('utf-8'))
+patches = [target / 'fluidsynth-vla-size.patch']
 portfile = target / 'portfile.cmake'
 text = portfile.read_text(encoding='utf-8-sig')
 text, count = re.subn(r'(?m)^([ \t]*)PATCHES[ \t]*$', lambda m: m.group(0) + ''.join('\n' + m.group(1) + '    ' + patch.name for patch in patches), text, count=1)
 if count != 1:
     raise SystemExit('FluidSynth portfile has no PATCHES block; refusing unpatched build.')
+# The port's first vcpkg_from_github call sets SOURCE_PATH. Work on a private
+# copy so the normal vcpkg source cache remains unmodified.
+match = re.search(r'(?ms)^vcpkg_from_github\(.*?^\)[ \t]*$', text)
+if not match or not re.search(r'\bOUT_SOURCE_PATH[ \t]+SOURCE_PATH\b', match.group(0)):
+    raise SystemExit('FluidSynth port extraction has changed; refusing unpatched build.')
+extra = r'''
+# LSFX TEST31.1: apply the same reviewed delta by code anchors.
+set(LSFX_PATCHED_SOURCE_PATH "${SOURCE_PATH}-lsfx-note-routing")
+file(REMOVE_RECURSE "${LSFX_PATCHED_SOURCE_PATH}")
+file(MAKE_DIRECTORY "${LSFX_PATCHED_SOURCE_PATH}")
+file(COPY "${SOURCE_PATH}/" DESTINATION "${LSFX_PATCHED_SOURCE_PATH}")
+find_program(LSFX_PYTHON NAMES python3 python REQUIRED)
+execute_process(COMMAND "${LSFX_PYTHON}" "${CURRENT_PORT_DIR}/ApplyFluidNoteRouting.py"
+    "${LSFX_PATCHED_SOURCE_PATH}" RESULT_VARIABLE LSFX_NOTE_PATCH_RESULT)
+if(NOT "${LSFX_NOTE_PATCH_RESULT}" STREQUAL "0")
+    message(FATAL_ERROR "LSFX FluidSynth note routing patch failed: ${LSFX_NOTE_PATCH_RESULT}")
+endif()
+set(SOURCE_PATH "${LSFX_PATCHED_SOURCE_PATH}")
+'''
+text = text[:match.end()] + '\n' + extra + text[match.end():]
 portfile.write_text(text, encoding='utf-8')
 print(f'FluidSynth {version}: prepared patched overlay at {target}')
