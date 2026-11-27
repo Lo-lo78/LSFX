@@ -62,7 +62,7 @@ lsfx::sfzexport::Audio decodeSfzExportSample(juce::AudioFormatManager& formats,c
     return a;
 }
 constexpr int channels = 16;
-constexpr auto lsfxVersion="0.99.2";
+constexpr auto lsfxVersion="0.99.3 TEST33";
 constexpr auto lsfxReleaseDate="27 November 2026";
 constexpr auto lsfxProjectUrl="https://github.com/Lo-lo78/LSFX";
 constexpr auto lsfxContactEmail="vmanolo301@gmail.com";
@@ -260,6 +260,7 @@ struct Engine {
     std::array<SfzSlot*,channels> sfzActive{};
     std::array<int,channels> sfzAddress{};
     Controls sfzCC=emptyControls();
+    std::array<int,channels> resetPrograms{}; // initial addresses, independent of current MIDI state
     uint64_t serial=0;
     bool hasSF2=false;
     bool hasSFZ() const { return !sfzSources.empty(); }
@@ -281,6 +282,7 @@ struct Engine {
                 // Restore instrument defaults when reusing an instance on another channel.
                 sfizz_send_cc(slot.synth,0,121,0);
                 sfizz_send_hd_pitch_wheel(slot.synth,0,0.0f);
+                sfizz_send_channel_aftertouch(slot.synth,0,0);
                 for(int cc=1;cc<120;++cc) if(cc!=32&&source.initialCC[cc]!=unset)
                     sfizz_send_cc(slot.synth,0,cc,source.initialCC[cc]);
             }
@@ -325,6 +327,15 @@ struct Engine {
 };
 using Programs = std::array<int, channels>;
 Programs defaults() { Programs p{}; p[9] = pack(128, 0); return p; }
+// Keep the same initial selection policy as opening an ordinary source.
+Programs initialPrograms(bool standaloneSfz,int address=0) {
+    auto p=defaults();
+    if(standaloneSfz) {
+        p[0]=address;
+        for(int ch=1;ch<channels;++ch) if(p[ch]==address) p[ch]=pack(address>>7,((address&127)+1)&127);
+    }
+    return p;
+}
 struct Request { juce::String path; double rate = 44100; Programs programs = defaults(); uint64_t serial = 0; Controls controls=emptyControls(); MapEdits edits; int sfzCode=0; std::optional<InstrumentGains> restoredGains; int resetGainBank=-1,resetGainProgram=-1; std::optional<lsfx::NoteAssignments> restoredNotes; };
 struct View { juce::String path, status = "No SoundFont loaded"; std::vector<Preset> presets; uint64_t revision = 0; bool loading = false; bool ready=false; std::map<juce::String,std::vector<CCLabel>> labels; };
 }
@@ -414,6 +425,17 @@ public:
     int current(int ch) const { const auto cmd=commands[ch].load(); return cmd>=0 ? cmd : selected[ch].load(); }
     void select(int ch,int bank,int prog) { if (ch>=0 && ch<channels && bank>=0 && bank<=16383 && prog>=0 && prog<128) commands[ch].store(pack(bank,prog)); }
     void allOff() { panic.store(true); }
+    // This is a MIDI reset, not an instrument reload or a mixer reset.
+    bool resetMidi() {
+        std::lock_guard<std::mutex> lock(requestMutex);
+        if(pending||loadingSerial!=0||failedSerial==latest.serial||(latest.path.isEmpty()&&latest.edits.empty())) return false;
+        overrides=emptyControls();
+        for(auto& c:controlCommands) c.store(unset);
+        controlDirty.store(false);
+        for(auto& c:commands) c.store(-1);
+        midiResetRequested.store(true);
+        return true;
+    }
     // Full instance initialization, not just MIDI panic. Keep user-wide
     // browser settings and on-disk presets intact. Worker retires the engine.
     void initializeInstance() {
@@ -534,8 +556,7 @@ public:
         if(f.hasFileExtension("sfz")) setUiChannel(0);
         if(f.hasFileExtension("sf2;sf3") && midiFX->getIndex()==1 && effects->getIndex()==0)
             effects->setValueNotifyingHost(effects->convertTo0to1(3.0f));
-        auto p=defaults();
-        if(f.hasFileExtension("sfz")) for(int ch=1;ch<channels;++ch) if(p[ch]==0) p[ch]=pack(0,1);
+        auto p=initialPrograms(f.hasFileExtension("sfz"));
         load(f.getFullPathName(),p,emptyControls(),{},0,false,InstrumentGains{},-1,-1,lsfx::NoteAssignments{});
     }
     juce::AudioParameterFloat& gainParameter() { return *gain; }
@@ -592,10 +613,14 @@ public:
         auto f=readFX(); int fx=effects->getIndex();
         const int followMode=midiFX->getIndex();
         if(engine->lastMidiFxMode!=followMode) {engine->midiDisabledFx=0; engine->lastMidiFxMode=followMode;}
+        // Apply before this block's MIDI events, so the new song can send its
+        // own Bank Select / Program Change / CCs immediately after the reset.
+        const bool midiReset=midiResetRequested.exchange(false);
+        if(midiReset) resetLiveMidi(*engine,f,fx);
         const bool settingsChanged=configureFX(*engine,f,fx);
         auto* s = engine->synth;
         const int q=quality->getIndex();
-        bool controlChanged = q!=engine->quality || settingsChanged || routingChanged;
+        bool controlChanged = midiReset || q!=engine->quality || settingsChanged || routingChanged;
         if(applyControls(*engine)) controlChanged=true;
         if(engine->hasSF2&&updateSF2Trims(*engine)) controlChanged=true;
         if(engine->hasSF2&&applyInitialAmbience(*engine,f[sf2Ambience])) controlChanged=true;
@@ -1086,7 +1111,7 @@ private:
     std::array<std::atomic<int>,channels> selected{},commands{};
     std::array<std::atomic<int>,channels> sfzNeeded{},sfzRetry{};
     std::atomic<bool> extraSfzPending{false};
-    std::atomic<bool> panic{false}, clearing{false};
+    std::atomic<bool> panic{false}, clearing{false}, midiResetRequested{false};
     std::mutex engineMutex, requestMutex, viewMutex;
     InstrumentGains instrumentGains; // protected by engineMutex, already held during render
     std::mutex noteMutex;
@@ -1121,6 +1146,40 @@ private:
             const int v=e.sfzCC[controlIndex(ch,cc.cc)];
             controlValues[controlIndex(ch,cc.cc)].store(v==unset?cc.initial:v);
         }
+    }
+    void resetLiveMidi(Engine& e,FXValues& f,int& fx) {
+        // Native system reset clears channel modes, notes, controllers, bank
+        // state, pitch bend, pressure, RPN/NRPN and generator offsets. Rebind
+        // virtual addresses explicitly: FluidSynth does not know our map.
+        fluid_synth_system_reset(e.synth);
+        for(int ch=0;ch<channels;++ch) {
+            if(auto* slot=e.sfzActive[ch]) {
+                sfizz_all_sound_off(slot->synth);
+                slot->owner=-1; e.sfzActive[ch]=nullptr;
+            }
+            e.sfzAddress[ch]=-1;
+            sfzNeeded[ch].store(-1); sfzRetry[ch].store(-1);
+        }
+        e.sfzCC=emptyControls();
+        for(auto& c:controlValues) c.store(unset);
+        e.sf2Trims={};
+        e.midiMaster=1.0f; e.midiDisabledFx=0;
+        e.reverbSendExplicit.fill(false); e.ambienceApplied=-1;
+        // Follow MIDI exposes MIDI-driven effect settings through host
+        // parameters. Restore their initial profile, but leave manual FX
+        // and all mixer-specific settings (gain, compressors, routes) alone.
+        if(midiFX->getIndex()==1) {
+            for(int i=0;i<inputTrim;++i) {
+                f[i]=fxSpecs[i].initial;
+                auto* par=fxParams[i];
+                static_cast<juce::AudioProcessorParameter*>(par)->setValue(par->convertTo0to1(float(f[i])));
+            }
+            midiEffectMask(e.hasSF2?3:0,fx);
+        }
+        e.resetFX(); e.lastFx.fill(-1); e.effects=-1; e.quality=-1;
+        for(int ch=0;ch<channels;++ch) selectLive(e,ch,e.resetPrograms[ch]);
+        // Do not recycle note-route groups until the existing render-path
+        // silence check: FluidSynth may still hold a partially rendered block.
     }
     void selectLive(Engine& e,int ch,int code) {
         const bool ready=choose(e,ch,code); selected[ch].store(code);
@@ -1174,11 +1233,13 @@ private:
         if(controls) *controls=(pending||loadingSerial!=0||failedSerial==latest.serial)?latest.controls:overrides;
         // While a new bank is loading retain the requested state, not old programs.
         if (pending || loadingSerial!=0 || failedSerial==latest.serial) p=latest.programs;
+        else if(midiResetRequested.load()) p=initialPrograms(juce::File(latest.path).hasFileExtension("sfz"),latest.sfzCode);
         else for(int i=0;i<channels;++i) { int cmd=commands[i].load(); p[i]=cmd>=0 ? cmd : selected[i].load(); }
     }
     uint64_t loadingSerial=0, failedSerial=~uint64_t(0);
     void load(const juce::String& path,Programs p,Controls c=emptyControls(),MapEdits edits={},int sfzCode=0,bool preserveOnFailure=false,std::optional<InstrumentGains> restoredGains=std::nullopt,int resetGainBank=-1,int resetGainProgram=-1,std::optional<lsfx::NoteAssignments> restoredNotes=std::nullopt) {
         { std::lock_guard<std::mutex> lock(requestMutex);
+          midiResetRequested.store(false);
           importRollback.reset();
           if(preserveOnFailure&&!pending&&loadingSerial==0) {
               importRollback=latest; rollbackWasFailed=failedSerial==latest.serial;
@@ -1207,7 +1268,7 @@ private:
             if(!empty) {
                 if(r.path.isNotEmpty()&&!juce::File(r.path).existsAsFile()) error="SoundFont not found: "+r.path;
                 else {
-                    fresh=std::make_unique<Engine>(); fresh->rate=r.rate; fresh->serial=r.serial; fresh->sfzCC=r.controls; fresh->prepareFX(); fresh->prepareMixer();
+                    fresh=std::make_unique<Engine>(); fresh->rate=r.rate; fresh->serial=r.serial; fresh->sfzCC=r.controls; fresh->resetPrograms=initialPrograms(juce::File(r.path).hasFileExtension("sfz"),r.sfzCode); fresh->prepareFX(); fresh->prepareMixer();
                     fresh->settings=new_fluid_settings();
                     if(fresh->settings) {
                         fluid_settings_setnum(fresh->settings,"synth.sample-rate",r.rate);
@@ -1420,7 +1481,7 @@ public:
     explicit Editor(Processor& p) : AudioProcessorEditor(p), proc(p) {
         setWantsKeyboardFocus(true);
         setFocusContainerType(juce::Component::FocusContainerType::keyboardFocusContainer);
-        title.setText(sf2MultiOutput?"LSFX 0.99.2":"LSFX 0.99.2 SF2 stereo recovery",juce::dontSendNotification); title.setFont(juce::FontOptions(21.0f)); title.setAccessible(false); addAndMakeVisible(title);
+        title.setText(sf2MultiOutput?"LSFX 0.99.3 TEST33":"LSFX 0.99.3 TEST33 SF2 stereo recovery",juce::dontSendNotification); title.setFont(juce::FontOptions(21.0f)); title.setAccessible(false); addAndMakeVisible(title);
         status.setText("No SoundFont loaded",juce::dontSendNotification); status.setTitle("Instrument status"); addAndMakeVisible(status);
         setup(open,"Open SF2 or SFZ",1); setup(parameters,"Parameters",2); setup(channel,"MIDI channel",3); setup(bank,"Bank",37); setup(program,"Program",38); setup(level,"Master output gain",36);
         setup(grid,"Parameter grid",1); setup(value,"Parameter value",2); setup(closeGrid,"Close parameters",3);
@@ -2031,6 +2092,11 @@ private:
         // Leave the host and the native combo popup in control of their own keys.
         if(chooser||catalogBusy) return false;
         if(ctrl&&!alt&&!mods.isShiftDown()&&code==juce::KeyPress::returnKey&&(panelMode==Panel::none||panelMode==Panel::notes)) {proc.allOff();if(origin)speak(*origin,"All sounds off");return true;}
+        if(ctrl&&alt&&!mods.isShiftDown()&&(ch=='m'||code=='M'||code=='m')&&(panelMode==Panel::none||panelMode==Panel::notes)) {
+            const bool accepted=proc.resetMidi();
+            if(origin) speak(*origin,accepted?"MIDI reset":"MIDI reset unavailable while empty or loading");
+            return true;
+        }
         if(panelMode==Panel::notes) return handleNoteKey(k);
         if(panelMode==Panel::about) return handleAboutKey(k,origin);
         if(panelMode!=Panel::none) return handlePanelKey(k,origin);

@@ -1,3 +1,10 @@
+# TEST33 — MIDI reset acceptance checks
+
+- Load GeneralUser GS or a hybrid map. Set CC7/11 to zero, change banks/programs, set pitch bend and sustain; stop, Ctrl+Alt+M, then play from the beginning. Check volume/expression defaults, percussion channel, and all channel assignments.
+- Reset with a populated Note Mixer, channel gains, SFZ instrument gains, compressor settings, and output routes; ensure they and the map/preset path remain intact. Manual global FX settings must remain unchanged; Follow MIDI restores its initial FX profile. Repeat with standalone SFZ and hybrid SF2/SFZ. Confirm reset is applied before new MIDI events in the next block.
+- Ctrl+Enter remains Panic, Alt+I remains full initialization. Reset must not reload source banks. Check keyboard focus and the screen-reader announcement. Actual Windows host test pending.
+- CI's hybrid processor smoke test now includes MIDI reset, map/mixer preservation and re-triggering. All ten independent C++ tests and the patch installer passed locally. With the installed Linux FluidSynth and GeneralUser GS, native system reset restored CC7/11/10/64/1, pitch bend center, pitch bend range and cutoff offset for all 16 channels. The JUCE hybrid processor and Windows UI were not built or run locally.
+
 # LSFX 0.99.2 — release acceptance checks
 
 27 November 2026. TEST31.3 SF2 per-note routing and TEST32 keyboard ergonomics were validated by the user in REAPER. This release keeps their audio implementation unchanged.

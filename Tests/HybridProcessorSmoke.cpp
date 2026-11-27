@@ -151,6 +151,54 @@ void testChannelCompression(const juce::File& source,bool sfz) {
     require(restored.compressorValue(0,lsfx::compMix)==0,"initialize resets compressor");
     std::cout<<"PASS: "<<(sfz?"SFZ":"SF2 experimental")<<" channel compressor, routing move, independence, state\n";
 }
+void testMidiReset(const juce::File& sf2,const juce::File& sfz) {
+    Processor p; p.prepareToPlay(44100,256);p.loadFile(sf2);waitReady(p);
+    require(p.importSFZ(sfz,pack(0,3),1).wasOk(),"SFZ mapped before MIDI reset");waitReady(p);
+    setChoice(p.midiFXParameter(),0);setChoice(p.effectsParameter(),0);
+    setChoice(p.routeParameter(0),sf2MultiOutput?1:0);
+    p.channelGainParameter(0).setValueNotifyingHost(p.channelGainParameter(0).convertTo0to1(-3.0f));
+    p.setInstrumentGain(pack(0,3),-4.0f);p.setNote(pack(0,0),60,{sf2MultiOutput?1:-1,-10,0,0});
+    setComp(p,0,lsfx::compMix,20);
+    juce::MidiBuffer midi;
+    p.setControl(0,128,1000);
+    midi.addEvent(juce::MidiMessage::controllerEvent(1,7,0),0);
+    midi.addEvent(juce::MidiMessage::controllerEvent(1,11,0),0);
+    midi.addEvent(juce::MidiMessage::controllerEvent(1,64,127),0);
+    midi.addEvent(juce::MidiMessage::pitchWheel(1,16000),0);
+    midi.addEvent(juce::MidiMessage::programChange(1,17),0);
+    midi.addEvent(juce::MidiMessage::controllerEvent(2,1,127),0);
+    render(p,midi,2);
+    require(p.current(0)==pack(0,17)&&p.getControl(0,11)==0,"dirty SF2 state");
+    require(p.getControl(1,1)==127,"dirty SFZ controller");
+    require(p.resetMidi(),"reset accepted");
+    render(p,midi,2);
+    require(p.current(0)==pack(0,0)&&p.current(9)==pack(128,0),"default virtual addresses after reset");
+    require(p.getControl(0,7)==100&&p.getControl(0,11)==127&&p.getControl(0,128)==0,"reset volume/expression/generator");
+    require(findPreset(p.getView().presets,pack(0,3))!=nullptr,"reset retains mixed map");
+    require(p.routeParameter(0).getIndex()==(sf2MultiOutput?1:0)&&std::abs(p.channelGainParameter(0).get()+3)<.01f&&p.compressorValue(0,lsfx::compMix)==20,"reset preserves mixer");
+    require(p.instrumentGain(pack(0,3))==-4&&p.notesForProgram(pack(0,0)).at(60).level==-10,"reset preserves program gain and notes");
+    require(p.effectsParameter().getIndex()==0,"manual effects preserved");
+    midi.addEvent(juce::MidiMessage::noteOn(1,60,juce::uint8(100)),0);
+    require(render(p,midi)[sf2MultiOutput?1:0]>1e-5f,"SF2 audible after reset");
+    // New messages in the reset block must win over the initial defaults.
+    require(p.resetMidi(),"second reset accepted");
+    midi.addEvent(juce::MidiMessage::controllerEvent(1,7,81),0);
+    midi.addEvent(juce::MidiMessage::programChange(1,3),0);
+    render(p,midi,2);
+    require(p.current(0)==pack(0,3)&&p.getControl(0,7)==81,"new song overrides reset");
+    // Standalone SFZ starts with just channel 1 on program 0.
+    Processor z;z.prepareToPlay(44100,256);z.loadFile(sfz);waitReady(z);
+    const int initial=z.getControl(0,1);
+    midi.addEvent(juce::MidiMessage::controllerEvent(1,1,127),0);
+    midi.addEvent(juce::MidiMessage::pitchWheel(1,16383),0);render(z,midi,2);
+    require(z.getControl(0,1)==127,"standalone SFZ dirty CC");
+    require(z.resetMidi(),"standalone SFZ reset accepted");render(z,midi,2);
+    require(z.current(0)==pack(0,0)&&z.current(1)==pack(0,1),"standalone SFZ default addresses");
+    require(z.getControl(0,1)==initial,"standalone SFZ default CC");
+    midi.addEvent(juce::MidiMessage::noteOn(1,60,juce::uint8(100)),0);
+    require(render(z,midi)[0]>1e-5f,"standalone SFZ audible after reset");
+    std::cout<<"PASS: MIDI reset restores defaults, retains map/mixer and accepts new song messages\n";
+}
 }
 int main(int argc,char** argv) {
     if(argc!=4) return 2;
@@ -267,6 +315,7 @@ int main(int argc,char** argv) {
         require(deletedRestore.clearLocation(128,-1).wasOk(),"clear final bank");waitReady(deletedRestore,false);
         require(deletedRestore.getView().presets.empty()&&deletedRestore.notesForProgram(pack(1,4)).empty(),"last deletion releases map and note state");
         std::cout<<"PASS: persistent virtual map deletion, refilling, draft note state and MIDI learn\n";
+        testMidiReset(sf2,one);
         testChannelCompression(one,true);testLastSfzOutput(one);
         if constexpr(sf2MultiOutput) {testChannelCompression(sf2,false);testAllSf2Outputs(sf2);testNoteRouting(sf2);}
     } catch(const std::exception& e) {std::cerr<<"FAIL: "<<e.what()<<'\n';return 1;}

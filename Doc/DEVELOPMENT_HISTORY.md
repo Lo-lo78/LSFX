@@ -215,3 +215,8 @@ Generate and include an in-process CMake installer for the identical ten note-ro
 ## 0.99.2 — 27 November 2026
 
 TEST32 validated by the user. Bank and Program navigation now uses eight rows per column to match General MIDI instrument families. Release About, guides and package naming updated. No audio, dependency patch or serialization changes.
+
+## 0.99.3 TEST33
+
+- Ctrl+Alt+M manual MIDI playback reset without unloading the virtual map or altering the channel/note mixer; Follow MIDI effects return to their initial profile. Reset is processed before incoming MIDI on the audio thread.
+- Existing Panic and Initialize shortcuts unchanged; added hybrid processor regression test.

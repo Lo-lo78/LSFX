@@ -1,8 +1,12 @@
-# LSFX 0.99.2
+# LSFX 0.99.3 TEST33
 
 27 November 2026 · Windows x64 VST3 · Lo-lo
 
 LSFX is an accessible multitimbral SF2/SFZ instrument for REAPER. Its defining feature is a fully editable MIDI bank/program map combining complete SoundFont banks, individual SF2 presets and SFZ instruments from multiple sources. Save the entire hybrid map as an LSFX preset or export it as a standalone SoundFont. Sixteen independent MIDI channels, 64 stereo audio outputs (Main 1/2 and 63 auxiliary pairs 3/4–127/128), 16 stereo parallel compressors, channel gains, SFZ program-specific gain, shared Main effects and keyboard/screen-reader navigation make it a flexible mixing instrument.
+
+## TEST33 — MIDI Reset
+
+Ctrl+Alt+M restores MIDI playback defaults without unloading the sound library or resetting the mixer. Notes are stopped; SF2 channels are reset using FluidSynth's system reset and the virtual programs are rebound (bank 000/program 000, channel 10 bank 128/program 000; standalone SFZ follows the initial open-file policy). SFZ controllers are restored to instrument defaults, pitch wheel and channel pressure reset. Manual CC/generator overrides are cleared. Follow MIDI mode also restores the MIDI-controlled global FX profile; Manual mode preserves global FX settings. Channel gain, output assignments, compressors, SFZ instrument gain, note mixer and map remain intact. The reset is processed before incoming MIDI in the next audio block; it does not reload samples, and is unavailable while empty/loading. This is not a full reset of internal SFZ round-robin/keyswitch state or a guarantee of reproducing an arbitrary mid-song seek; REAPER can still send chased MIDI events after the reset. Ctrl+Enter remains Panic; Alt+I remains full initialization.
 
 ## New in 0.99.2
 
@@ -45,6 +49,6 @@ Older preset route indices are preserved. Previously recorded host automation fo
 
 ## Build and verification
 
-Push to main and download the Windows x64 artifact from GitHub Actions. The default build retains mandatory native multigroup and hybrid processor tests. The user validated TEST31.3 per-note SF2 routing and TEST32 keyboard ergonomics in REAPER. This release changes only the bank/program grid size, About/version metadata and documentation/package naming. Final Windows compilation and the eight-row navigation check are still required. The optional SF2 stereo recovery build is diagnostic only.
+Push to main and download the Windows x64 artifact from GitHub Actions. The default build retains mandatory native multigroup and hybrid processor tests. The user validated TEST31.3 per-note SF2 routing and TEST32 keyboard ergonomics in REAPER. TEST33 adds the manual MIDI reset described above. Full Windows compilation and host verification of TEST33 are still required. The optional SF2 stereo recovery build is diagnostic only.
 
 Plug-in IDs and existing state format are unchanged. See [testing](TESTING.md), [third-party and licensing notes](THIRD_PARTY.md) and [development history](Doc/DEVELOPMENT_HISTORY.md). Complete dependency distribution obligations before publishing binaries.
