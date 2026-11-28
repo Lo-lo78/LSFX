@@ -30,6 +30,7 @@ extern "C" int lsfx_fluid_channel_dry(fluid_synth_t*,int,int);
 #include "SoundFontExport.h"
 #include "SfzSoundFontExport.h"
 #include "InstrumentProjectIO.h"
+#include "InstrumentPreview.h"
 #if JUCE_WINDOWS
  #include <Windows.h>
  #include <UIAutomation.h>
@@ -63,7 +64,7 @@ lsfx::sfzexport::Audio decodeSfzExportSample(juce::AudioFormatManager& formats,c
     return a;
 }
 constexpr int channels = 16;
-constexpr auto lsfxVersion="0.99.3 TEST34";
+constexpr auto lsfxVersion="0.99.3 TEST35";
 constexpr auto lsfxReleaseDate="28 November 2026";
 constexpr auto lsfxProjectUrl="https://github.com/Lo-lo78/LSFX";
 constexpr auto lsfxContactEmail="vmanolo301@gmail.com";
@@ -413,14 +414,15 @@ public:
     }
     void prepareToPlay(double rate, int) override {
         const auto old = hostRate.exchange(rate);
+        instrumentPreview.setRate(rate);
         if (std::abs(old-rate)>0.01) {
             juce::String path; Programs p; Controls c; MapEdits edits; int sfzCode=0;
             InstrumentGains savedGains; lsfx::NoteAssignments savedNotes; stateForSave(path,p,&c,&edits,&sfzCode,&savedGains,&savedNotes);
             if (path.isNotEmpty()||!edits.empty()) load(path,p,c,std::move(edits),sfzCode,false,std::move(savedGains),-1,-1,std::move(savedNotes));
         }
     }
-    void releaseResources() override { panic.store(true); }
-    void reset() override { panic.store(true); }
+    void releaseResources() override { panic.store(true); instrumentPreview.panic(); }
+    void reset() override { panic.store(true); instrumentPreview.panic(); }
     uint64_t getRevision() { std::lock_guard<std::mutex> lock(viewMutex); return view.revision; }
     View getView() { std::lock_guard<std::mutex> lock(viewMutex); return view; }
     int current(int ch) const { const auto cmd=commands[ch].load(); return cmd>=0 ? cmd : selected[ch].load(); }
@@ -457,6 +459,9 @@ public:
     struct EditorMemory { int focus=1,gridReturn=2,gainChannel=0,routeChannel=0,sf2Row=-1,sfzRow=-1,emptyRow=-1,step=0; };
     EditorMemory editorMemory;
     lsfx::instrument::Draft instrumentDraft; // message thread only; no DSP access
+    lsfx::instrument::InstrumentPreview instrumentPreview;
+    void previewInstrument(const lsfx::instrument::Project& p,int raw=-1) {panic.store(true);instrumentPreview.update(p,hostRate.load(),raw);}
+    void stopInstrumentPreview(){panic.store(true);instrumentPreview.disable();}
     float instrumentGain(int code) {
         std::lock_guard<std::mutex> audio(engineMutex);
         const auto it=instrumentGains.find(code); return it==instrumentGains.end()?0.0f:it->second;
@@ -589,6 +594,8 @@ public:
         juce::ScopedNoDenormals noDenormals;
         b.clear();
         if(b.getNumSamples()==0) { midi.clear(); return; }
+        // Exclusive dry editor audition, also usable when the main map is empty.
+        if(instrumentPreview.render(b,midi))return;
         // No waiting for disk I/O or for the worker on the audio thread.
         std::unique_lock<std::mutex> lock(engineMutex, std::try_to_lock);
         if (!lock.owns_lock()) { ++droppedBlocks; for(const auto m:midi) if(m.numBytes>0&&m.data[0]<0xf8) { panic.store(true); break; } midi.clear(); return; }
@@ -1485,7 +1492,7 @@ public:
     explicit Editor(Processor& p) : AudioProcessorEditor(p), proc(p) {
         setWantsKeyboardFocus(true);
         setFocusContainerType(juce::Component::FocusContainerType::keyboardFocusContainer);
-        title.setText(sf2MultiOutput?"LSFX 0.99.3 TEST34":"LSFX 0.99.3 TEST34 SF2 stereo recovery",juce::dontSendNotification); title.setFont(juce::FontOptions(21.0f)); title.setAccessible(false); addAndMakeVisible(title);
+        title.setText(sf2MultiOutput?"LSFX 0.99.3 TEST35":"LSFX 0.99.3 TEST35 SF2 stereo recovery",juce::dontSendNotification); title.setFont(juce::FontOptions(21.0f)); title.setAccessible(false); addAndMakeVisible(title);
         status.setText("No SoundFont loaded",juce::dontSendNotification); status.setTitle("Instrument status"); addAndMakeVisible(status);
         setup(open,"Open SF2 or SFZ",1); setup(parameters,"Parameters",2); setup(channel,"MIDI channel",3); setup(bank,"Bank",37); setup(program,"Program",38); setup(level,"Master output gain",36);
         setup(grid,"Parameter grid",1); setup(value,"Parameter value",2); setup(closeGrid,"Close parameters",3);
@@ -1579,7 +1586,7 @@ public:
         startTimerHz(5);
         scheduleInitialFocus();
     }
-    ~Editor() override { proc.setNoteLearnChannel(-1); if(panelMode==Panel::none&&!initialFocusPending&&!returnFromChooser&&!chooser&&!importInProgress) rememberFocus(focusId(juce::Component::getCurrentlyFocusedComponent())); juce::Desktop::getInstance().removeFocusChangeListener(this); stopTimer(); removeKeyListener(this); panelText.removeKeyListener(this); presetList.removeKeyListener(this); presetList.setModel(nullptr); chooser.reset(); if(catalogThread.joinable()) catalogThread.join(); if(exportJob) exportJob->cancel.store(true); if(exportThread.joinable()) exportThread.join(); }
+    ~Editor() override { if(instrumentPanel)proc.stopInstrumentPreview(); proc.setNoteLearnChannel(-1); if(panelMode==Panel::none&&!initialFocusPending&&!returnFromChooser&&!chooser&&!importInProgress) rememberFocus(focusId(juce::Component::getCurrentlyFocusedComponent())); juce::Desktop::getInstance().removeFocusChangeListener(this); stopTimer(); removeKeyListener(this); panelText.removeKeyListener(this); presetList.removeKeyListener(this); presetList.setModel(nullptr); chooser.reset(); if(catalogThread.joinable()) catalogThread.join(); if(exportJob) exportJob->cancel.store(true); if(exportThread.joinable()) exportThread.join(); }
     void paint(juce::Graphics& g) override {
         g.fillAll(juce::Colour(0xff202429));
         if(panelMode==Panel::notes) {paintNoteGrid(g);return;}
@@ -2383,7 +2390,7 @@ private:
         instrumentPanel=std::make_unique<InstrumentEditorPanel>(proc.instrumentDraft,[this]{
             // Avoid destroying the focused component in its own key callback.
             juce::Component::SafePointer<Editor> safe(this);
-            juce::MessageManager::callAsync([safe]{if(auto* e=safe.getComponent();e&&e->panelMode==Panel::instrument){e->instrumentPanel.reset();e->closePanel(&e->instrumentButton);e->refresh(true);}});
+            juce::MessageManager::callAsync([safe]{if(auto* e=safe.getComponent();e&&e->panelMode==Panel::instrument){e->proc.stopInstrumentPreview();e->instrumentPanel.reset();e->closePanel(&e->instrumentButton);e->refresh(true);}});
         },[this,ch,code,expected](const juce::File& file){
             const auto view=proc.getView();const auto* current=findPreset(view.presets,code);
             const bool same=expected->has_value()?(current&&current->path==expected->value().path&&current->sourceBank==expected->value().sourceBank&&current->sourceProgram==expected->value().sourceProgram):current==nullptr;
@@ -2391,7 +2398,7 @@ private:
             auto result=file.hasFileExtension("sf2")?proc.importSF2(file,code>>7,code&127,0,0,ch):proc.importSFZ(file,code,ch);
             if(result.wasOk())*expected=Preset{code>>7,code&127,file.getFileNameWithoutExtension(),file.getFullPathName(),0,0};
             return result;
-        },address);
+        },address,[this](const lsfx::instrument::Project& p,int raw){proc.previewInstrument(p,raw);},[this]{return proc.instrumentPreview.getStatus();},[this]{proc.instrumentPreview.panic();});
         addAndMakeVisible(*instrumentPanel);resized();repaint();instrumentPanel->activate();
     }
     void hidePanelControls() {

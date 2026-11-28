@@ -16,7 +16,10 @@ int main(int argc,char** argv) {
         auto sfz=exportSFZ(p,base/"sfz-test");require(std::filesystem::exists(sfz)&&std::filesystem::file_size(sfz.parent_path()/"Samples"/sampleFilename(0,p.samples[0]))==a->size(),"SFZ package incomplete");
         auto before=std::filesystem::file_size(sfz);bool rejected=false;try{exportSFZ(p,base/"sfz-test");}catch(...){rejected=true;}require(rejected&&std::filesystem::file_size(sfz)==before,"Overwrite protection failed");
         auto sf2=base/"editor.sf2";lsfx::sfzexport::Report report;
-        lsfx::sfzexport::convertRegions(regions(p),p.name,sf2,[](const Path& path){lsfx::sfzexport::Audio a;a.rate=44100;a.channels=1;for(int i=0;i<8192;++i)a.pcm.push_back(float(.25*std::sin((path.filename()=="sample0001.wav"?.1:.2)*i)));return a;},report);
+        lsfx::sfzexport::Decode decode=[](const Path& path){lsfx::sfzexport::Audio a;a.rate=44100;a.channels=1;for(int i=0;i<8192;++i)a.pcm.push_back(float(.25*std::sin((path.filename()=="sample0001.wav"?.1:.2)*i)));return a;};
+        lsfx::sfzexport::convertRegions(regions(p),p.name,sf2,decode,report);
+        std::ostringstream memory(std::ios::out|std::ios::binary);lsfx::sfzexport::Report ramReport;lsfx::sfzexport::convertRegionsToStream(regions(p),p.name,memory,decode,ramReport);
+        std::ifstream disk(sf2,std::ios::binary);std::string diskBytes((std::istreambuf_iterator<char>(disk)),{});require(memory.str()==diskBytes&&ramReport.regions==report.regions,"Memory SF2 differs from disk export");
         Source result(sf2);require(report.regions==7&&result.presets.count({0,0})==1&&result.ib.size()/4==8,"Direct SF2 region export failed");
         auto bad=p;bad.zones[0].low=127;rejected=false;try{bad.validate();}catch(...){rejected=true;}require(rejected,"Invalid key range accepted");
         std::cout<<"PASS: editor sample sharing, four mapping modes, range validation, non-destructive SFZ package and direct SF2 export\n";

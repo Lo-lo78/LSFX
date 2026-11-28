@@ -219,6 +219,27 @@ void testInstrumentEditor(const juce::File& sfz) {
     require(newSfz.existsAsFile()&&newSfz.getParentDirectory().getChildFile("Samples").getNumberOfChildFiles(juce::File::findFiles)==1,"portable SFZ sample sharing");
     bool refused=false;try{q.format=ie::Format::sf2;ie::exportInstrument(q,sf2);}catch(const std::exception&){refused=true;}require(refused,"existing SF2 must not be overwritten");
     for(auto file:{sf2,newSfz}){Processor sampler;sampler.prepareToPlay(44100,256);sampler.loadFile(file);waitReady(sampler);setChoice(sampler.effectsParameter(),0);juce::MidiBuffer midi;midi.addEvent(juce::MidiMessage::noteOn(1,60,juce::uint8(100)),0);require(render(sampler,midi)[0]>1e-5f,"generated instrument playback");}
+    // Actual preview path, before any main SoundFont is loaded. Source WAV has
+    // already been removed; only the project's immutable sample bytes remain.
+    Processor preview;preview.prepareToPlay(44100,256);
+    auto ready=[&]{for(int i=0;i<1500;++i){auto status=preview.instrumentPreview.getStatus();if(status.startsWith("Preview error"))throw std::runtime_error(status.toStdString());if(status=="Preview: ready, play MIDI"||status=="Preview: sample audition")return;std::this_thread::sleep_for(std::chrono::milliseconds(20));}throw std::runtime_error("Editor preview timed out");};
+    const int initial=preview.current(0);
+    for(auto fmt:{ie::Format::sf2,ie::Format::sfz}){
+        q.format=fmt;for(auto& zone:q.zones){zone.low=zone.high=60;zone.pan=0;}
+        preview.previewInstrument(q);ready();juce::MidiBuffer midi;
+        midi.addEvent(juce::MidiMessage::noteOn(10,61,juce::uint8(100)),0);require(render(preview,midi,4)[0]<1e-6f,"Preview ignored mapping range");
+        midi.addEvent(juce::MidiMessage::noteOn(10,60,juce::uint8(100)),0);auto peak=render(preview,midi,4);require(peak[0]>1e-5f&&peak[1]<1e-6f&&peak[2]<1e-6f,"Preview missing or leaked to auxiliary output");
+        preview.instrumentPreview.panic();render(preview,midi,4);require(render(preview,midi,12)[0]<1e-5f,"Preview panic left audio");
+        for(auto& zone:q.zones)zone.low=zone.high=62;
+        preview.previewInstrument(q);ready();midi.addEvent(juce::MidiMessage::noteOn(1,60,juce::uint8(100)),0);require(render(preview,midi,4)[0]<1e-6f,"Preview retained stale mapping");
+        midi.addEvent(juce::MidiMessage::noteOn(1,62,juce::uint8(100)),0);require(render(preview,midi,4)[0]>1e-5f,"Edited mapping not audible");
+    }
+    preview.previewInstrument(q,0);ready();juce::MidiBuffer noMidi;require(render(preview,noMidi,4)[0]>1e-5f,"Raw sample audition missing");
+    preview.stopInstrumentPreview();require(render(preview,noMidi,4)[0]<1e-6f&&!preview.getView().ready&&preview.current(0)==initial,"Preview changed empty main map");
+    preview.loadFile(sf2);waitReady(preview);const auto before=preview.getView();const auto code=preview.current(0);
+    preview.previewInstrument(q);ready();preview.stopInstrumentPreview();require(preview.getView().revision==before.revision&&preview.current(0)==code,"Preview altered loaded library or program");
+    noMidi.addEvent(juce::MidiMessage::noteOn(1,60,juce::uint8(100)),0);require(render(preview,noMidi,4)[0]>1e-5f,"Main instrument not restored after editor");
+    std::cout<<"PASS: editor MIDI preview SF2/SFZ, remap, dry main output, raw sample, main map isolation\n";
     std::cout<<"PASS: portable compressed project, deduplication, original removed, SF2 and SFZ audio playback, overwrite protection\n";
 }
 }
