@@ -8,7 +8,7 @@ namespace lsfx::instrument {
 class FluidEditorBank {
     struct SampleDeleter {void operator()(fluid_sample_t* p)const {if(p)delete_fluid_sample(p);}};
     struct Asset {std::array<std::unique_ptr<fluid_sample_t,SampleDeleter>,2> pcm;int frames=0,channels=0;};
-    struct Generators {std::array<std::pair<int,float>,56> data{};size_t count=0;void set(int id,int value){data[count++]={id,float(value)};}};
+    struct Generators {std::array<std::pair<int,float>,56> data{};size_t count=0;void set(int id,float value){data[count++]={id,float(value)};}};
     struct ModDeleter {void operator()(fluid_mod_t* p)const {if(p)delete_fluid_mod(p);}};
     using Mods=std::vector<std::unique_ptr<fluid_mod_t,ModDeleter>>;
     static int flags(int s){return ((s>>8)&3)|((s>>8)&12)|((s&128)?FLUID_MOD_CC:0);}
@@ -45,7 +45,7 @@ class FluidEditorBank {
         offset(g,0,4,z.startFrame);offset(g,1,12,end-last);
         offset(g,2,45,z.loopStart);offset(g,3,50,loopEnd-last);
         g.set(58,z.root);int coarse=z.pitch/100;g.set(51,coarse);g.set(52,z.pitch-coarse*100);g.set(56,z.keyTrack);
-        int att=-10*z.level;int pan=z.pan*5;if(a.channels==2){pan=ch==0?-500:500;att=std::min(1440,att+sfzexport::attenuation(1-std::max(0.0,(ch==0?z.pan:-z.pan)/100.0)));}
+        float att=float(sf2VoiceAttenuation(z.level));int pan=z.pan*5;if(a.channels==2){pan=ch==0?-500:500;att=std::min(1440.0f,att+sfzexport::attenuation(1-std::max(0.0,(ch==0?z.pan:-z.pan)/100.0)));}
         g.set(17,pan);g.set(48,att);
         g.set(33,timecents(z.ampDelay,5000));g.set(34,timecents(z.ampAttack));g.set(35,timecents(z.ampHold,5000));g.set(36,timecents(z.ampDecay));g.set(37,sfzexport::attenuation(z.ampSustain/100.0));g.set(38,timecents(z.ampRelease));
         g.set(8,sfzexport::clampRound(1200*std::log2(z.cutoff/8.176),1500,13500));g.set(9,z.resonance);
@@ -53,6 +53,7 @@ class FluidEditorBank {
         g.set(23,timecents(z.vibDelay,5000));g.set(24,frequency(z.vibFreq));g.set(6,z.vibPitch);
         g.set(21,timecents(z.lfoDelay,5000));g.set(22,frequency(z.lfoFreq));g.set(10,z.lfoFilter);g.set(13,z.lfoVolume);g.set(5,z.lfoPitch);g.set(39,z.ampHoldKey);g.set(40,z.ampDecayKey);g.set(31,z.modHoldKey);g.set(32,z.modDecayKey);
         g.set(54,z.loopMode==1?1:z.loopMode==2?3:0);g.set(57,z.choke);g.set(16,z.reverb*10);g.set(15,z.chorus*10);
+        for(const auto& native:activeNativeGenerators(z)){if(native.first==17&&a.channels==2)continue;for(size_t i=0;i<g.count;++i)if(g.data[i].first==native.first){g.data[i].second=float(native.second);break;}}
         return g;
     }
 public:

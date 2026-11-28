@@ -1,8 +1,14 @@
-# LSFX 0.99.3 TEST40
+# LSFX 0.99.3 TEST41
 
 28 November 2026 · Windows x64 VST3 · Lo-lo
 
 LSFX is an accessible multitimbral SF2/SFZ instrument for REAPER. Its defining feature is a fully editable MIDI bank/program map combining complete SoundFont banks, individual SF2 presets and SFZ instruments from multiple sources. Save the entire hybrid map as an LSFX preset or export it as a standalone SoundFont. Sixteen independent MIDI channels, 64 stereo audio outputs (Main 1/2 and 63 auxiliary pairs 3/4–127/128), 16 stereo parallel compressors, channel gains, SFZ program-specific gain, shared Main effects and keyboard/screen-reader navigation make it a flexible mixing instrument.
+
+## TEST41 — Preserve imported instrument levels
+
+The dry SF2 editor and main engine now use the same unity FluidSynth gain. The SF2 loader's EMU initial-attenuation factor (0.4) is applied exactly once: the editable Level is stored in audible nominal dB (0.04 dB native SF2 resolution, 0.01 dB SFZ resolution), and SF2 export reverses that conversion to preserve the original file generator. No sample normalization, automatic makeup gain or PCM gain baking is used for SF2 editor exports. SFZ imports combine static volume and amplitude without discarding positive or fractional gain (up to +48 dB); zero amplitude remains silent. Native SF2 envelope, sustain, filter, pan, LFO timing/frequency and send generator values are retained while unedited, including values finer than the editor display. Matching preset-level modulation amounts are added to the instrument/default modulator rather than replacing it. The editor remains a dry preview, independent of the main mixer, effects, channel controller state and program-specific gain.
+
+Project archives use version 4. Versions 1–3 remain readable; their old Level unit is converted to preserve the former export interpretation. Reimport a TEST40-imported source for the precision lost when it was first imported. The editable SF2 Level range is -57.60 to 0 dB (0–1440 native centibels); combined preset/instrument offsets outside that range still produce an import warning. SFZ-specific unsupported opcodes, nonstandard SF2 generators and complex modulation combinations can still require an approximation. No original file or main map is modified.
 
 ## TEST40 — Edit a loaded SF2/SFZ program
 

@@ -222,9 +222,10 @@ void testInstrumentEditor(const juce::File& sfz) {
     // Multi-program archive: retain two addresses, one shared original blob,
     // independent edits, and native SF2/SFZ exports with no main-map mutation.
     q.format=ie::Format::sf2;auto first=q;first.name="First";for(auto& z:first.zones)z.low=z.high=60;
-    auto second=first;second.name="Second";for(auto& z:second.zones)z.low=z.high=62;
+    first.zones[0].level=-1236;first.zones[0].nativeGenerators={{37,17,first.zones[0].ampSustain}};auto second=first;second.name="Second";for(auto& z:second.zones)z.low=z.high=62;
     ie::Library library;ie::storeProgram(library,first,{2,4},false);ie::storeProgram(library,second,{128,0},false);
     auto multi=dir.getChildFile("library.lsfx-instrument");ie::saveProject(second,multi,false,library);auto bundle=ie::openLibraryProject(multi);
+    require(bundle.programs.at({2,4}).zones[0].level==-1236&&bundle.programs.at({2,4}).zones[0].nativeGenerators==first.zones[0].nativeGenerators,"Exact gain/generator archive round trip failed");
     require(bundle.programs.size()==2&&bundle.programs.at({2,4}).name=="First"&&bundle.programs.at({128,0}).zones[0].low==62,"Library archive lost addresses or mapping");
     require(bundle.draft.samples[0].bytes==bundle.programs.at({2,4}).samples[0].bytes&&bundle.programs.at({2,4}).samples[0].bytes==bundle.programs.at({128,0}).samples[0].bytes,"Archive failed shared resource identity");
     {juce::ZipFile zip(multi);require(zip.getNumEntries()==2,"Archive duplicated original sample");}

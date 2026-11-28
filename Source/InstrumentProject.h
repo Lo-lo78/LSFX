@@ -44,9 +44,11 @@ inline const ModDestination* modDestination(int id){for(const auto& d:modDestina
 inline int sfzAmountLimit(int dest){return dest==48?960:dest==17?1000:dest==9?400:12000;}
 inline bool validMod(const Modulation& m){auto* d=modDestination(m.destination);if(!d||m.amount< -32768||m.amount>32767)return false;return m.sfz?d->sfzOpcode&&std::abs(m.amount)<=sfzAmountLimit(m.destination)&&m.source>=128&&m.source<248&&validCC(m.source-128)&&m.secondary==0&&m.transform==0:validSource(m.source)&&validSource(m.secondary,true)&&(m.transform==0||m.transform==2);}
 inline bool sameModIdentity(const Modulation& a,const Modulation& b){return a.sfz==b.sfz&&a.source==b.source&&a.destination==b.destination&&a.secondary==b.secondary;}
+struct NativeGenerator { int id=0, value=0, baseline=0; bool operator==(const NativeGenerator& o)const{return std::tie(id,value,baseline)==std::tie(o.id,o.value,o.baseline);} };
 struct Zone {
     std::vector<Modulation> mods;
-    int sample=0,root=60,low=0,high=127,lowVel=1,highVel=127,level=0,pan=0,pitch=0; // dB, %, cents
+    std::vector<NativeGenerator> nativeGenerators; // exact SF2 values while the corresponding UI value is unchanged
+    int sample=0,root=60,low=0,high=127,lowVel=1,highVel=127,level=0,pan=0,pitch=0; // level: hundredths of audible dB; pan: %, pitch: cents
     int startFrame=0,endFrame=-1,loopMode=0,loopStart=0,loopEnd=-1; // inclusive frame indices; -1 = sample end
     int ampDelay=0,ampAttack=0,ampHold=0,ampDecay=0,ampSustain=100,ampRelease=5; // ms, percent
     int cutoff=19912,resonance=0; // Hz, tenths dB
@@ -68,7 +70,7 @@ struct ZoneParam { const char* name; const char* key; int Zone::*member; int lo,
 inline constexpr ZoneParam zoneParams[]={
  {"Sample","sample",&Zone::sample,0,4095,0,""},
  {"Root Key","root",&Zone::root,0,127,60,""}, {"Low Key","low",&Zone::low,0,127,0,""}, {"High Key","high",&Zone::high,0,127,127,""},
- {"Low Velocity","lowVel",&Zone::lowVel,1,127,1,""}, {"High Velocity","highVel",&Zone::highVel,1,127,127,""}, {"Level","level",&Zone::level,-60,0,0,"dB"}, {"Pan","pan",&Zone::pan,-100,100,0,"percent"},
+ {"Low Velocity","lowVel",&Zone::lowVel,1,127,1,""}, {"High Velocity","highVel",&Zone::highVel,1,127,127,""}, {"Level","level",&Zone::level,-14400,4800,0,"0.01 dB"}, {"Pan","pan",&Zone::pan,-100,100,0,"percent"},
  {"Pitch","pitch",&Zone::pitch,-4800,4800,0,"cents"}, {"Key Tracking","keyTrack",&Zone::keyTrack,0,1200,100,"percent"},
  {"Sample Start","startFrame",&Zone::startFrame,0,99999999,0,"frames"}, {"Sample End","endFrame",&Zone::endFrame,-1,99999999,-1,"frames"},
  {"Loop Mode","loopMode",&Zone::loopMode,0,3,0,""}, {"Loop Start","loopStart",&Zone::loopStart,0,99999999,0,"frames"}, {"Loop End","loopEnd",&Zone::loopEnd,-1,99999999,-1,"frames"},
@@ -112,6 +114,8 @@ inline uint64_t fingerprint(const Blob& data) {
 inline std::string hashText(uint64_t h) {std::ostringstream s;s<<std::hex<<std::setw(16)<<std::setfill('0')<<h;return s.str();}
 inline bool extensionOK(const std::string& x) {return x=="wav"||x=="aif"||x=="aiff"||x=="flac";}
 inline std::string sampleFilename(size_t i,const Sample& s) {std::ostringstream out;out<<"sample"<<std::setw(4)<<std::setfill('0')<<i+1<<'.'<<s.extension;return out.str();}
+inline int Zone::* nativeGeneratorMember(int id);
+inline constexpr int sf2MinLevel=-5760;
 struct Project {
     std::string name="New Instrument";
     Format format=Format::sf2;
@@ -126,6 +130,8 @@ struct Project {
         for(const auto& s:samples) require(s.bytes&&!s.bytes->empty()&&s.bytes->size()<=maxSampleBytes&&extensionOK(s.extension)&&!s.name.empty()&&s.name.size()<=1024&&s.root>=0&&s.root<=127,"Invalid sample resource");
         for(const auto& z:zones){
             require(z.mods.size()<=48,"Too many zone modulators");
+            require(format!=Format::sf2||(z.level>=sf2MinLevel&&z.level<=0),"Invalid SF2 level");
+            require(z.nativeGenerators.size()<=20,"Too many exact SF2 generators");std::set<int> nativeIds;for(const auto& g:z.nativeGenerators){auto member=nativeGeneratorMember(g.id);require(member&&g.value>=-32768&&g.value<=32767&&nativeIds.insert(g.id).second,"Invalid exact SF2 generator");}
             for(size_t i=0;i<z.mods.size();++i){require(validMod(z.mods[i]),"Invalid modulator");for(size_t j=0;j<i;++j)require(!sameModIdentity(z.mods[i],z.mods[j]),"Duplicate modulator");}
             for(const auto& param:zoneParams)require(z.*param.member>=param.lo&&z.*param.member<=param.hi,"Invalid zone parameter");
             require(z.sample>=0&&size_t(z.sample)<samples.size()&&z.low<=z.high&&z.lowVel<=z.highVel&&z.seqPosition<=z.seqLength&&z.randomLow<=z.randomHigh,"Invalid zone mapping");
@@ -169,7 +175,7 @@ struct Project {
 };
 inline bool sameSound(const Project& a,const Project& b){
     if(a.format!=b.format||!sameSamples(a.samples,b.samples)||a.zones.size()!=b.zones.size())return false;
-    for(size_t i=0;i<a.zones.size();++i){if(a.zones[i].mods!=b.zones[i].mods)return false;for(const auto& param:zoneParams)if(a.zones[i].*param.member!=b.zones[i].*param.member)return false;}
+    for(size_t i=0;i<a.zones.size();++i){if(a.zones[i].mods!=b.zones[i].mods||a.zones[i].nativeGenerators!=b.zones[i].nativeGenerators)return false;for(const auto& param:zoneParams)if(a.zones[i].*param.member!=b.zones[i].*param.member)return false;}
     return true;
 }
 // A project library holds independent editable programs. Audio blobs remain shared.
@@ -188,9 +194,21 @@ inline void storeProgram(Library& programs,const Project& draft,Address addr,boo
     require(addr.first>=0&&addr.first<=128&&addr.second>=0&&addr.second<=127,"Invalid program address");require(replace||!programs.count(addr),"Program already exists");auto next=programs;next[addr]=compactProgram(draft);auto packed=packLibrary(draft,next);size_t i=1;for(auto& item:next){const auto& refs=packed.refs.at(i++);for(size_t n=0;n<refs.size();++n)item.second.samples[n].bytes=packed.pool.samples[size_t(refs[n])].bytes;}programs=std::move(next);
 }
 inline Project remapProgram(const Project& q,const Project& pool,const std::vector<int>& refs){Project out=q;out.samples=pool.samples;for(auto& z:out.zones)z.sample=refs.at(size_t(z.sample));return out;}
+// FluidSynth default SF2 loader applies 0.4 to initial attenuation only.
+// The editor stores audible gain, not the pre-scaled file generator.
+inline int legacyLevel(int oldDb,Format f){return oldDb*(f==Format::sf2?40:100);}
+inline int sf2FileAttenuation(int level){return sfzexport::clampRound(-level/4.0,0,1440);}
+inline double sf2VoiceAttenuation(int level){return sf2FileAttenuation(level)*0.4;}
+inline int Zone::* nativeGeneratorMember(int id){switch(id){
+case 17:return &Zone::pan;case 8:return &Zone::cutoff;case 15:return &Zone::chorus;case 16:return &Zone::reverb;
+case 33:return &Zone::ampDelay;case 34:return &Zone::ampAttack;case 35:return &Zone::ampHold;case 36:return &Zone::ampDecay;case 37:return &Zone::ampSustain;case 38:return &Zone::ampRelease;
+case 25:return &Zone::modDelay;case 26:return &Zone::modAttack;case 27:return &Zone::modHold;case 28:return &Zone::modDecay;case 29:return &Zone::modSustain;case 30:return &Zone::modRelease;
+case 21:return &Zone::lfoDelay;case 22:return &Zone::lfoFreq;case 23:return &Zone::vibDelay;case 24:return &Zone::vibFreq;default:return nullptr;}}
+inline std::map<int,int> activeNativeGenerators(const Zone& z){std::map<int,int> out;for(const auto& g:z.nativeGenerators){auto m=nativeGeneratorMember(g.id);if(m&&z.*m==g.baseline)out.emplace(g.id,g.value);}return out;}
 inline sfzexport::Ops zoneOps(const Zone& z,const std::string& path,Format fmt=Format::sf2) {
-    sfzexport::Ops o={{"sample",path},{"pitch_keycenter",std::to_string(z.root)},{"lokey",std::to_string(z.low)},{"hikey",std::to_string(z.high)},{"lovel",std::to_string(z.lowVel)},{"hivel",std::to_string(z.highVel)},{"volume",std::to_string(z.level)},{"pan",std::to_string(z.pan)},{"tune",std::to_string(z.pitch)}};
+    sfzexport::Ops o={{"sample",path},{"pitch_keycenter",std::to_string(z.root)},{"lokey",std::to_string(z.low)},{"hikey",std::to_string(z.high)},{"lovel",std::to_string(z.lowVel)},{"hivel",std::to_string(z.highVel)},{"volume",std::to_string(z.level/100.0)},{"pan",std::to_string(z.pan)},{"tune",std::to_string(z.pitch)}};
     auto set=[&](const char* k,auto v){o[k]=std::to_string(v);};
+    if(fmt==Format::sfz&&z.level==-14400)o["amplitude"]="0";
     set("pitch_keytrack",z.keyTrack);set("offset",z.startFrame);if(z.endFrame>=0)set("end",z.endFrame);
     o["loop_mode"]=z.loopMode==1?"loop_continuous":z.loopMode==2?"loop_sustain":z.loopMode==3&&fmt==Format::sfz?"one_shot":"no_loop";
     if(z.loopMode==1||z.loopMode==2){set("loop_start",z.loopStart);if(z.loopEnd>=0)set("loop_end",z.loopEnd);else if(z.endFrame>=0)set("loop_end",z.endFrame);}
@@ -231,7 +249,7 @@ inline sfzexport::Ops zoneOps(const Zone& z,const std::string& path,Format fmt=F
 }
 inline std::vector<sfzexport::Region> regions(const Project& p) {
     p.validate(true);std::vector<sfzexport::Region> r;r.reserve(p.zones.size());
-    for(const auto& z:p.zones){sfzexport::Region reg{zoneOps(z,sampleFilename(size_t(z.sample),p.samples[size_t(z.sample)])),{}};for(const auto& m:z.mods)if(!m.sfz)reg.nativeMods.push_back({m.source,m.destination,m.amount,m.secondary,m.transform});r.push_back(std::move(reg));}
+    for(const auto& z:p.zones){sfzexport::Region reg{zoneOps(z,sampleFilename(size_t(z.sample),p.samples[size_t(z.sample)])),{}};if(p.format==Format::sf2){reg.editorAttenuation=sf2FileAttenuation(z.level);reg.exactGenerators=activeNativeGenerators(z);}for(const auto& m:z.mods)if(!m.sfz)reg.nativeMods.push_back({m.source,m.destination,m.amount,m.secondary,m.transform});r.push_back(std::move(reg));}
     return r;
 }
 inline std::string sfzText(const Project& p,const std::vector<std::string>* names=nullptr) {

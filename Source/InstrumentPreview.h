@@ -52,7 +52,7 @@ struct PreviewEngine {
             juce::AudioFormatManager formats;formats.registerBasicFormats();
             e->bank=std::make_unique<FluidEditorBank>(p,[&](const Sample& sample){return decode(formats,sample);});
             e->settings=new_fluid_settings();require(e->settings,"Cannot create preview settings");
-            fluid_settings_setnum(e->settings,"synth.sample-rate",rate);fluid_settings_setnum(e->settings,"synth.gain",0.8);
+            fluid_settings_setnum(e->settings,"synth.sample-rate",rate);fluid_settings_setnum(e->settings,"synth.gain",1.0);
             fluid_settings_setint(e->settings,"synth.polyphony",256);fluid_settings_setint(e->settings,"synth.dynamic-sample-loading",0);
             fluid_settings_setint(e->settings,"synth.reverb.active",0);fluid_settings_setint(e->settings,"synth.chorus.active",0);
             e->fluid=new_fluid_synth(e->settings);require(e->fluid,"Cannot create preview synth");
