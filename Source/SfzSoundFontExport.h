@@ -47,16 +47,16 @@ inline void gen(Bytes& b,int op,int val){add16(b,uint16_t(op));add16(b,uint16_t(
 inline void mod(Bytes& b,int src,int dst,int amount,int amtSrc=0){add16(b,uint16_t(src));add16(b,uint16_t(dst));add16(b,uint16_t(amount));add16(b,uint16_t(amtSrc));add16(b,0);}
 inline int tc(double seconds,int hi=8000){return seconds<=0?-12000:clampRound(1200*std::log2(seconds),-12000,hi);}
 inline int attenuation(double gain){return gain<=0?1440:clampRound(-200*std::log10(gain),0,1440);}
-inline void convert(const Path& path,const Path& out,const Decode& decode,Report& report,const std::atomic<bool>* cancel=nullptr){
-    Parser parsed(path,report,cancel);require(!parsed.data().empty(),"SFZ contains no regions");
-    Bytes ph,pb,pg,pm,ih,ib,ig,im,sh,info;const auto name=utf8(path.stem());tag(info,"INFO");Bytes ver;add16(ver,2);add16(ver,1);append(info,chunk("ifil",ver));append(info,chunk("isng",text("EMU8000")));append(info,chunk("INAM",text(name)));append(info,chunk("ICMT",text("Converted from SFZ; source license applies.")));info=chunk("LIST",info);
+inline void convertRegions(const std::vector<Region>& regions,const std::string& name,const Path& out,const Decode& decode,Report& report,const std::atomic<bool>* cancel=nullptr){
+    require(!regions.empty(),"SFZ contains no regions");
+    Bytes ph,pb,pg,pm,ih,ib,ig,im,sh,info;tag(info,"INFO");Bytes ver;add16(ver,2);add16(ver,1);append(info,chunk("ifil",ver));append(info,chunk("isng",text("EMU8000")));append(info,chunk("INAM",text(name)));append(info,chunk("ICMT",text("Converted from SFZ; source license applies.")));info=chunk("LIST",info);
     // Stream PCM to disk, then append tables and patch sizes. No complete source bank held in RAM.
     std::fstream f(out,std::ios::binary|std::ios::out|std::ios::trunc);require(bool(f),"Cannot open temporary conversion file");Bytes head;tag(head,"RIFF");add32(head,0);tag(head,"sfbk");append(head,info);tag(head,"LIST");const auto listSize=head.size();add32(head,0);tag(head,"sdta");tag(head,"smpl");const auto pcmSize=head.size();add32(head,0);write(f,head);
     U64 sampleCount=0;using CacheKey=std::tuple<Path,int64_t,int64_t,int64_t,int64_t,int,int>;std::map<CacheKey,uint16_t> cache;Path lastPath;Audio audio;
     const std::set<std::string> known={"sample","key","lokey","hikey","lovel","hivel","pitch_keycenter","pitch_keytrack","transpose","tune","volume","amplitude","pan","offset","end","loop_start","loop_end","loop_mode","ampeg_delay","ampeg_attack","ampeg_hold","ampeg_decay","ampeg_sustain","ampeg_release","amp_veltrack","cutoff","resonance","fil_type","fileg_depth","fileg_delay","fileg_attack","fileg_hold","fileg_decay","fileg_sustain","fileg_release","pitcheg_depth","pitcheg_delay","pitcheg_attack","pitcheg_hold","pitcheg_decay","pitcheg_sustain","pitcheg_release","pitchlfo_freq","pitchlfo_depth","pitchlfo_delay","amplfo_freq","amplfo_depth","amplfo_delay","fillfo_freq","fillfo_depth","fillfo_delay","group","off_by","off_mode","trigger","seq_length","seq_position","lorand","hirand","sw_lokey","sw_hikey","sw_last","sw_default","sw_label","label","effect1","effect2","bend_up","bend_down","fil_veltrack","fil_keytrack","fil_keycenter","amp_keytrack","amp_keycenter","pitch_veltrack"};
     static const std::regex gate(R"((lo|hi)cc([0-9]+))");
     static const std::regex ccMod(R"((volume|gain|pan|cutoff|pitch|tune|resonance|amplitude)_(oncc|cc)([0-9]+))");
-    for(auto& reg:parsed.data()) {checkCancel(cancel);auto& o=reg.ops;bool gatedOut=false;
+    for(auto& reg:regions) {checkCancel(cancel);auto& o=reg.ops;bool gatedOut=false;
         for(auto& kv:o) {std::smatch m;if(std::regex_match(kv.first,m,gate)){auto cc=m[2].str();int n=int(number(cc));double initial=num(o,"set_cc"+cc,n==7?100:n==10?64:n==11?127:0);if((m[1]=="lo"&&initial<number(kv.second))||(m[1]=="hi"&&initial>number(kv.second)))gatedOut=true;report.warn("CC region conditions: initial controller values only");}else if(!known.count(kv.first)&&!std::regex_match(kv.first,ccMod)&&kv.first.rfind("set_cc",0)!=0)report.warn(kv.first);}
         if(gatedOut){++report.skipped;continue;}
         if(num(o,"end",0)==-1||get(o,"sample")=="*silence"){++report.skipped;report.warn("silent region omitted");continue;}
@@ -94,5 +94,8 @@ inline void convert(const Path& path,const Path& out,const Decode& decode,Report
     }
     require(report.regions>0&&!sh.empty(),"SFZ has no convertible sampled regions");auto p=record(38,name.c_str());append(ph,p);p=record(38,"EOP");put16(p,24,1);append(ph,p);add16(pb,0);add16(pb,0);add16(pb,1);add16(pb,0);gen(pg,41,0);gen(pg,0,0);pm.resize(10);append(ih,record(22,name.c_str()));auto term=record(22,"EOI");put16(term,20,index16(ib.size()/4));append(ih,term);add16(ib,index16(ig.size()/4));add16(ib,index16(im.size()/10));gen(ig,0,0);im.resize(im.size()+10);append(sh,record(46,"EOS"));
     Bytes pd;tag(pd,"pdta");append(pd,chunk("phdr",ph));append(pd,chunk("pbag",pb));append(pd,chunk("pmod",pm));append(pd,chunk("pgen",pg));append(pd,chunk("inst",ih));append(pd,chunk("ibag",ib));append(pd,chunk("imod",im));append(pd,chunk("igen",ig));append(pd,chunk("shdr",sh));pd=chunk("LIST",pd);write(f,pd);auto patch=[&](size_t pos,U64 value){Bytes b;add32(b,size32(value));f.seekp(std::streamoff(pos));write(f,b);};patch(4,head.size()+sampleCount*2+pd.size()-8);patch(listSize,12+sampleCount*2);patch(pcmSize,sampleCount*2);f.flush();require(bool(f),"Cannot finalize temporary SFZ SoundFont");
+}
+inline void convert(const Path& path,const Path& out,const Decode& decode,Report& report,const std::atomic<bool>* cancel=nullptr){
+    Parser parsed(path,report,cancel);convertRegions(parsed.data(),utf8(path.stem()),out,decode,report,cancel);
 }
 }

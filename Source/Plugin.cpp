@@ -29,6 +29,7 @@ extern "C" int lsfx_fluid_noteon(fluid_synth_t*,int,int,int,int,int,float,float,
 extern "C" int lsfx_fluid_channel_dry(fluid_synth_t*,int,int);
 #include "SoundFontExport.h"
 #include "SfzSoundFontExport.h"
+#include "InstrumentProjectIO.h"
 #if JUCE_WINDOWS
  #include <Windows.h>
  #include <UIAutomation.h>
@@ -62,8 +63,8 @@ lsfx::sfzexport::Audio decodeSfzExportSample(juce::AudioFormatManager& formats,c
     return a;
 }
 constexpr int channels = 16;
-constexpr auto lsfxVersion="0.99.3 TEST33";
-constexpr auto lsfxReleaseDate="27 November 2026";
+constexpr auto lsfxVersion="0.99.3 TEST34";
+constexpr auto lsfxReleaseDate="28 November 2026";
 constexpr auto lsfxProjectUrl="https://github.com/Lo-lo78/LSFX";
 constexpr auto lsfxContactEmail="vmanolo301@gmail.com";
 constexpr auto lsfxLicense="GNU Affero General Public License v3 or later (AGPL-3.0-or-later)";
@@ -455,6 +456,7 @@ public:
     // Editor-only state belongs to this processor instance, not to the temporary editor.
     struct EditorMemory { int focus=1,gridReturn=2,gainChannel=0,routeChannel=0,sf2Row=-1,sfzRow=-1,emptyRow=-1,step=0; };
     EditorMemory editorMemory;
+    lsfx::instrument::Draft instrumentDraft; // message thread only; no DSP access
     float instrumentGain(int code) {
         std::lock_guard<std::mutex> audio(engineMutex);
         const auto it=instrumentGains.find(code); return it==instrumentGains.end()?0.0f:it->second;
@@ -1476,12 +1478,14 @@ static void speak(juce::Component& source,const juce::String& message) {
     // No generic JUCE announcement fallback: it may use standalone speech.
 }
 
+#include "InstrumentEditorPanel.h"
+
 class Editor final : public juce::AudioProcessorEditor, private juce::Timer, private juce::KeyListener, private juce::ListBoxModel, private juce::FocusChangeListener {
 public:
     explicit Editor(Processor& p) : AudioProcessorEditor(p), proc(p) {
         setWantsKeyboardFocus(true);
         setFocusContainerType(juce::Component::FocusContainerType::keyboardFocusContainer);
-        title.setText(sf2MultiOutput?"LSFX 0.99.3 TEST33":"LSFX 0.99.3 TEST33 SF2 stereo recovery",juce::dontSendNotification); title.setFont(juce::FontOptions(21.0f)); title.setAccessible(false); addAndMakeVisible(title);
+        title.setText(sf2MultiOutput?"LSFX 0.99.3 TEST34":"LSFX 0.99.3 TEST34 SF2 stereo recovery",juce::dontSendNotification); title.setFont(juce::FontOptions(21.0f)); title.setAccessible(false); addAndMakeVisible(title);
         status.setText("No SoundFont loaded",juce::dontSendNotification); status.setTitle("Instrument status"); addAndMakeVisible(status);
         setup(open,"Open SF2 or SFZ",1); setup(parameters,"Parameters",2); setup(channel,"MIDI channel",3); setup(bank,"Bank",37); setup(program,"Program",38); setup(level,"Master output gain",36);
         setup(grid,"Parameter grid",1); setup(value,"Parameter value",2); setup(closeGrid,"Close parameters",3);
@@ -1547,7 +1551,8 @@ public:
         panelText.onEscapeKey=[this]{cancelPanel();};
         panelLabel.setTitle("Preset information"); panelLabel.setJustificationType(juce::Justification::centredLeft); addAndMakeVisible(panelLabel);
         setup(exportButton,"Export SoundFont",42); exportButton.setDescription("Alt+E"); exportButton.onClick=[this]{browseExport();};
-        setup(aboutButton,"About",43); aboutButton.setDescription("Alt+A"); aboutButton.onClick=[this]{openAbout();};
+        setup(instrumentButton,"Instrument Editor",43); instrumentButton.setDescription("Alt+T"); instrumentButton.onClick=[this]{openInstrumentEditor();};
+        setup(aboutButton,"About",44); aboutButton.setDescription("Alt+A"); aboutButton.onClick=[this]{openAbout();};
         const auto aboutText=juce::String("LSFX\nVersion: ")+lsfxVersion+"\nRelease date: "+lsfxReleaseDate+"\nLicense: "+lsfxLicense+"\nProject: "+lsfxProjectUrl+"\nContact: "+lsfxContactEmail;
         setup(aboutInfo,"About LSFX",1);
         aboutInfo.setMultiLine(true,true); aboutInfo.setReturnKeyStartsNewLine(false); aboutInfo.setReadOnly(true);
@@ -1635,6 +1640,7 @@ public:
     }
     void resized() override {
         auto r=getLocalBounds().reduced(16); title.setBounds(r.removeFromTop(30)); status.setBounds(r.removeFromTop(30));
+        if(panelMode==Panel::instrument) {if(instrumentPanel) instrumentPanel->setBounds(r);return;}
         if(panelMode==Panel::about) {
             auto a=r.withSizeKeepingCentre(juce::jmin(700,r.getWidth()),juce::jmin(430,r.getHeight()));
             auto close=a.removeFromBottom(42); a.removeFromBottom(10);
@@ -1673,7 +1679,7 @@ public:
         for(int ch=0;ch<channels;++ch) routeLevels[ch].setBounds(routes.getX()+ch*cellWidth,routes.getY(),cellWidth,routes.getHeight());
         auto lv=r.removeFromTop(38); levelLabel.setBounds(lv.removeFromLeft(200)); levelReadout.setBounds(lv.removeFromRight(100)); level.setBounds(lv.reduced(0,3));
         line(bankLabel,bank);line(programLabel,program);
-        auto buttons=r.removeFromTop(34); presetsButton.setBounds(buttons.removeFromLeft(170)); saveButton.setBounds(buttons.removeFromLeft(150)); saveAsButton.setBounds(buttons.removeFromLeft(170)); exportButton.setBounds(buttons.removeFromLeft(250)); aboutButton.setBounds(buttons.removeFromLeft(120));
+        auto buttons=r.removeFromTop(34); presetsButton.setBounds(buttons.removeFromLeft(140)); saveButton.setBounds(buttons.removeFromLeft(125)); saveAsButton.setBounds(buttons.removeFromLeft(140)); exportButton.setBounds(buttons.removeFromLeft(160)); instrumentButton.setBounds(buttons.removeFromLeft(180)); aboutButton.setBounds(buttons.removeFromLeft(100));
     }
 private:
     Processor& proc;
@@ -1688,14 +1694,15 @@ private:
     Keyed<juce::TextButton> parentButton{"Back"},panelOK{"OK"},panelCancel{"Cancel"};
     juce::TextEditor panelText;
     juce::Label panelLabel;
-    enum class Panel {none,browser,name,confirm,source,about,exportProgress,notes};
+    enum class Panel {none,browser,name,confirm,source,about,exportProgress,notes,instrument};
     Keyed<juce::TextButton> noteCell{"Note assignments"};
     int noteProgram=0,noteChannel=0,noteSelected=-1,noteColumn=0;
     bool noteLearn=false;
     uint64_t noteEventSeen=0;
     std::map<int,lsfx::NoteAssignment> noteRows;
     juce::Rectangle<int> noteArea;
-    Keyed<juce::TextButton> exportButton{"Export SoundFont"};
+    Keyed<juce::TextButton> exportButton{"Export SoundFont"},instrumentButton{"Instrument Editor"};
+    std::unique_ptr<InstrumentEditorPanel> instrumentPanel;
     struct ExportJob {std::atomic<bool> cancel{false},done{false}; std::atomic<int> progress{0}; juce::String message;};
     std::shared_ptr<ExportJob> exportJob;
     std::thread exportThread;
@@ -1746,14 +1753,14 @@ private:
         for(;c&&c!=this;c=c->getParentComponent()) {
             if(c==&open)return 1; if(c==&parameters)return 2; if(c==&channel)return 3;
             if(c==&level)return 36; if(c==&bank)return 37; if(c==&program)return 38;
-            if(c==&presetsButton)return 39; if(c==&saveButton)return 40; if(c==&saveAsButton)return 41; if(c==&aboutButton)return 42; if(c==&exportButton)return 43;
+            if(c==&presetsButton)return 39; if(c==&saveButton)return 40; if(c==&saveAsButton)return 41; if(c==&aboutButton)return 42; if(c==&exportButton)return 43; if(c==&instrumentButton)return 44;
             if(c==&grid)return 50; if(c==&value)return 51; if(c==&closeGrid)return 52;
             for(int i=0;i<channels;++i) {if(c==&channelLevels[i])return 4+i; if(c==&routeLevels[i])return 20+i;}
         } return 0;
     }
     juce::Component& focusTarget(int id) {
         if(id>=4&&id<20)return channelLevels[id-4]; if(id>=20&&id<36)return routeLevels[id-20];
-        switch(id) {case 2:return parameters;case 3:return channel;case 36:return level;case 37:return bank;case 38:return program;case 39:return presetsButton;case 40:return saveButton;case 41:return saveAsButton;case 42:return aboutButton;case 43:return exportButton;case 50:return grid;case 51:return value;case 52:return closeGrid;default:return open;}
+        switch(id) {case 2:return parameters;case 3:return channel;case 36:return level;case 37:return bank;case 38:return program;case 39:return presetsButton;case 40:return saveButton;case 41:return saveAsButton;case 42:return aboutButton;case 43:return exportButton;case 44:return instrumentButton;case 50:return grid;case 51:return value;case 52:return closeGrid;default:return open;}
     }
     void rememberFocus(int id) {
         if(!id)return;
@@ -1847,7 +1854,7 @@ private:
     }
     void showGrid(bool show,juce::Component* destination=nullptr) {
         gridOpen=show; search.reset();
-        const auto main=std::array<juce::Component*,18>{&open,&parameters,&channel,&bank,&program,&level,&channelLabel,&bankLabel,&programLabel,&levelLabel,&levelReadout,&channelGainLabel,&routingLabel,&presetsButton,&saveButton,&saveAsButton,&aboutButton,&exportButton};
+        const auto main=std::array<juce::Component*,19>{&open,&parameters,&channel,&bank,&program,&level,&channelLabel,&bankLabel,&programLabel,&levelLabel,&levelReadout,&channelGainLabel,&routingLabel,&presetsButton,&saveButton,&saveAsButton,&aboutButton,&exportButton,&instrumentButton};
         const auto panel=std::array<juce::Component*,6>{&grid,&value,&closeGrid,&gridTitle,&hint,&valueReadout};
         // Reveal the destination before hiding the old focused controls.
         if(show) for(auto* c:panel) c->setVisible(true);
@@ -2066,6 +2073,7 @@ private:
         speak(control,control.getText());
     }
     bool handleKey(const juce::KeyPress& k,juce::Component* origin) {
+        if(panelMode==Panel::instrument) return false; // editor owns its own keyboard context
         origin=keyboardControl(origin);
         if(returnFromChooser&&!chooser&&!importInProgress) {
             if(focusId(origin)!=chooserReturn) {
@@ -2147,6 +2155,7 @@ private:
             if(code==juce::KeyPress::returnKey) {openNoteGrid();return true;}
             if(ch=='a') {openAbout(); return true;}
             if(ch=='e') {browseExport();return true;}
+            if(ch=='t') {openInstrumentEditor();return true;}
             if(ch=='s') {showStatus(); return true;}
             if(ch=='l') {openParameters();return true;}
             if(ch=='o') {browse();return true;}
@@ -2364,6 +2373,27 @@ private:
 
         return false;
     }
+    void openInstrumentEditor() {
+        if(chooser||catalogBusy||importInProgress||panelMode!=Panel::none||cached.loading)return;
+        const int ch=selectedChannel(),code=proc.current(ch);
+        auto expected=std::make_shared<std::optional<Preset>>();
+        const auto initialView=proc.getView();if(const auto* current=findPreset(initialView.presets,code))*expected=*current;
+        const auto address="Channel "+juce::String(ch+1)+", Bank "+number(code>>7)+", Program "+number(code&127);
+        hideMainForPanel();hidePanelControls();panelMode=Panel::instrument;
+        instrumentPanel=std::make_unique<InstrumentEditorPanel>(proc.instrumentDraft,[this]{
+            // Avoid destroying the focused component in its own key callback.
+            juce::Component::SafePointer<Editor> safe(this);
+            juce::MessageManager::callAsync([safe]{if(auto* e=safe.getComponent();e&&e->panelMode==Panel::instrument){e->instrumentPanel.reset();e->closePanel(&e->instrumentButton);e->refresh(true);}});
+        },[this,ch,code,expected](const juce::File& file){
+            const auto view=proc.getView();const auto* current=findPreset(view.presets,code);
+            const bool same=expected->has_value()?(current&&current->path==expected->value().path&&current->sourceBank==expected->value().sourceBank&&current->sourceProgram==expected->value().sourceProgram):current==nullptr;
+            if(view.loading||proc.current(ch)!=code||!same)return juce::Result::fail("MIDI destination changed or is loading. File exported; load it manually.");
+            auto result=file.hasFileExtension("sf2")?proc.importSF2(file,code>>7,code&127,0,0,ch):proc.importSFZ(file,code,ch);
+            if(result.wasOk())*expected=Preset{code>>7,code&127,file.getFileNameWithoutExtension(),file.getFullPathName(),0,0};
+            return result;
+        },address);
+        addAndMakeVisible(*instrumentPanel);resized();repaint();instrumentPanel->activate();
+    }
     void hidePanelControls() {
         panelCancel.setDescription({});
         for(auto* c:std::array<juce::Component*,11>{&presetList,&parentButton,&panelOK,&panelCancel,&panelText,&panelLabel,&aboutInfo,&aboutProject,&aboutContact,&aboutClose,&noteCell}) c->setVisible(false);
@@ -2372,7 +2402,7 @@ private:
         if(panelMode==Panel::none) {const int id=focusId(juce::Component::getCurrentlyFocusedComponent());panelReturn=id?id:proc.editorMemory.focus;}
         juce::ScopedValueSetter<bool> guard(focusTransition,true);
         if(gridOpen) showGrid(false);
-        for(auto* c:std::array<juce::Component*,18>{&open,&parameters,&channel,&bank,&program,&level,&channelLabel,&bankLabel,&programLabel,&levelLabel,&levelReadout,&channelGainLabel,&routingLabel,&presetsButton,&saveButton,&saveAsButton,&aboutButton,&exportButton}) c->setVisible(false);
+        for(auto* c:std::array<juce::Component*,19>{&open,&parameters,&channel,&bank,&program,&level,&channelLabel,&bankLabel,&programLabel,&levelLabel,&levelReadout,&channelGainLabel,&routingLabel,&presetsButton,&saveButton,&saveAsButton,&aboutButton,&exportButton,&instrumentButton}) c->setVisible(false);
         for(auto& c:channelLevels) c.setVisible(false);
         for(auto& c:routeLevels) c.setVisible(false);
         initialFocusPending=false; returnFromChooser=false;
@@ -3018,6 +3048,7 @@ private:
         }
     }
     void timerCallback() override {
+        if(panelMode==Panel::instrument) {refresh(false);return;}
         if(panelMode==Panel::notes) {
             if(proc.getRevision()!=revision||proc.current(noteChannel)!=noteProgram) {closePanel();refresh(true);return;}
             pollNoteLearn();return;

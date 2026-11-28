@@ -199,6 +199,28 @@ void testMidiReset(const juce::File& sf2,const juce::File& sfz) {
     require(render(z,midi)[0]>1e-5f,"standalone SFZ audible after reset");
     std::cout<<"PASS: MIDI reset restores defaults, retains map/mixer and accepts new song messages\n";
 }
+void testInstrumentEditor(const juce::File& sfz) {
+    namespace ie=lsfx::instrument;
+    auto dir=juce::File::getSpecialLocation(juce::File::tempDirectory).getNonexistentChildFile("LSFX-editor-smoke","",false);
+    require(dir.createDirectory().wasOk(),"create editor test directory");
+    struct Cleanup {juce::File dir;~Cleanup(){dir.deleteRecursively();}} cleanup{dir};
+    auto original=sfz.withFileExtension("wav"),local=dir.getChildFile("Tone_C4.wav");
+    require(original.copyFileTo(local),"copy WAV fixture");
+    juce::AudioFormatManager formats;formats.registerBasicFormats();ie::Project p;p.name="Editor smoke";
+    int id=p.addSample(ie::importSample(formats,local));require(p.addSample(ie::importSample(formats,local))==id,"duplicate import shared");
+    p.addZones({id,id},ie::Mapping::velocity);require(local.deleteFile(),"delete only test copy of imported sample");
+    auto archive=dir.getChildFile("test.lsfx-instrument");ie::saveProject(p,archive);
+    require(archive.existsAsFile(),"project saved");auto q=ie::openProject(archive);
+    require(q.samples.size()==1&&q.zones.size()==2&&q.samples[0].hash==p.samples[0].hash&&*q.samples[0].bytes==*p.samples[0].bytes,"portable archive round trip");
+    require(q.zones[1].lowVel==64&&q.zones[0].highVel==63,"velocity layers preserved");
+    q.zones[0].pan=-20;ie::saveProject(q,archive,true);require(ie::openProject(archive).zones[0].pan==-20,"project save replaces only own project");
+    auto sf2=ie::exportInstrument(q,dir.getChildFile("Editor.sf2"));
+    q.format=ie::Format::sfz;auto newSfz=ie::exportInstrument(q,dir.getChildFile("Editor SFZ.sfz"));
+    require(newSfz.existsAsFile()&&newSfz.getParentDirectory().getChildFile("Samples").getNumberOfChildFiles(juce::File::findFiles)==1,"portable SFZ sample sharing");
+    bool refused=false;try{q.format=ie::Format::sf2;ie::exportInstrument(q,sf2);}catch(const std::exception&){refused=true;}require(refused,"existing SF2 must not be overwritten");
+    for(auto file:{sf2,newSfz}){Processor sampler;sampler.prepareToPlay(44100,256);sampler.loadFile(file);waitReady(sampler);setChoice(sampler.effectsParameter(),0);juce::MidiBuffer midi;midi.addEvent(juce::MidiMessage::noteOn(1,60,juce::uint8(100)),0);require(render(sampler,midi)[0]>1e-5f,"generated instrument playback");}
+    std::cout<<"PASS: portable compressed project, deduplication, original removed, SF2 and SFZ audio playback, overwrite protection\n";
+}
 }
 int main(int argc,char** argv) {
     if(argc!=4) return 2;
@@ -315,6 +337,7 @@ int main(int argc,char** argv) {
         require(deletedRestore.clearLocation(128,-1).wasOk(),"clear final bank");waitReady(deletedRestore,false);
         require(deletedRestore.getView().presets.empty()&&deletedRestore.notesForProgram(pack(1,4)).empty(),"last deletion releases map and note state");
         std::cout<<"PASS: persistent virtual map deletion, refilling, draft note state and MIDI learn\n";
+        testInstrumentEditor(one);
         testMidiReset(sf2,one);
         testChannelCompression(one,true);testLastSfzOutput(one);
         if constexpr(sf2MultiOutput) {testChannelCompression(sf2,false);testAllSf2Outputs(sf2);testNoteRouting(sf2);}

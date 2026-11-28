@@ -220,3 +220,10 @@ TEST32 validated by the user. Bank and Program navigation now uses eight rows pe
 
 - Ctrl+Alt+M manual MIDI playback reset without unloading the virtual map or altering the channel/note mixer; Follow MIDI effects return to their initial profile. Reset is processed before incoming MIDI on the audio thread.
 - Existing Panic and Initialize shortcuts unchanged; added hybrid processor regression test.
+
+## 0.99.3 TEST34
+
+- First Instrument Editor panel (Alt+T), inserted after Export SoundFont.
+- Common editor-only model with immutable, deduplicated source samples, four mapping import modes, key/velocity ranges, level, pan, pitch and undo/redo.
+- Self-contained compressed `.lsfx-instrument` project; original files never edited; SF2/SFZ export to fresh destinations and explicit import into the displayed program.
+- No additional DSP. Live preview, advanced zone parameters and non-destructive import of existing instruments are later stages. Full Windows host verification pending.

@@ -123,3 +123,6 @@ if(MSVC)
 else()
     target_compile_options(LSFXGridNavigationTest PRIVATE -UNDEBUG)
 endif()
+
+# TEST34: portable instrument editor model and region writer.
+add_executable(LSFXInstrumentProjectTest Tests/InstrumentProjectTest.cpp)
