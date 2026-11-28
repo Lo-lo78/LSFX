@@ -64,7 +64,7 @@ lsfx::sfzexport::Audio decodeSfzExportSample(juce::AudioFormatManager& formats,c
     return a;
 }
 constexpr int channels = 16;
-constexpr auto lsfxVersion="0.99.3 TEST37.1";
+constexpr auto lsfxVersion="0.99.3 TEST39";
 constexpr auto lsfxReleaseDate="28 November 2026";
 constexpr auto lsfxProjectUrl="https://github.com/Lo-lo78/LSFX";
 constexpr auto lsfxContactEmail="vmanolo301@gmail.com";
@@ -73,6 +73,8 @@ const juce::String settingsName="LSFX";
 juce::File presetRoot() { return juce::File::getSpecialLocation(juce::File::userDocumentsDirectory).getChildFile("LSFX"); }
 juce::String setting(const juce::String& key) { juce::PropertiesFile f(preset_browser_memory::options(settingsName)); return f.getValue(key); }
 void rememberSetting(const juce::String& key,const juce::String& value) { juce::PropertiesFile f(preset_browser_memory::options(settingsName)); f.setValue(key,value); f.saveIfNeeded(); }
+juce::File recalledDirectory(const juce::String& key,const juce::File& fallback) {auto path=setting(key);if(juce::File::isAbsolutePath(path)&&juce::File(path).isDirectory())return juce::File(path);return fallback;}
+void rememberDirectory(const juce::String& key,const juce::File& file){auto dir=file.getParentDirectory();if(dir.isDirectory())rememberSetting(key,dir.getFullPathName());}
 bool insideLibrary(const juce::File& f) { const auto root=presetRoot(); return f==root||f.isAChildOf(root); }
 juce::File savedDirectory() { const auto path=setting("saveDirectory"); if(juce::File::isAbsolutePath(path)) { juce::File f(path); if(insideLibrary(f)&&f.isDirectory()) return f; } return presetRoot(); }
 
@@ -1492,7 +1494,7 @@ public:
     explicit Editor(Processor& p) : AudioProcessorEditor(p), proc(p) {
         setWantsKeyboardFocus(true);
         setFocusContainerType(juce::Component::FocusContainerType::keyboardFocusContainer);
-        title.setText(sf2MultiOutput?"LSFX 0.99.3 TEST37.1":"LSFX 0.99.3 TEST37.1 SF2 stereo recovery",juce::dontSendNotification); title.setFont(juce::FontOptions(21.0f)); title.setAccessible(false); addAndMakeVisible(title);
+        title.setText(sf2MultiOutput?"LSFX 0.99.3 TEST39":"LSFX 0.99.3 TEST39 SF2 stereo recovery",juce::dontSendNotification); title.setFont(juce::FontOptions(21.0f)); title.setAccessible(false); addAndMakeVisible(title);
         status.setText("No SoundFont loaded",juce::dontSendNotification); status.setTitle("Instrument status"); addAndMakeVisible(status);
         setup(open,"Open SF2 or SFZ",1); setup(parameters,"Parameters",2); setup(channel,"MIDI channel",3); setup(bank,"Bank",37); setup(program,"Program",38); setup(level,"Master output gain",36);
         setup(grid,"Parameter grid",1); setup(value,"Parameter value",2); setup(closeGrid,"Close parameters",3);
@@ -2382,23 +2384,12 @@ private:
     }
     void openInstrumentEditor() {
         if(chooser||catalogBusy||importInProgress||panelMode!=Panel::none||cached.loading)return;
-        const int ch=selectedChannel(),code=proc.current(ch);
-        auto expected=std::make_shared<std::optional<Preset>>();
-        const auto initialView=proc.getView();if(const auto* current=findPreset(initialView.presets,code))*expected=*current;
-        const auto address="Channel "+juce::String(ch+1)+", Bank "+number(code>>7)+", Program "+number(code&127);
         hideMainForPanel();hidePanelControls();panelMode=Panel::instrument;
         instrumentPanel=std::make_unique<InstrumentEditorPanel>(proc.instrumentDraft,[this]{
             // Avoid destroying the focused component in its own key callback.
             juce::Component::SafePointer<Editor> safe(this);
             juce::MessageManager::callAsync([safe]{if(auto* e=safe.getComponent();e&&e->panelMode==Panel::instrument){e->proc.stopInstrumentPreview();e->instrumentPanel.reset();e->closePanel(&e->instrumentButton);e->refresh(true);}});
-        },[this,ch,code,expected](const juce::File& file){
-            const auto view=proc.getView();const auto* current=findPreset(view.presets,code);
-            const bool same=expected->has_value()?(current&&current->path==expected->value().path&&current->sourceBank==expected->value().sourceBank&&current->sourceProgram==expected->value().sourceProgram):current==nullptr;
-            if(view.loading||proc.current(ch)!=code||!same)return juce::Result::fail("MIDI destination changed or is loading. File exported; load it manually.");
-            auto result=file.hasFileExtension("sf2")?proc.importSF2(file,code>>7,code&127,0,0,ch):proc.importSFZ(file,code,ch);
-            if(result.wasOk())*expected=Preset{code>>7,code&127,file.getFileNameWithoutExtension(),file.getFullPathName(),0,0};
-            return result;
-        },address,[this](const lsfx::instrument::Project& p,int raw){proc.previewInstrument(p,raw);},[this]{return proc.instrumentPreview.getStatus();},[this]{proc.instrumentPreview.panic();});
+        },[this](const lsfx::instrument::Project& p,int raw){proc.previewInstrument(p,raw);},[this]{return proc.instrumentPreview.getStatus();},[this]{proc.instrumentPreview.panic();});
         addAndMakeVisible(*instrumentPanel);resized();repaint();instrumentPanel->activate();
     }
     void hidePanelControls() {
@@ -2478,18 +2469,18 @@ private:
         if(panelMode!=Panel::none) return;
         if(auto result=presetRoot().createDirectory(); result.failed()) {announce(result.getErrorMessage());return;}
         const auto last=preset_browser_memory::recalled(presetRoot(),settingsName);
-        browserDirectory=last.existsAsFile()?last.getParentDirectory():presetRoot();
-        rememberSetting("saveDirectory",browserDirectory.getFullPathName()); showBrowserAt(last);
+        browserDirectory=recalledDirectory("presetBrowserDirectory",last.existsAsFile()?last.getParentDirectory():presetRoot());
+        if(!insideLibrary(browserDirectory))browserDirectory=presetRoot();showBrowserAt(last.existsAsFile()&&last.getParentDirectory()==browserDirectory?last:juce::File{});
     }
     void parentFolder() {
         if(browserDirectory==presetRoot()) return;
         const auto child=browserDirectory; browserDirectory=browserDirectory.getParentDirectory();
-        rememberSetting("saveDirectory",browserDirectory.getFullPathName()); showBrowserAt(child);
+        rememberSetting("presetBrowserDirectory",browserDirectory.getFullPathName()); showBrowserAt(child);
     }
     void activatePreset(int row) {
         if(!juce::isPositiveAndBelow(row,getNumRows())) return;
         const auto f=browserEntries[static_cast<size_t>(row)];
-        if(f.isDirectory()) {browserDirectory=f;rememberSetting("saveDirectory",f.getFullPathName());showBrowserAt();return;}
+        if(f.isDirectory()) {browserDirectory=f;rememberSetting("presetBrowserDirectory",f.getFullPathName());showBrowserAt();return;}
         loadPreset(f);
     }
     void loadPreset(const juce::File& f) {
@@ -2504,7 +2495,7 @@ private:
         // Do not change any current parameter or instrument until the referenced file is present.
         pendingBrowserPreset=f;
         proc.setStateInformation(state.getData(),static_cast<int>(state.getSize()));
-        rememberSetting("saveDirectory",f.getParentDirectory().getFullPathName());
+        rememberSetting("presetBrowserDirectory",f.getParentDirectory().getFullPathName());
         closePanel(); announceLoaded=true; refresh(true);
         announce("Preset selected. "+f.getFileNameWithoutExtension());
     }
@@ -2581,9 +2572,9 @@ private:
         },[this,f]{showBrowserAt(f);});
     }
     void browserMenu() {
-        juce::PopupMenu menu; menu.addItem(1,"Rename",selectedPreset()!=juce::File{}); menu.addItem(2,"New folder"); menu.addItem(3,"Delete preset",selectedPreset().existsAsFile());
+        juce::PopupMenu menu; menu.addItem(1,"Rename",selectedPreset()!=juce::File{}); menu.addItem(2,"New folder"); menu.addItem(3,"Delete preset",selectedPreset().existsAsFile()); menu.addItem(4,"Use current folder for Save As");
         juce::Component::SafePointer<Editor> safe(this);
-        menu.showMenuAsync(juce::PopupMenu::Options().withTargetComponent(&presetList),[safe](int id){if(auto* e=safe.getComponent();e&&e->panelMode==Panel::browser) {if(id==1)e->renamePreset();else if(id==2)e->newFolder();else if(id==3)e->deletePreset();}});
+        menu.showMenuAsync(juce::PopupMenu::Options().withTargetComponent(&presetList),[safe](int id){if(auto* e=safe.getComponent();e&&e->panelMode==Panel::browser) {if(id==1)e->renamePreset();else if(id==2)e->newFolder();else if(id==3)e->deletePreset();else if(id==4){rememberSetting("saveDirectory",e->browserDirectory.getFullPathName());e->focus(e->presetList);e->announce("Save As folder. "+e->browserDirectory.getFileName());}}});
     }
     bool handlePanelKey(const juce::KeyPress& k,juce::Component*) {
         const auto code=k.getKeyCode();const auto mods=k.getModifiers();const bool ctrl=mods.isCtrlDown()||mods.isCommandDown();
@@ -2898,16 +2889,15 @@ private:
         const int returnId=from?from:proc.editorMemory.focus;
         rememberFocus(returnId);
         initialFocusPending=false; returnFromChooser=false; announceLoaded=false; pendingReturnMessage.clear();
-        auto start=cached.path.isNotEmpty()?juce::File(cached.path).getParentDirectory():juce::File{};
-        const auto previous=setting("instrumentPath");
-        if(!start.isDirectory()&&juce::File::isAbsolutePath(previous)) start=juce::File(previous).getParentDirectory();
-        if(!start.isDirectory()) start=juce::File::getSpecialLocation(juce::File::userDocumentsDirectory);
+        auto fallback=juce::File::getSpecialLocation(juce::File::userDocumentsDirectory);
+        const auto previous=setting("instrumentPath");if(juce::File::isAbsolutePath(previous)&&juce::File(previous).getParentDirectory().isDirectory())fallback=juce::File(previous).getParentDirectory();
+        auto start=recalledDirectory("openInstrumentDirectory",fallback);
         chooser=std::make_unique<juce::FileChooser>("Open SF2 or SFZ",start,"*.sf2;*.sfz",true,false,this);
         juce::Component::SafePointer<Editor> safe(this);
         chooser->launchAsync(juce::FileBrowserComponent::openMode|juce::FileBrowserComponent::canSelectFiles,[safe,returnId](const juce::FileChooser& fc) {
             if(auto* self=safe.getComponent()) {
                 auto file=fc.getResult();
-                if(file!=juce::File{}) { rememberSetting("instrumentPath",file.getFullPathName()); self->pendingBrowserPreset=juce::File{}; self->announceLoaded=true; self->proc.loadFile(file); }
+                if(file!=juce::File{}) { rememberDirectory("openInstrumentDirectory",file); self->pendingBrowserPreset=juce::File{}; self->announceLoaded=true; self->proc.loadFile(file); }
                 juce::MessageManager::callAsync([safe,returnId]{if(auto* e=safe.getComponent()) {
                     e->chooser.reset(); e->refresh(true); e->returnTo(returnId);
                 }});
@@ -2919,9 +2909,7 @@ private:
         if(chooser||catalogBusy||cached.loading||importInProgress) return;
         importInProgress=true; pendingReturnMessage.clear(); chooserReturn=single?38:37; rememberFocus(chooserReturn);
         const int ch=selectedChannel(),code=proc.current(ch),destBank=bank.getSelectedId()>0?bank.getSelectedId()-1:code>>7,destProgram=program.getSelectedId()>0?program.getSelectedId()-1:code&127;
-        auto start=juce::File::getSpecialLocation(juce::File::userDocumentsDirectory);
-        const auto previous=setting("instrumentPath");
-        if(juce::File::isAbsolutePath(previous)&&juce::File(previous).getParentDirectory().isDirectory()) start=juce::File(previous).getParentDirectory();
+        auto start=recalledDirectory(single?"importProgramDirectory":"importBankDirectory",juce::File::getSpecialLocation(juce::File::userDocumentsDirectory));
         chooser=std::make_unique<juce::FileChooser>(single?"Import SF2 or SFZ program":"Import SF2 bank",start,single?"*.sf2;*.sfz":"*.sf2",true,false,this);
         juce::Component::SafePointer<Editor> safe(this);
         chooser->launchAsync(juce::FileBrowserComponent::openMode|juce::FileBrowserComponent::canSelectFiles,[safe,single,ch,destBank,destProgram](const juce::FileChooser& fc){
@@ -2929,7 +2917,7 @@ private:
             juce::MessageManager::callAsync([safe,single,ch,destBank,destProgram,file]{if(auto* e=safe.getComponent()) {
                 e->chooser.reset();
                 if(file==juce::File{}) {e->endImport();return;}
-                rememberSetting("instrumentPath",file.getFullPathName());
+                rememberDirectory(single?"importProgramDirectory":"importBankDirectory",file);
                 if(single&&file.hasFileExtension("sfz")) {e->finishImport(e->proc.importSFZ(file,pack(destBank,destProgram),ch));return;}
                 if(!file.hasFileExtension("sf2;sf3")) {e->endImport("Unsupported file format");return;}
                 e->scanImport(file,single,ch,destBank,destProgram);

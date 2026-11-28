@@ -13,6 +13,8 @@ int main(){try{
     require(render(2048)[0]>.001,"Editing interrupted active note");reset();fluid_synth_noteon(synth.get(),0,60,100);require(render(1024)[0]<1e-6,"Previous key mapping still active");fluid_synth_noteon(synth.get(),0,62,100);a=render(16384);require(a[0]>.001&&a[1]<a[0]*.05,"Edited stereo pan/mapping invalid");require(render(16384)[0]>.001,"Loop did not sustain");
     fluid_synth_noteoff(synth.get(),0,62);render(8192);require(render(2048)[0]<1e-5,"Note off failed");reset();
     z.loopMode=0;z.level=-24;z.ampAttack=300;z.cutoff=800;z.choke=1;p.zones[0]=z;bank.replaceZones(p);fluid_synth_noteon(synth.get(),0,62,100);require(render(128)[0]<a[0]*.1,"Edited envelope/level not applied");reset();
+    z.pan=0;z.level=0;z.ampAttack=0;z.cutoff=19912;z.loopMode=1;z.mods={{128+74,48,960,0,0,false}};p.zones[0]=z;bank.replaceZones(p);
+    fluid_synth_cc(synth.get(),0,74,0);fluid_synth_noteon(synth.get(),0,62,100);auto loud=render(4096);require(loud[0]>.001,"Custom mod baseline silent");fluid_synth_cc(synth.get(),0,74,127);auto quiet=render(8192);quiet=render(4096);require(quiet[0]<loud[0]*.05,"Custom CC did not modulate held SF2 note");reset();
     p.zones.clear();bank.replaceZones(p);fluid_synth_noteon(synth.get(),0,62,100);require(render(2048)[0]<1e-6,"Empty mapping still produces audio");
     std::cout<<"PASS: resident virtual SF2 sample stereo, mapping updates without decode, held notes, loop, pan, envelope, filter, empty map\n";
 }catch(const std::exception& e){std::cerr<<"FAIL: "<<e.what()<<'\n';return 1;}}

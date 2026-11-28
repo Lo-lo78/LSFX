@@ -1,3 +1,16 @@
+# TEST39 — Multi-program instrument projects
+
+- F6 Bank/Program are independent of main map. Enter on Bank selects Program only. Enter on an empty slot stores; on occupied slot default Cancel, Tab to Confirm, Enter replaces; Space loads; Delete confirms removal. F1 New instrument preserves all saved slots. Ctrl+S archives working draft plus all slots. Reopen and verify addresses, names, samples, modulators and independent edits. Older project v1/v2 opens as a draft. Export only committed slots. No main map changes. Test focus and folder memory in REAPER/NVDA.
+- Standalone test verifies two addresses, shared sample identity, snapshot isolation, refusal to overwrite without authorization, SF2 preset/instrument/sample tables, SFZ package and overwrite protection. Native Linux FluidSynth plays both generated SF2 addresses and rejects notes outside each mapping. Windows hybrid smoke verifies archive round trip, shared ZIP resources and playback of exported SF2/SFZ library. Full JUCE/sfizz/Windows build not run locally.
+
+# TEST38 — Folder memories, zone picker, contextual modulation
+
+- Verify separate last confirmed directories for Alt+O, Alt+K Enter, Alt+P Enter, F2 import, project open/save and each export mode/format. Close/reopen REAPER; cancel a chooser; delete a remembered directory and verify fallback. Preset browser directory does not change Save As directory.
+- F1 Enter goes to F2. F2 Enter on a single-zone sample goes to F3; a multiple-zone sample opens a vertical selector, Escape returns to F2. Check silent boundaries and Ctrl+Up/Down outside selector; F3 parameter remains selected.
+- F3 Cutoff -> F4 Insert -> edit source and amount; F5 shows the same assignment, then switch sources and edit destinations. SF2 Low/High Velocity -> F5 selects Velocity. F6 saves/exports. Check NVDA and focus at reentry.
+- Model test verifies native SF2 imod records, format isolation, SFZ opcode generation, duplicate/invalid assignment rejection and preview equality. Native FluidSynth test verifies CC attenuation on a held note in virtual editor preset. Hybrid CI verifies archive round-trip of both assignment types and held-note CC attenuation in both engines. All existing build gates retained.
+- Known limitations: SFZ currently five CC destinations only; no CC gating, keyswitch, extended sources or default SF2 modulator list yet. UI and native sfizz remain to be tested on Windows.
+
 # TEST37.1 — SFZ embedded sample reload regression
 
 - TEST37 Windows log: first two SFZ definitions loaded the sample, subsequent same-path reload dropped both regions. sfizz 1.2.3 Resources::clearNonState clears FilePool even on same-path load. Every memory document now contains every referenced sample exactly once, including repeated edits and reintroduced samples. No hint_ram_based opcode is needed for fully decoded embedded PCM (also avoids its fall-through warning).

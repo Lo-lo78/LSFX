@@ -24,7 +24,7 @@ struct PreviewEngine {
     void stop(){rawPlaying=false;if(fluid)fluid_synth_all_sounds_off(fluid,0);else if(sfz)sfizz_all_sound_off(sfz);}
     void event(const uint8_t* d,int n){if(n<1)return;int status=d[0]&0xf0;if(status==0xf0)return;int a=n>1?d[1]&127:0,v=n>2?d[2]&127:0;
         if(status==0x90&&n>=3){if(v)noteOn(a,v);else noteOff(a,0);}else if(status==0x80&&n>=3)noteOff(a,v);
-        else if(status==0xb0&&n>=3&&a!=0&&a!=32&&a!=91&&a!=93)cc(a,v);
+        else if(status==0xb0&&n>=3&&a!=0&&a!=32)cc(a,v);
         else if(status==0xe0&&n>=3){int bend=a|(v<<7);if(fluid)fluid_synth_pitch_bend(fluid,0,bend);else if(sfz)sfizz_send_hd_pitch_wheel(sfz,0,(bend-8192)/8192.0f);}
         else if(status==0xd0&&n>=2){if(fluid)fluid_synth_channel_pressure(fluid,0,a);else if(sfz)sfizz_send_channel_aftertouch(sfz,0,a);}
         else if(status==0xa0&&n>=3){if(fluid)fluid_synth_key_pressure(fluid,0,a,v);else if(sfz)sfizz_send_poly_aftertouch(sfz,0,a,v);}

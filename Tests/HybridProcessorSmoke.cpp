@@ -213,12 +213,26 @@ void testInstrumentEditor(const juce::File& sfz) {
     require(archive.existsAsFile(),"project saved");auto q=ie::openProject(archive);
     require(q.samples.size()==1&&q.zones.size()==2&&q.samples[0].hash==p.samples[0].hash&&*q.samples[0].bytes==*p.samples[0].bytes,"portable archive round trip");
     require(q.zones[1].lowVel==64&&q.zones[0].highVel==63,"velocity layers preserved");
-    q.zones[0].pan=-20;q.zones[0].ampRelease=80;q.zones[0].cutoff=3000;q.zones[0].choke=3;q.zones[0].chokeTarget=3;ie::saveProject(q,archive,true);auto reopened=ie::openProject(archive);require(reopened.zones[0].pan==-20&&reopened.zones[0].ampRelease==80&&reopened.zones[0].cutoff==3000&&reopened.zones[0].choke==3&&reopened.samples[0].frames>0,"expanded project round trip");
+    q.zones[0].pan=-20;q.zones[0].ampRelease=80;q.zones[0].cutoff=3000;q.zones[0].choke=3;q.zones[0].chokeTarget=3;q.zones[0].mods={{202,8,1200,0,0,false},{202,48,-600,0,0,true}};ie::saveProject(q,archive,true);auto reopened=ie::openProject(archive);require(reopened.zones[0].pan==-20&&reopened.zones[0].ampRelease==80&&reopened.zones[0].cutoff==3000&&reopened.zones[0].choke==3&&reopened.zones[0].mods==q.zones[0].mods&&reopened.samples[0].frames>0,"expanded project round trip");
     auto sf2=ie::exportInstrument(q,dir.getChildFile("Editor.sf2"));
     q.format=ie::Format::sfz;auto newSfz=ie::exportInstrument(q,dir.getChildFile("Editor SFZ.sfz"));
     require(newSfz.existsAsFile()&&newSfz.getParentDirectory().getChildFile("Samples").getNumberOfChildFiles(juce::File::findFiles)==1,"portable SFZ sample sharing");
     bool refused=false;try{q.format=ie::Format::sf2;ie::exportInstrument(q,sf2);}catch(const std::exception&){refused=true;}require(refused,"existing SF2 must not be overwritten");
     for(auto file:{sf2,newSfz}){Processor sampler;sampler.prepareToPlay(44100,256);sampler.loadFile(file);waitReady(sampler);setChoice(sampler.effectsParameter(),0);juce::MidiBuffer midi;midi.addEvent(juce::MidiMessage::noteOn(1,60,juce::uint8(100)),0);require(render(sampler,midi)[0]>1e-5f,"generated instrument playback");}
+    // Multi-program archive: retain two addresses, one shared original blob,
+    // independent edits, and native SF2/SFZ exports with no main-map mutation.
+    q.format=ie::Format::sf2;auto first=q;first.name="First";for(auto& z:first.zones)z.low=z.high=60;
+    auto second=first;second.name="Second";for(auto& z:second.zones)z.low=z.high=62;
+    ie::Library library;ie::storeProgram(library,first,{2,4},false);ie::storeProgram(library,second,{128,0},false);
+    auto multi=dir.getChildFile("library.lsfx-instrument");ie::saveProject(second,multi,false,library);auto bundle=ie::openLibraryProject(multi);
+    require(bundle.programs.size()==2&&bundle.programs.at({2,4}).name=="First"&&bundle.programs.at({128,0}).zones[0].low==62,"Library archive lost addresses or mapping");
+    require(bundle.draft.samples[0].bytes==bundle.programs.at({2,4}).samples[0].bytes&&bundle.programs.at({2,4}).samples[0].bytes==bundle.programs.at({128,0}).samples[0].bytes,"Archive failed shared resource identity");
+    {juce::ZipFile zip(multi);require(zip.getNumEntries()==2,"Archive duplicated original sample");}
+    auto multiSf2=ie::exportLibrary(bundle.draft,bundle.programs,dir.getChildFile("Library.sf2"));
+    for(int bank:{2,128}){Processor sampler;sampler.prepareToPlay(44100,256);sampler.loadFile(multiSf2);waitReady(sampler);setChoice(sampler.effectsParameter(),0);int ch=bank==128?9:0;sampler.select(ch,bank,bank==128?0:4);juce::MidiBuffer midi;midi.addEvent(juce::MidiMessage::noteOn(ch+1,bank==128?62:60,juce::uint8(100)),0);require(render(sampler,midi,4)[0]>1e-5f,"Exported library bank/program not audible");}
+    bundle.draft.format=ie::Format::sfz;for(auto& item:bundle.programs)item.second.format=ie::Format::sfz;
+    auto multiSfz=ie::exportLibrary(bundle.draft,bundle.programs,dir.getChildFile("Library SFZ.sfz"));require(multiSfz.getChildFile("Samples").getNumberOfChildFiles(juce::File::findFiles)==1,"SFZ library duplicated audio");
+    for(auto name:{"Bank002_Program004.sfz","Bank128_Program000.sfz"}){auto file=multiSfz.getChildFile(name);require(file.existsAsFile(),"SFZ library program missing");Processor sampler;sampler.prepareToPlay(44100,256);sampler.loadFile(file);waitReady(sampler);setChoice(sampler.effectsParameter(),0);juce::MidiBuffer midi;midi.addEvent(juce::MidiMessage::noteOn(1,file.getFileName().startsWith("Bank002")?60:62,juce::uint8(100)),0);require(render(sampler,midi,4)[0]>1e-5f,"SFZ library program not audible");}
     // Actual preview path, before any main SoundFont is loaded. Source WAV has
     // already been removed; only the project's immutable sample bytes remain.
     Processor preview;preview.prepareToPlay(44100,256);
@@ -237,6 +251,10 @@ void testInstrumentEditor(const juce::File& sfz) {
         midi.addEvent(juce::MidiMessage::noteOn(1,62,juce::uint8(100)),0);require(render(preview,midi,4)[0]>1e-5f,"Resident preview not immediately audible");
         for(int key:{64,65,66,67,68,69}){for(auto& zone:q.zones)zone.low=zone.high=key;preview.previewInstrument(q);ready();midi.addEvent(juce::MidiMessage::noteOn(1,key,juce::uint8(100)),0);require(render(preview,midi,4)[0]>1e-5f,"Repeated resident mapping failed");}
 
+    }
+    for(auto fmt:{ie::Format::sf2,ie::Format::sfz}){
+        auto modded=q;modded.format=fmt;modded.zones.resize(1);auto& z=modded.zones[0];z.low=z.high=z.root=60;z.lowVel=1;z.highVel=127;z.pan=0;z.level=0;z.cutoff=19912;z.loopMode=1;z.loopStart=0;z.loopEnd=-1;z.mods={{202,48,fmt==ie::Format::sf2?960:-960,0,0,fmt==ie::Format::sfz}};
+        preview.previewInstrument(modded);ready();juce::MidiBuffer midi;preview.instrumentPreview.panic();render(preview,midi,4);midi.addEvent(juce::MidiMessage::controllerEvent(1,74,0),0);midi.addEvent(juce::MidiMessage::noteOn(1,60,juce::uint8(100)),1);auto loud=render(preview,midi,8);require(loud[0]>1e-5f,"Modulation baseline silent");midi.addEvent(juce::MidiMessage::controllerEvent(1,74,127),0);render(preview,midi,24);auto quiet=render(preview,midi,8);require(quiet[0]<loud[0]*.1f,"Editor CC modulation did not attenuate held note");
     }
     preview.previewInstrument(q,0);ready();juce::MidiBuffer noMidi;require(render(preview,noMidi,4)[0]>1e-5f,"Raw sample audition missing");
     preview.stopInstrumentPreview();require(render(preview,noMidi,4)[0]<1e-6f&&!preview.getView().ready&&preview.current(0)==initial,"Preview changed empty main map");

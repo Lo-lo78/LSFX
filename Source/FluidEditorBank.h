@@ -9,7 +9,11 @@ class FluidEditorBank {
     struct SampleDeleter {void operator()(fluid_sample_t* p)const {if(p)delete_fluid_sample(p);}};
     struct Asset {std::array<std::unique_ptr<fluid_sample_t,SampleDeleter>,2> pcm;int frames=0,channels=0;};
     struct Generators {std::array<std::pair<int,float>,56> data{};size_t count=0;void set(int id,int value){data[count++]={id,float(value)};}};
-    struct VoiceZone {int lo,hi,lv,hv;fluid_sample_t* sample;Generators gen;};
+    struct ModDeleter {void operator()(fluid_mod_t* p)const {if(p)delete_fluid_mod(p);}};
+    using Mods=std::vector<std::unique_ptr<fluid_mod_t,ModDeleter>>;
+    static int flags(int s){return ((s>>8)&3)|((s>>8)&12)|((s&128)?FLUID_MOD_CC:0);}
+    static std::shared_ptr<const Mods> makeMods(const Zone& z){auto mods=std::make_shared<Mods>();for(const auto& m:z.mods)if(!m.sfz){std::unique_ptr<fluid_mod_t,ModDeleter> v(new_fluid_mod());require(bool(v),"Cannot allocate modulator");fluid_mod_set_source1(v.get(),m.source&127,flags(m.source));fluid_mod_set_source2(v.get(),m.secondary&127,flags(m.secondary));fluid_mod_set_dest(v.get(),m.destination);fluid_mod_set_amount(v.get(),m.amount);fluid_mod_set_transform(v.get(),m.transform);mods->push_back(std::move(v));}return mods;}
+    struct VoiceZone {int lo,hi,lv,hv;fluid_sample_t* sample;Generators gen;std::shared_ptr<const Mods> mods;};
     std::vector<Sample> sources;
     std::vector<Asset> assets;
     std::vector<VoiceZone> zones;
@@ -26,6 +30,7 @@ class FluidEditorBank {
         for(const auto& z:self->zones)if(key>=z.lo&&key<=z.hi&&vel>=z.lv&&vel<=z.hv){
             auto* voice=fluid_synth_alloc_voice(synth,z.sample,channel,key,vel);if(!voice)continue;
             for(size_t i=0;i<z.gen.count;++i)fluid_voice_gen_set(voice,z.gen.data[i].first,z.gen.data[i].second);
+            for(const auto& m:*z.mods)fluid_voice_add_mod(voice,m.get(),FLUID_VOICE_OVERWRITE);
             fluid_synth_start_voice(synth,voice);
         }
         return FLUID_OK;
@@ -73,7 +78,7 @@ public:
     Prepared prepareZones(const Project& p)const{
         p.validate();Prepared next;next.reserve(p.zones.size()*2);
         for(const auto& z:p.zones){const auto& a=assets.at(size_t(z.sample));auto fixed=z;Sample bounds;bounds.frames=a.frames;clampFrames(fixed,bounds);
-            for(int ch=0;ch<a.channels;++ch)next.push_back({fixed.low,fixed.high,fixed.lowVel,fixed.highVel,a.pcm[size_t(ch)].get(),generators(fixed,a,ch)});
+            auto mods=makeMods(fixed);for(int ch=0;ch<a.channels;++ch)next.push_back({fixed.low,fixed.high,fixed.lowVel,fixed.highVel,a.pcm[size_t(ch)].get(),generators(fixed,a,ch),mods});
         }
         return next;
     }

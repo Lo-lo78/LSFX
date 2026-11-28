@@ -49,6 +49,28 @@ int main(int argc,char** argv) {
         decodes=0;require(sfzMemoryText(reload,decodeRam).find("<sample> name=LSFX_1.wav")!=std::string::npos&&decodes==2,"Reintroduced asset omitted");
         auto wrong=sfzProject;wrong.zones[0].seqPosition=4;rejected=false;try{wrong.validate();}catch(...){rejected=true;}require(rejected,"Invalid round robin accepted");
         auto more=advanced;more.zones[0].lfoPitch=120;more.zones[0].ampHoldKey=90;more.zones[0].modDecayKey=-100;lsfx::sfzexport::Report extraReport;lsfx::sfzexport::convertRegions(regions(more),more.name,base/"more.sf2",decode,extraReport);Source moreSF2(base/"more.sf2");bool lfo=false,ampKey=false,modKey=false;for(size_t i=0;i<moreSF2.ig.size();i+=4){auto op=u16(moreSF2.ig,i),val=u16(moreSF2.ig,i+2);lfo|=op==5&&val==120;ampKey|=op==39&&val==90;modKey|=op==32&&val==uint16_t(-100);}require(lfo&&ampKey&&modKey,"New SF2 generators missing");
+        auto modded=advanced;auto& mzone=modded.zones[0];mzone.mods={{128+74,8,2400,0,0,false},{2+256+1024,48,600,0,0,false},{128+1,17,500,0,0,true}};
+        modded.validate(true);require(!sameSound(modded,advanced),"Modulation edit ignored by preview equality");
+        auto moddedRegions=regions(modded);require(moddedRegions[0].nativeMods.size()==2,"SF2 modulator export lost or mixed format");
+        lsfx::sfzexport::Report modReport;auto modPath=base/"modulated.sf2";lsfx::sfzexport::convertRegions(moddedRegions,modded.name,modPath,decode,modReport);Source modSF2(modPath);bool cutoffMod=false,velocityMod=false;
+        for(size_t i=0;i<modSF2.im.size();i+=10){auto src=u16(modSF2.im,i),dst=u16(modSF2.im,i+2),amount=u16(modSF2.im,i+4);cutoffMod|=src==202&&dst==8&&amount==2400;velocityMod|=src==1282&&dst==48&&amount==600;}require(cutoffMod&&velocityMod,"Native SF2 modulator bytes missing");
+        modded.format=Format::sfz;auto modOps=zoneOps(mzone,"sample.wav",Format::sfz);require(std::abs(std::stod(modOps.at("pan_oncc1"))-50)<.001&&!modOps.count("cutoff_oncc74"),"SFZ CC mapping mixed formats");
+        auto dup=modded;dup.zones[0].mods.push_back(dup.zones[0].mods[0]);rejected=false;try{dup.validate();}catch(...){rejected=true;}require(rejected,"Duplicate modulator accepted");
+        auto invalid=modded;invalid.zones[0].mods[2].amount=1001;rejected=false;try{invalid.validate();}catch(...){rejected=true;}require(rejected,"Invalid SFZ amount accepted");
+        // A library contains multiple MIDI addresses, with one shared pool.
+        Project first;first.name="First";first.samples={p.samples[0]};first.addZones({0},Mapping::chromatic,60);
+        Project second=first;second.name="Second";second.samples[0].bytes=std::make_shared<Blob>(*first.samples[0].bytes);second.zones[0].low=second.zones[0].high=62;
+        Library lib;storeProgram(lib,first,{2,4},false);storeProgram(lib,second,{128,0},false);
+        require(lib.size()==2&&lib.at({2,4}).samples[0].bytes==lib.at({128,0}).samples[0].bytes,"Program audio not shared");
+        require(packLibrary(second,lib).pool.samples.size()==1,"Duplicate archive sample");
+        second.name="Uncommitted";second.zones[0].pan=99;require(lib.at({128,0}).name=="Second"&&lib.at({128,0}).zones[0].pan==0,"Working draft changed saved program");
+        rejected=false;try{storeProgram(lib,second,{2,4},false);}catch(...){rejected=true;}require(rejected&&lib.at({2,4}).name=="First","Unconfirmed overwrite accepted");
+        auto libPath=base/"library.sf2";{std::ofstream f(libPath,std::ios::binary);writeSF2Library(second,lib,f,[&](const Sample&){return decode(Path("sample0001.wav"));});}
+        Source libSF2(libPath);require(libSF2.presets.size()==2&&libSF2.presets.count({2,4})&&libSF2.presets.count({128,0}),"Library SF2 lost bank/program addresses");require(libSF2.sh.size()/46==2,"Library SF2 duplicated sample");require(libSF2.ih.size()/22==3&&u16(libSF2.ih,42)==1&&u16(libSF2.ih,64)==2,"Library instrument boundaries invalid");
+        require(std::string(libSF2.ph.begin(),libSF2.ph.begin()+5)=="First"&&std::string(libSF2.ph.begin()+38,libSF2.ph.begin()+44)=="Second","Export used draft name instead of saved program");
+        auto zlib=lib;for(auto& item:zlib)item.second.format=Format::sfz;second.format=Format::sfz;auto zpath=exportSFZLibrary(second,zlib,base/"library-sfz");require(std::filesystem::exists(zpath/"Bank002_Program004.sfz")&&std::filesystem::exists(zpath/"Bank128_Program000.sfz")&&std::filesystem::exists(zpath/"Programs.csv"),"SFZ library files missing");require(std::distance(std::filesystem::directory_iterator(zpath/"Samples"),std::filesystem::directory_iterator{})==1,"SFZ library duplicated samples");
+        rejected=false;try{exportSFZLibrary(second,zlib,zpath);}catch(...){rejected=true;}require(rejected,"Library export overwrite accepted");
+        std::cout<<"PASS: multi-program library, shared sample pool, address preservation and non-destructive SF2/SFZ export\n";
         std::cout<<"PASS: editor sample sharing, four mapping modes, range validation, non-destructive SFZ package and direct SF2 export\n";
     } catch(const std::exception& e){std::cerr<<"FAIL: "<<e.what()<<'\n';return 1;}
 }

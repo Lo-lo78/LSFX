@@ -3,6 +3,7 @@
 // snapshots and offline jobs. Nothing here is called from processBlock.
 #include "SfzSoundFontExport.h"
 #include <memory>
+#include <tuple>
 #include <iomanip>
 #include <limits>
 #include <cstring>
@@ -17,7 +18,34 @@ struct Sample {
     int root=60;
     int frames=0; // derived from immutable audio, not separately stored
 };
+// Source uses standard SF2 source bits; SFZ uses CC-only, positive linear.
+struct Modulation {
+    int source=129,destination=8,amount=0,secondary=0,transform=0;
+    bool sfz=false;
+    bool operator==(const Modulation& m) const {return std::tie(source,destination,amount,secondary,transform,sfz)==std::tie(m.source,m.destination,m.amount,m.secondary,m.transform,m.sfz);}
+};
+inline bool validCC(int cc){return cc>=1&&cc<=119&&cc!=6&&cc!=32&&cc!=38&&!(cc>=96&&cc<=101);}
+inline bool validSource(int s,bool secondary=false){if(s<0||s>4095||(s>>10)>3)return false;int n=s&127;if(s&128)return validCC(n);return (n==0&&secondary&&s==0)||n==2||n==3||n==10||n==13||n==14||n==16;}
+struct ModDestination {int id;const char* key;const char* name;const char* unit;const char* sfzOpcode;double sfzScale;};
+inline constexpr ModDestination modDestinations[]={
+ {48,"level","Level (attenuation)","centibels","volume_oncc",.1},
+ {17,"pan","Pan","0.1 percent of full span","pan_oncc",.1},
+ {52,"pitch","Pitch","cents","pitch_oncc",1},
+ {8,"cutoff","Filter Cutoff","cents","cutoff_oncc",1},
+ {9,"resonance","Filter Resonance","0.1 dB","resonance_oncc",.1},
+ {33,"ampDelay","Amp Delay","timecents",nullptr,0},{34,"ampAttack","Amp Attack","timecents",nullptr,0},{35,"ampHold","Amp Hold","timecents",nullptr,0},{36,"ampDecay","Amp Decay","timecents",nullptr,0},{37,"ampSustain","Amp Sustain (attenuation)","centibels",nullptr,0},{38,"ampRelease","Amp Release","timecents",nullptr,0},
+ {25,"modDelay","Mod Delay","timecents",nullptr,0},{26,"modAttack","Mod Attack","timecents",nullptr,0},{27,"modHold","Mod Hold","timecents",nullptr,0},{28,"modDecay","Mod Decay","timecents",nullptr,0},{29,"modSustain","Mod Sustain (reduction)","0.1 percent",nullptr,0},{30,"modRelease","Mod Release","timecents",nullptr,0},
+ {7,"envPitch","Mod Envelope Pitch","cents",nullptr,0},{11,"envFilter","Mod Envelope Filter","cents",nullptr,0},
+ {23,"vibDelay","Vibrato Delay","timecents",nullptr,0},{24,"vibFreq","Vibrato Frequency","cents",nullptr,0},{6,"vibPitch","Vibrato Pitch","cents",nullptr,0},
+ {21,"lfoDelay","Mod LFO Delay","timecents",nullptr,0},{22,"lfoFreq","Mod LFO Frequency","cents",nullptr,0},{10,"lfoFilter","Mod LFO Filter","cents",nullptr,0},{13,"lfoVolume","Mod LFO Volume","centibels",nullptr,0},{5,"lfoPitch","Mod LFO Pitch","cents",nullptr,0},
+ {15,"chorus","Chorus Send","0.1 percent",nullptr,0},{16,"reverb","Reverb Send","0.1 percent",nullptr,0},
+ {39,"ampHoldKey","Amp Hold Key Scaling","timecents/key",nullptr,0},{40,"ampDecayKey","Amp Decay Key Scaling","timecents/key",nullptr,0},{31,"modHoldKey","Mod Hold Key Scaling","timecents/key",nullptr,0},{32,"modDecayKey","Mod Decay Key Scaling","timecents/key",nullptr,0}};
+inline const ModDestination* modDestination(int id){for(const auto& d:modDestinations)if(d.id==id)return &d;return nullptr;}
+inline int sfzAmountLimit(int dest){return dest==48?960:dest==17?1000:dest==9?400:12000;}
+inline bool validMod(const Modulation& m){auto* d=modDestination(m.destination);if(!d||m.amount< -32768||m.amount>32767)return false;return m.sfz?d->sfzOpcode&&std::abs(m.amount)<=sfzAmountLimit(m.destination)&&m.source>=128&&m.source<248&&validCC(m.source-128)&&m.secondary==0&&m.transform==0:validSource(m.source)&&validSource(m.secondary,true)&&(m.transform==0||m.transform==2);}
+inline bool sameModIdentity(const Modulation& a,const Modulation& b){return a.sfz==b.sfz&&a.source==b.source&&a.destination==b.destination&&a.secondary==b.secondary;}
 struct Zone {
+    std::vector<Modulation> mods;
     int sample=0,root=60,low=0,high=127,lowVel=1,highVel=127,level=0,pan=0,pitch=0; // dB, %, cents
     int startFrame=0,endFrame=-1,loopMode=0,loopStart=0,loopEnd=-1; // inclusive frame indices; -1 = sample end
     int ampDelay=0,ampAttack=0,ampHold=0,ampDecay=0,ampSustain=100,ampRelease=5; // ms, percent
@@ -97,6 +125,8 @@ struct Project {
         require(!needZones||!zones.empty(),"Import or add a zone first");
         for(const auto& s:samples) require(s.bytes&&!s.bytes->empty()&&s.bytes->size()<=maxSampleBytes&&extensionOK(s.extension)&&!s.name.empty()&&s.name.size()<=1024&&s.root>=0&&s.root<=127,"Invalid sample resource");
         for(const auto& z:zones){
+            require(z.mods.size()<=48,"Too many zone modulators");
+            for(size_t i=0;i<z.mods.size();++i){require(validMod(z.mods[i]),"Invalid modulator");for(size_t j=0;j<i;++j)require(!sameModIdentity(z.mods[i],z.mods[j]),"Duplicate modulator");}
             for(const auto& param:zoneParams)require(z.*param.member>=param.lo&&z.*param.member<=param.hi,"Invalid zone parameter");
             require(z.sample>=0&&size_t(z.sample)<samples.size()&&z.low<=z.high&&z.lowVel<=z.highVel&&z.seqPosition<=z.seqLength&&z.randomLow<=z.randomHigh,"Invalid zone mapping");
             const auto& sample=samples[size_t(z.sample)];if(sample.frames>0){auto fixed=z;clampFrames(fixed,sample);require(fixed.startFrame==z.startFrame&&fixed.endFrame==z.endFrame&&fixed.loopStart==z.loopStart&&fixed.loopEnd==z.loopEnd&&fixed.offsetRandom==z.offsetRandom,"Invalid sample or loop bounds");}
@@ -139,9 +169,25 @@ struct Project {
 };
 inline bool sameSound(const Project& a,const Project& b){
     if(a.format!=b.format||!sameSamples(a.samples,b.samples)||a.zones.size()!=b.zones.size())return false;
-    for(size_t i=0;i<a.zones.size();++i)for(const auto& param:zoneParams)if(a.zones[i].*param.member!=b.zones[i].*param.member)return false;
+    for(size_t i=0;i<a.zones.size();++i){if(a.zones[i].mods!=b.zones[i].mods)return false;for(const auto& param:zoneParams)if(a.zones[i].*param.member!=b.zones[i].*param.member)return false;}
     return true;
 }
+// A project library holds independent editable programs. Audio blobs remain shared.
+using Address=std::pair<int,int>;
+using Library=std::map<Address,Project>;
+struct PackedLibrary {Project pool;std::vector<std::vector<int>> refs;};
+inline PackedLibrary packLibrary(const Project& draft,const Library& programs){
+    PackedLibrary out;out.pool.format=draft.format;out.pool.name=draft.name;draft.validate();size_t zones=0,bytes=0;
+    std::map<const Blob*,int> pointers;std::multimap<uint64_t,int> hashes;
+    auto intern=[&](const Sample& sample){auto ptr=pointers.find(sample.bytes.get());if(ptr!=pointers.end())return ptr->second;auto range=hashes.equal_range(sample.hash);for(auto it=range.first;it!=range.second;++it){const auto& other=out.pool.samples[size_t(it->second)];if(other.bytes->size()==sample.bytes->size()&&*other.bytes==*sample.bytes){pointers.emplace(sample.bytes.get(),it->second);return it->second;}}require(out.pool.samples.size()<maxSamples&&sample.bytes->size()<=maxProjectBytes-bytes,"Library sample limit exceeded");int id=int(out.pool.samples.size());out.pool.samples.push_back(sample);bytes+=sample.bytes->size();pointers.emplace(sample.bytes.get(),id);hashes.emplace(sample.hash,id);return id;};
+    auto collect=[&](const Project& q){q.validate();require(q.format==draft.format,"All programs must use the project format");std::vector<int> refs;for(const auto& sample:q.samples)refs.push_back(intern(sample));out.refs.push_back(std::move(refs));};
+    collect(draft);for(const auto& item:programs){require(item.first.first>=0&&item.first.first<=128&&item.first.second>=0&&item.first.second<=127,"Invalid program address");require(!item.second.zones.empty()&&item.second.zones.size()<=maxZones-zones,"Library zone limit exceeded");zones+=item.second.zones.size();collect(item.second);}return out;
+}
+inline Project compactProgram(const Project& q){q.validate(true);Project p;p.name=q.name;p.format=q.format;std::map<int,int> ids;for(const auto& z:q.zones){auto it=ids.find(z.sample);if(it==ids.end()){int id=int(p.samples.size());p.samples.push_back(q.samples[size_t(z.sample)]);it=ids.emplace(z.sample,id).first;}auto copy=z;copy.sample=it->second;p.zones.push_back(std::move(copy));}p.validate(true);return p;}
+inline void storeProgram(Library& programs,const Project& draft,Address addr,bool replace){
+    require(addr.first>=0&&addr.first<=128&&addr.second>=0&&addr.second<=127,"Invalid program address");require(replace||!programs.count(addr),"Program already exists");auto next=programs;next[addr]=compactProgram(draft);auto packed=packLibrary(draft,next);size_t i=1;for(auto& item:next){const auto& refs=packed.refs.at(i++);for(size_t n=0;n<refs.size();++n)item.second.samples[n].bytes=packed.pool.samples[size_t(refs[n])].bytes;}programs=std::move(next);
+}
+inline Project remapProgram(const Project& q,const Project& pool,const std::vector<int>& refs){Project out=q;out.samples=pool.samples;for(auto& z:out.zones)z.sample=refs.at(size_t(z.sample));return out;}
 inline sfzexport::Ops zoneOps(const Zone& z,const std::string& path,Format fmt=Format::sf2) {
     sfzexport::Ops o={{"sample",path},{"pitch_keycenter",std::to_string(z.root)},{"lokey",std::to_string(z.low)},{"hikey",std::to_string(z.high)},{"lovel",std::to_string(z.lowVel)},{"hivel",std::to_string(z.highVel)},{"volume",std::to_string(z.level)},{"pan",std::to_string(z.pan)},{"tune",std::to_string(z.pitch)}};
     auto set=[&](const char* k,auto v){o[k]=std::to_string(v);};
@@ -178,13 +224,14 @@ inline sfzexport::Ops zoneOps(const Zone& z,const std::string& path,Format fmt=F
         if(z.delayRandom)set("delay_random",z.delayRandom/1000.0);if(z.offsetRandom)set("offset_random",z.offsetRandom);
         if(z.stereoWidth!=100)set("width",z.stereoWidth);if(z.stereoPosition)set("position",z.stereoPosition);
         if(z.filterKeyTrack){set("fil_keytrack",z.filterKeyTrack);set("fil_keycenter",z.filterKeyCenter);}
+        for(const auto& m:z.mods)if(m.sfz){const auto* d=modDestination(m.destination);if(d&&d->sfzOpcode){o[std::string(d->sfzOpcode)+std::to_string(m.source-128)]=std::to_string(m.amount*d->sfzScale);if(m.destination==8||m.destination==9){set("cutoff",z.cutoff);set("resonance",z.resonance/10.0);if(!o.count("fil_type"))o["fil_type"]="lpf_2p";}}}
         if(z.notePolyphony)set("note_polyphony",z.notePolyphony);if(!z.sustainSwitch)o["sustain_sw"]="off";
     }
     return o;
 }
 inline std::vector<sfzexport::Region> regions(const Project& p) {
     p.validate(true);std::vector<sfzexport::Region> r;r.reserve(p.zones.size());
-    for(const auto& z:p.zones)r.push_back({zoneOps(z,sampleFilename(size_t(z.sample),p.samples[size_t(z.sample)])),{}});
+    for(const auto& z:p.zones){sfzexport::Region reg{zoneOps(z,sampleFilename(size_t(z.sample),p.samples[size_t(z.sample)])),{}};for(const auto& m:z.mods)if(!m.sfz)reg.nativeMods.push_back({m.source,m.destination,m.amount,m.secondary,m.transform});r.push_back(std::move(reg));}
     return r;
 }
 inline std::string sfzText(const Project& p,const std::vector<std::string>* names=nullptr) {
@@ -242,4 +289,22 @@ inline Path exportSFZ(const Project& p,const Path& directory) {
         auto dest=directory/std::filesystem::u8path(directory.filename().u8string()+".sfz");const auto text=sfzText(p);writeNew(dest,text.data(),text.size());return dest;
     } catch(...) {std::error_code ec;std::filesystem::remove_all(directory,ec);throw;}
 }
+// Export only committed slots, with a single shared pool. The working draft is
+// deliberately excluded, even when it has uncommitted changes.
+inline PackedLibrary exportPool(const Project& work,const Library& programs){Project empty;empty.format=work.format;empty.name=work.name;require(!programs.empty(),"No saved programs");return packLibrary(empty,programs);}
+template<class DecodeSample>
+inline void writeSF2Library(const Project& work,const Library& programs,std::ostream& out,DecodeSample decodeSample){
+    require(work.format==Format::sf2,"Project is not SF2");const auto packed=exportPool(work,programs);std::vector<sfzexport::Region> all;std::vector<sfzexport::ProgramSpan> spans;size_t i=1;
+    for(const auto& item:programs){auto q=remapProgram(item.second,packed.pool,packed.refs.at(i++));auto rr=regions(q);spans.push_back({item.first.first,item.first.second,q.name,all.size(),rr.size()});all.insert(all.end(),std::make_move_iterator(rr.begin()),std::make_move_iterator(rr.end()));}
+    std::map<Path,size_t> indices;for(size_t n=0;n<packed.pool.samples.size();++n)indices.emplace(std::filesystem::u8path(sampleFilename(n,packed.pool.samples[n])),n);
+    sfzexport::Report report;sfzexport::convertRegionsToStream(all,work.name,out,[&](const Path& key){return decodeSample(packed.pool.samples.at(indices.at(key)));},report,nullptr,spans);require(report.regions==all.size()&&report.skipped==0,"Library export lost zones");
+}
+inline Path exportSFZLibrary(const Project& work,const Library& programs,const Path& dir){
+    require(work.format==Format::sfz,"Project is not SFZ");const auto packed=exportPool(work,programs);require(std::filesystem::create_directory(dir),"SFZ destination folder already exists; choose a new name");
+    try{require(std::filesystem::create_directory(dir/"Samples"),"Cannot create Samples folder");std::vector<std::string> names;for(size_t n=0;n<packed.pool.samples.size();++n){const auto& sample=packed.pool.samples[n];auto name=sampleFilename(n,sample);names.push_back("Samples/"+name);writeNew(dir/"Samples"/name,sample.bytes->data(),sample.bytes->size());}
+        std::ostringstream map;map<<"Bank,Program,File,Name\n";size_t i=1;for(const auto& item:programs){auto q=remapProgram(item.second,packed.pool,packed.refs.at(i++));std::ostringstream file;file<<"Bank"<<std::setw(3)<<std::setfill('0')<<item.first.first<<"_Program"<<std::setw(3)<<item.first.second<<".sfz";auto text=sfzText(q,&names);writeNew(dir/file.str(),text.data(),text.size());map<<item.first.first<<','<<item.first.second<<','<<file.str()<<",\"";for(char c:q.name){if(c=='"')map<<'"';map<<c;}map<<"\"\n";}
+        auto text=map.str();writeNew(dir/"Programs.csv",text.data(),text.size());return dir;
+    }catch(...){std::error_code ec;std::filesystem::remove_all(dir,ec);throw;}
+}
+
 }
