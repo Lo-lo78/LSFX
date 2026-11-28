@@ -235,7 +235,7 @@ void testInstrumentEditor(const juce::File& sfz) {
         midi.addEvent(juce::MidiMessage::noteOn(1,62,juce::uint8(100)),0);require(render(preview,midi,4)[0]>1e-5f,"Edited mapping not audible");
         preview.stopInstrumentPreview();preview.previewInstrument(q);require(preview.instrumentPreview.getStatus()=="Preview: ready, play MIDI","Reopening prepared editor rebuilt engine");
         midi.addEvent(juce::MidiMessage::noteOn(1,62,juce::uint8(100)),0);require(render(preview,midi,4)[0]>1e-5f,"Resident preview not immediately audible");
-        for(int key:{64,65,66}){for(auto& zone:q.zones)zone.low=zone.high=key;preview.previewInstrument(q);ready();midi.addEvent(juce::MidiMessage::noteOn(1,key,juce::uint8(100)),0);require(render(preview,midi,4)[0]>1e-5f,"Repeated resident mapping failed");}
+        for(int key:{64,65,66,67,68,69}){for(auto& zone:q.zones)zone.low=zone.high=key;preview.previewInstrument(q);ready();midi.addEvent(juce::MidiMessage::noteOn(1,key,juce::uint8(100)),0);require(render(preview,midi,4)[0]>1e-5f,"Repeated resident mapping failed");}
 
     }
     preview.previewInstrument(q,0);ready();juce::MidiBuffer noMidi;require(render(preview,noMidi,4)[0]>1e-5f,"Raw sample audition missing");

@@ -15,7 +15,7 @@ namespace lsfx::instrument {
 struct PreviewEngine {
     fluid_settings_t* settings=nullptr;fluid_synth_t* fluid=nullptr;sfizz_synth_t* sfz=nullptr;
     std::unique_ptr<FluidEditorBank> bank;
-    std::vector<Sample> sfzSources;std::set<int> sfzLoaded;std::string definition;juce::String virtualPath;double rate=44100;bool raw=false;
+    std::vector<Sample> sfzSources;std::string definition;juce::String virtualPath;double rate=44100;bool raw=false;
     sfzexport::Audio rawAudio;double rawPosition=0;bool rawPlaying=false;
     ~PreviewEngine(){if(sfz)sfizz_free(sfz);if(fluid)delete_fluid_synth(fluid);if(settings)delete_fluid_settings(settings);}
     void noteOn(int key,int vel){if(raw){rawPosition=0;rawPlaying=true;return;}if(fluid)fluid_synth_noteon(fluid,0,key,vel);else if(sfz)sfizz_send_note_on(sfz,0,key,vel);}
@@ -36,20 +36,13 @@ struct PreviewEngine {
         if(fluid)fluid_synth_write_float(fluid,n,l,0,1,r,0,1);else if(sfz){float* out[]={l,r};sfizz_render_block(sfz,out,2,n);}off+=n;}}
     bool sfzMatches(const Project& p) const{return sfz&&sameSamples(sfzSources,p.samples);}
     void reloadSFZ(const Project& p){
-        p.validate(true);const auto ids=usedSampleIds(p);const auto names=ramSampleNames(p);
         juce::AudioFormatManager formats;formats.registerBasicFormats();
-        // Worst-case stereo bound; metadata is already validated at import.
-        uint64_t total=0;for(int i:ids){total+=uint64_t(p.samples[size_t(i)].frames)*8;require(total<=maxProjectBytes,"Decoded SFZ preview exceeds 1 GiB RAM limit");}
-        const bool same=sfzMatches(p);std::string text;
-        for(int i:ids)if(!same||!sfzLoaded.count(i)){
-            auto wav=ramWave(decode(formats,p.samples[size_t(i)]));
-            text+="<sample> name="+names[size_t(i)]+" base64data=";text+=base64Audio(wav);
-        }
-        // A header immediately terminates the previous base64 field.
-        text+="\n<control> hint_ram_based=1\n";text+=sfzText(p,&names);
+        // Self-contained on every reload: sfizz 1.2.3 clears its sample pool
+        // even for the same virtual path. Do not rely on old embedded IDs.
+        auto text=sfzMemoryText(p,[&](const Sample& sample){return decode(formats,sample);});
         require(sfizz_load_string(sfz,virtualPath.toRawUTF8(),text.c_str()),"Cannot load SFZ editor preview");
         require(sfizz_get_num_regions(sfz)==int(p.zones.size()),"SFZ preview lost a region");
-        sfzSources=p.samples;sfzLoaded=ids;definition=sfzText(p);
+        sfzSources=p.samples;definition=sfzText(p);
     }
     static std::unique_ptr<PreviewEngine> build(Project p,double rate,int audition,std::unique_ptr<PreviewEngine>& standby){
         auto e=std::make_unique<PreviewEngine>();e->rate=rate;e->raw=audition>=0;
@@ -66,8 +59,8 @@ struct PreviewEngine {
             e->bank->install(e->fluid);
             fluid_synth_cc(e->fluid,0,7,100);fluid_synth_cc(e->fluid,0,11,127);
         }else{
-            // Reuse the inactive sfizz instance and its decoded sample pool on
-            // same-path reloads. No files are created; only new assets are embedded.
+            // Reuse the inactive sfizz instance, not its cleared sample pool.
+            // The new document includes all required audio; no files are created.
             if(standby&&standby->sfzMatches(p)&&std::abs(standby->rate-rate)<.01)e=std::move(standby);
             else {standby.reset();e->sfz=sfizz_create_synth();require(e->sfz,"Cannot create SFZ editor preview");sfizz_set_sample_rate(e->sfz,float(rate));sfizz_set_samples_per_block(e->sfz,1024);sfizz_set_num_voices(e->sfz,256);
                 e->virtualPath=juce::File::getSpecialLocation(juce::File::tempDirectory).getChildFile("LSFX-RAM-"+juce::Uuid().toString()+".sfz").getFullPathName();}
@@ -154,8 +147,8 @@ private:
             }status=result;
             }
 
-        // Retired SFZ engine is a warm standby. It will be updated on the
-        // worker without blocking the audio thread or touching the live pool.
+        // Retired SFZ engine is a standby. Reload its complete embedded document
+        // on the worker without touching the live pool.
         if(next&&next->sfz){next->stop();standby=std::move(next);}
     }}
 };

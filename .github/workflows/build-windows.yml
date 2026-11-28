@@ -127,7 +127,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           & ./build/LSFXHybridSmoke_artefacts/Release/LSFXHybridSmoke.exe build/smoke.sf2 build/sfz-one.sfz build/sfz-two.sfz 2>&1 | Tee-Object -FilePath logs/hybrid-smoke.txt
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-      - name: Package 0.99.3-TEST37
+      - name: Package 0.99.3-TEST37.1
         shell: pwsh
         run: |
           Start-Transcript -Path logs/package.txt -Force | Out-Null
@@ -150,7 +150,7 @@ jobs:
             & "$root/vcpkg.exe" list | Out-File -Encoding utf8 package/ThirdParty/vcpkg-versions.txt
             git -C $root rev-parse HEAD | Out-File -Encoding utf8 package/ThirdParty/vcpkg-commit.txt
             git rev-parse HEAD | Out-File -Encoding utf8 package/source-commit.txt
-            Compress-Archive -Path package/* -DestinationPath LSFX.0.99.3-TEST37${{ (github.event_name == 'workflow_dispatch' && !inputs.experimental_sf2_multigroup) && '-SF2-stereo' || '' }}.Windows.x64.VST3.zip -Force
+            Compress-Archive -Path package/* -DestinationPath LSFX.0.99.3-TEST37.1${{ (github.event_name == 'workflow_dispatch' && !inputs.experimental_sf2_multigroup) && '-SF2-stereo' || '' }}.Windows.x64.VST3.zip -Force
           } catch {
             $_ | Out-String | Add-Content -Path logs/package-error.txt
             throw
@@ -159,13 +159,13 @@ jobs:
           }
       - uses: actions/upload-artifact@v4
         with:
-          name: LSFX-0.99.3-TEST37${{ (github.event_name == 'workflow_dispatch' && !inputs.experimental_sf2_multigroup) && '-SF2-stereo' || '' }}-Windows-x64
-          path: LSFX.0.99.3-TEST37${{ (github.event_name == 'workflow_dispatch' && !inputs.experimental_sf2_multigroup) && '-SF2-stereo' || '' }}.Windows.x64.VST3.zip
+          name: LSFX-0.99.3-TEST37.1${{ (github.event_name == 'workflow_dispatch' && !inputs.experimental_sf2_multigroup) && '-SF2-stereo' || '' }}-Windows-x64
+          path: LSFX.0.99.3-TEST37.1${{ (github.event_name == 'workflow_dispatch' && !inputs.experimental_sf2_multigroup) && '-SF2-stereo' || '' }}.Windows.x64.VST3.zip
           if-no-files-found: error
       - name: Upload build logs (also on failure)
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: LSFX-0.99.3-TEST37-build-logs
+          name: LSFX-0.99.3-TEST37.1-build-logs
           path: logs/*.txt
           if-no-files-found: warn

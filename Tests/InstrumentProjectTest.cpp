@@ -33,6 +33,20 @@ int main(int argc,char** argv) {
         auto ops=zoneOps(rz,"sample.wav",Format::sfz);require(ops.at("seq_length")=="3"&&ops.at("seq_position")=="2"&&ops.at("trigger")=="release"&&ops.at("fil_type")=="hpf_2p"&&ops.at("off_mode")=="time"&&ops.at("sustain_sw")=="off"&&ops.at("lfo1_pitch")=="100","SFZ articulation mapping");require(!zoneOps(rz,"sample.wav",Format::sf2).count("seq_length"),"SFZ-only fields leaked into SF2");
         auto names=ramSampleNames(sfzProject);auto text=sfzText(sfzProject,&names);require(text.find("sample=LSFX_0.wav")!=std::string::npos&&text.find("Samples/")==std::string::npos,"Memory resource naming failed");require(base64Audio(Blob{'M','a','n'})=="TWFu"&&base64Audio(Blob{'M'})=="TQ=="&&base64Audio(Blob{'M','a'})=="TWE=","Base64 padding failed");
         lsfx::sfzexport::Audio pcm;pcm.rate=48000;pcm.channels=2;pcm.pcm={.25f,-.5f,1.f,0.f};auto wav=ramWave(pcm);require(wav.size()==60&&u16(wav,20)==3&&u16(wav,22)==2&&u32(wav,24)==48000&&u32(wav,40)==16&&u32(wav,44)==0x3e800000&&u32(wav,48)==0xbf000000,"Embedded WAV header or float PCM invalid");
+        // A reload cannot assume the engine still owns any embedded PCM.
+        // Each document must contain the full referenced asset set, deduplicated.
+        auto reload=sfzProject;int decodes=0;
+        auto decodeRam=[&](const Sample&){++decodes;return pcm;};
+        auto countHeader=[](const std::string& doc,const std::string& header){size_t count=0,pos=0;while((pos=doc.find(header,pos))!=std::string::npos){++count;pos+=header.size();}return count;};
+        for(int edit=0;edit<4;++edit){
+            reload.zones[0].pan=edit*10;decodes=0;
+            const auto doc=sfzMemoryText(reload,decodeRam);
+            require(decodes==2&&countHeader(doc,"<sample> name=LSFX_0.wav base64data=")==1&&countHeader(doc,"<sample> name=LSFX_1.wav base64data=")==1,"Reload document omitted or duplicated resident audio");
+            require(doc.find("<sample>")<doc.find("<region>")&&doc.find("hint_ram_based")==std::string::npos,"Invalid embedded SFZ document layout");
+        }
+        auto oneAsset=reload;for(auto& zone:oneAsset.zones)zone.sample=0;decodes=0;
+        const auto singleDoc=sfzMemoryText(oneAsset,decodeRam);require(decodes==1&&singleDoc.find("<sample> name=LSFX_1.wav")==std::string::npos,"Unused asset embedded");
+        decodes=0;require(sfzMemoryText(reload,decodeRam).find("<sample> name=LSFX_1.wav")!=std::string::npos&&decodes==2,"Reintroduced asset omitted");
         auto wrong=sfzProject;wrong.zones[0].seqPosition=4;rejected=false;try{wrong.validate();}catch(...){rejected=true;}require(rejected,"Invalid round robin accepted");
         auto more=advanced;more.zones[0].lfoPitch=120;more.zones[0].ampHoldKey=90;more.zones[0].modDecayKey=-100;lsfx::sfzexport::Report extraReport;lsfx::sfzexport::convertRegions(regions(more),more.name,base/"more.sf2",decode,extraReport);Source moreSF2(base/"more.sf2");bool lfo=false,ampKey=false,modKey=false;for(size_t i=0;i<moreSF2.ig.size();i+=4){auto op=u16(moreSF2.ig,i),val=u16(moreSF2.ig,i+2);lfo|=op==5&&val==120;ampKey|=op==39&&val==90;modKey|=op==32&&val==uint16_t(-100);}require(lfo&&ampKey&&modKey,"New SF2 generators missing");
         std::cout<<"PASS: editor sample sharing, four mapping modes, range validation, non-destructive SFZ package and direct SF2 export\n";

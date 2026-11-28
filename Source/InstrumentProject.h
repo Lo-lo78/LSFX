@@ -212,6 +212,22 @@ inline Blob ramWave(const sfzexport::Audio& a){
     tag("RIFF");add32(b,size+36);tag("WAVE");tag("fmt ");add32(b,16);add16(b,3);add16(b,uint16_t(a.channels));add32(b,uint32_t(a.rate));add32(b,uint32_t(a.rate*a.channels*4));add16(b,uint16_t(a.channels*4));add16(b,32);tag("data");add32(b,size);
     for(float sample:a.pcm){require(std::isfinite(sample),"Invalid sample PCM");uint32_t bits;static_assert(sizeof(bits)==sizeof(sample),"Float32 required");std::memcpy(&bits,&sample,4);add32(b,bits);}return b;
 }
+// Every sfizz loadSfzString call clears its FilePool via clearNonState,
+// including reloads of an identical virtual path. Therefore every document
+// must declare ALL referenced memory samples, exactly once per sample.
+template<class DecodeSample>
+inline std::string sfzMemoryText(const Project& p,DecodeSample decodeSample){
+    p.validate(true);const auto ids=usedSampleIds(p);const auto names=ramSampleNames(p);
+    uint64_t total=0;for(int i:ids){total+=uint64_t(p.samples[size_t(i)].frames)*8;require(total<=maxProjectBytes,"Decoded SFZ preview exceeds 1 GiB RAM limit");}
+    std::string text;
+    for(int i:ids){
+        auto wav=ramWave(decodeSample(p.samples[size_t(i)]));
+        text+="<sample> name="+names[size_t(i)]+" base64data=";text+=base64Audio(wav);text+='\n';
+    }
+    // loadFromRam already loads the complete PCM. No hint_ram_based needed.
+    // In sfizz 1.2.3 that opcode also falls through to hint_stealing.
+    text+="<global>\n";text+=sfzText(p,&names);return text;
+}
 inline void writeNew(const Path& path,const void* bytes,size_t size) {
     require(!std::filesystem::exists(path),"Destination already exists; choose a new name");
     std::ofstream out(path,std::ios::binary);require(bool(out),"Cannot create file");out.write(static_cast<const char*>(bytes),std::streamsize(size));out.close();require(bool(out),"Cannot write file");

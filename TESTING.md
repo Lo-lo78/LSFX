@@ -1,3 +1,8 @@
+# TEST37.1 — SFZ embedded sample reload regression
+
+- TEST37 Windows log: first two SFZ definitions loaded the sample, subsequent same-path reload dropped both regions. sfizz 1.2.3 Resources::clearNonState clears FilePool even on same-path load. Every memory document now contains every referenced sample exactly once, including repeated edits and reintroduced samples. No hint_ram_based opcode is needed for fully decoded embedded PCM (also avoids its fall-through warning).
+- Model regression tests verify four repeated edits, two shared assets, unused and reintroduced assets, and headers preceding regions. The mandatory Windows hybrid test repeats six mapping edits and checks actual audio; do not disable it. Reopening unchanged editor must still be immediate. SFZ edits rebuild/decode in background and keep the previous preview until swap; no claim of incremental sample pool reuse. No change to SF2 synthesis, navigation or exports.
+
 # TEST37 — independent navigation, retained RAM preview and expanded parameters
 
 - F2 plain arrows change the selected sample only. Ctrl+Up/Down changes the zone independently, from F2 through F4; F3 retains its current parameter. Escape/reopen and close/reopen the VST window: same page, focus, zone, sample, edit step and undo/redo history within the instance. No ready announcements.
