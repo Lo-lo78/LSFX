@@ -213,7 +213,7 @@ void testInstrumentEditor(const juce::File& sfz) {
     require(archive.existsAsFile(),"project saved");auto q=ie::openProject(archive);
     require(q.samples.size()==1&&q.zones.size()==2&&q.samples[0].hash==p.samples[0].hash&&*q.samples[0].bytes==*p.samples[0].bytes,"portable archive round trip");
     require(q.zones[1].lowVel==64&&q.zones[0].highVel==63,"velocity layers preserved");
-    q.zones[0].pan=-20;ie::saveProject(q,archive,true);require(ie::openProject(archive).zones[0].pan==-20,"project save replaces only own project");
+    q.zones[0].pan=-20;q.zones[0].ampRelease=80;q.zones[0].cutoff=3000;q.zones[0].choke=3;q.zones[0].chokeTarget=3;ie::saveProject(q,archive,true);auto reopened=ie::openProject(archive);require(reopened.zones[0].pan==-20&&reopened.zones[0].ampRelease==80&&reopened.zones[0].cutoff==3000&&reopened.zones[0].choke==3&&reopened.samples[0].frames>0,"expanded project round trip");
     auto sf2=ie::exportInstrument(q,dir.getChildFile("Editor.sf2"));
     q.format=ie::Format::sfz;auto newSfz=ie::exportInstrument(q,dir.getChildFile("Editor SFZ.sfz"));
     require(newSfz.existsAsFile()&&newSfz.getParentDirectory().getChildFile("Samples").getNumberOfChildFiles(juce::File::findFiles)==1,"portable SFZ sample sharing");
@@ -231,8 +231,12 @@ void testInstrumentEditor(const juce::File& sfz) {
         midi.addEvent(juce::MidiMessage::noteOn(10,60,juce::uint8(100)),0);auto peak=render(preview,midi,4);require(peak[0]>1e-5f&&peak[1]<1e-6f&&peak[2]<1e-6f,"Preview missing or leaked to auxiliary output");
         preview.instrumentPreview.panic();render(preview,midi,4);require(render(preview,midi,12)[0]<1e-5f,"Preview panic left audio");
         for(auto& zone:q.zones)zone.low=zone.high=62;
-        preview.previewInstrument(q);ready();midi.addEvent(juce::MidiMessage::noteOn(1,60,juce::uint8(100)),0);require(render(preview,midi,4)[0]<1e-6f,"Preview retained stale mapping");
+        preview.previewInstrument(q);if(fmt==ie::Format::sf2)require(preview.instrumentPreview.getStatus()=="Preview: ready, play MIDI","SF2 zone edit rebuilt preview");else ready();midi.addEvent(juce::MidiMessage::noteOn(1,60,juce::uint8(100)),0);require(render(preview,midi,4)[0]<1e-6f,"Preview retained stale mapping");
         midi.addEvent(juce::MidiMessage::noteOn(1,62,juce::uint8(100)),0);require(render(preview,midi,4)[0]>1e-5f,"Edited mapping not audible");
+        preview.stopInstrumentPreview();preview.previewInstrument(q);require(preview.instrumentPreview.getStatus()=="Preview: ready, play MIDI","Reopening prepared editor rebuilt engine");
+        midi.addEvent(juce::MidiMessage::noteOn(1,62,juce::uint8(100)),0);require(render(preview,midi,4)[0]>1e-5f,"Resident preview not immediately audible");
+        for(int key:{64,65,66}){for(auto& zone:q.zones)zone.low=zone.high=key;preview.previewInstrument(q);ready();midi.addEvent(juce::MidiMessage::noteOn(1,key,juce::uint8(100)),0);require(render(preview,midi,4)[0]>1e-5f,"Repeated resident mapping failed");}
+
     }
     preview.previewInstrument(q,0);ready();juce::MidiBuffer noMidi;require(render(preview,noMidi,4)[0]>1e-5f,"Raw sample audition missing");
     preview.stopInstrumentPreview();require(render(preview,noMidi,4)[0]<1e-6f&&!preview.getView().ready&&preview.current(0)==initial,"Preview changed empty main map");

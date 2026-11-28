@@ -2,6 +2,7 @@
 // Isolated editor preview. The main virtual map is never mutated. All builds,
 // sample decoding and engine destruction happen on a worker, not processBlock.
 #include "InstrumentProjectIO.h"
+#include "FluidEditorBank.h"
 #include <fluidsynth.h>
 #include <sfizz.h>
 #include <cstring>
@@ -11,43 +12,10 @@
 #include <thread>
 #include <chrono>
 namespace lsfx::instrument {
-struct PreviewMemory {
-    struct Cursor {const std::string* data;size_t pos=0;};
-    // The default SF2 loader runs synchronously. Dynamic sample loading is off.
-    inline static thread_local const std::string* loading=nullptr;
-    inline static thread_local const char* token=nullptr;
-    static void* open(const char* name) noexcept {
-        if(!loading||!token||!name||std::strcmp(name,token)!=0)return nullptr;
-        return new(std::nothrow) Cursor{loading,0};
-    }
-    static int read(void* buf,fluid_long_long_t count,void* handle) noexcept {
-        auto& c=*static_cast<Cursor*>(handle);if(count<0||uint64_t(count)>c.data->size()-c.pos)return FLUID_FAILED;
-        if(count)std::memcpy(buf,c.data->data()+c.pos,size_t(count));c.pos+=size_t(count);return FLUID_OK;
-    }
-    static int seek(void* handle,fluid_long_long_t offset,int origin) noexcept {
-        auto& c=*static_cast<Cursor*>(handle);fluid_long_long_t base=0;
-        if(origin==SEEK_CUR)base=fluid_long_long_t(c.pos);else if(origin==SEEK_END)base=fluid_long_long_t(c.data->size());else if(origin!=SEEK_SET)return FLUID_FAILED;
-        if(offset< -base||offset>fluid_long_long_t(c.data->size())-base)return FLUID_FAILED;
-        c.pos=size_t(base+offset);return FLUID_OK;
-    }
-    static fluid_long_long_t tell(void* handle) noexcept {return fluid_long_long_t(static_cast<Cursor*>(handle)->pos);}
-    static int close(void* handle) noexcept {delete static_cast<Cursor*>(handle);return FLUID_OK;}
-};
-struct PreviewCache {
-    juce::File dir;std::vector<Sample> samples;
-    ~PreviewCache(){if(dir!=juce::File{})dir.deleteRecursively();}
-    bool matches(const Project& p)const{if(samples.size()!=p.samples.size())return false;for(size_t i=0;i<samples.size();++i)if(samples[i].bytes!=p.samples[i].bytes||samples[i].extension!=p.samples[i].extension)return false;return true;}
-    static std::shared_ptr<PreviewCache> create(const Project& p){
-        auto c=std::make_shared<PreviewCache>();auto dir=juce::File::getSpecialLocation(juce::File::tempDirectory).getChildFile("LSFX-preview-"+juce::Uuid().toString());
-        require(dir.createDirectory().wasOk(),"Cannot create SFZ preview cache");c->dir=dir;
-        auto samples=dir.getChildFile("Samples");require(samples.createDirectory().wasOk(),"Cannot create preview sample cache");
-        for(size_t i=0;i<p.samples.size();++i){auto& s=p.samples[i];writeNew(pathOf(samples.getChildFile(js(sampleFilename(i,s)))),s.bytes->data(),s.bytes->size());}
-        c->samples=p.samples;return c;
-    }
-};
 struct PreviewEngine {
     fluid_settings_t* settings=nullptr;fluid_synth_t* fluid=nullptr;sfizz_synth_t* sfz=nullptr;
-    std::shared_ptr<PreviewCache> cache;double rate=44100;bool raw=false;
+    std::unique_ptr<FluidEditorBank> bank;
+    std::vector<Sample> sfzSources;std::set<int> sfzLoaded;std::string definition;juce::String virtualPath;double rate=44100;bool raw=false;
     sfzexport::Audio rawAudio;double rawPosition=0;bool rawPlaying=false;
     ~PreviewEngine(){if(sfz)sfizz_free(sfz);if(fluid)delete_fluid_synth(fluid);if(settings)delete_fluid_settings(settings);}
     void noteOn(int key,int vel){if(raw){rawPosition=0;rawPlaying=true;return;}if(fluid)fluid_synth_noteon(fluid,0,key,vel);else if(sfz)sfizz_send_note_on(sfz,0,key,vel);}
@@ -66,59 +34,102 @@ struct PreviewEngine {
             for(int i=0;i<count;++i){if(rawPosition>=double(frames)){rawPlaying=false;break;}auto a=size_t(rawPosition),z=(std::min)(a+1,frames-1);float f=float(rawPosition-double(a));auto read=[&](int ch){float x=rawAudio.pcm[a*rawAudio.channels+ch],y=rawAudio.pcm[z*rawAudio.channels+ch];return x+(y-x)*f;};l[i]=read(0);r[i]=read(rawAudio.channels-1);rawPosition+=step;}return;}
         for(int off=0;off<count;){int n=std::min(1024,count-off);auto* l=b.getWritePointer(0,start+off);auto* r=b.getWritePointer(1,start+off);
         if(fluid)fluid_synth_write_float(fluid,n,l,0,1,r,0,1);else if(sfz){float* out[]={l,r};sfizz_render_block(sfz,out,2,n);}off+=n;}}
-    static std::unique_ptr<PreviewEngine> build(Project p,double rate,int audition,std::shared_ptr<PreviewCache>& cached){
+    bool sfzMatches(const Project& p) const{return sfz&&sameSamples(sfzSources,p.samples);}
+    void reloadSFZ(const Project& p){
+        p.validate(true);const auto ids=usedSampleIds(p);const auto names=ramSampleNames(p);
+        juce::AudioFormatManager formats;formats.registerBasicFormats();
+        // Worst-case stereo bound; metadata is already validated at import.
+        uint64_t total=0;for(int i:ids){total+=uint64_t(p.samples[size_t(i)].frames)*8;require(total<=maxProjectBytes,"Decoded SFZ preview exceeds 1 GiB RAM limit");}
+        const bool same=sfzMatches(p);std::string text;
+        for(int i:ids)if(!same||!sfzLoaded.count(i)){
+            auto wav=ramWave(decode(formats,p.samples[size_t(i)]));
+            text+="<sample> name="+names[size_t(i)]+" base64data=";text+=base64Audio(wav);
+        }
+        // A header immediately terminates the previous base64 field.
+        text+="\n<control> hint_ram_based=1\n";text+=sfzText(p,&names);
+        require(sfizz_load_string(sfz,virtualPath.toRawUTF8(),text.c_str()),"Cannot load SFZ editor preview");
+        require(sfizz_get_num_regions(sfz)==int(p.zones.size()),"SFZ preview lost a region");
+        sfzSources=p.samples;sfzLoaded=ids;definition=sfzText(p);
+    }
+    static std::unique_ptr<PreviewEngine> build(Project p,double rate,int audition,std::unique_ptr<PreviewEngine>& standby){
         auto e=std::make_unique<PreviewEngine>();e->rate=rate;e->raw=audition>=0;
         if(audition>=0){require(size_t(audition)<p.samples.size(),"No sample to audition");juce::AudioFormatManager formats;formats.registerBasicFormats();e->rawAudio=decode(formats,p.samples[size_t(audition)]);e->rawPlaying=true;return e;}
         p.validate(true);
         if(p.format==Format::sf2){
-            // Exactly the same generator as final SF2 export, but backed by RAM.
-            juce::AudioFormatManager formats;formats.registerBasicFormats();std::map<Path,size_t> indices;
-            for(size_t i=0;i<p.samples.size();++i)indices.emplace(std::filesystem::u8path(sampleFilename(i,p.samples[i])),i);
-            std::ostringstream stream(std::ios::out|std::ios::binary);sfzexport::Report report;
-            sfzexport::convertRegionsToStream(regions(p),p.name,stream,[&](const Path& path){return decode(formats,p.samples.at(indices.at(path)));},report);
-            require(report.regions==p.zones.size()&&report.skipped==0,"Preview lost mapping zones");auto bytes=stream.str();
+            juce::AudioFormatManager formats;formats.registerBasicFormats();
+            e->bank=std::make_unique<FluidEditorBank>(p,[&](const Sample& sample){return decode(formats,sample);});
             e->settings=new_fluid_settings();require(e->settings,"Cannot create preview settings");
             fluid_settings_setnum(e->settings,"synth.sample-rate",rate);fluid_settings_setnum(e->settings,"synth.gain",0.8);
             fluid_settings_setint(e->settings,"synth.polyphony",256);fluid_settings_setint(e->settings,"synth.dynamic-sample-loading",0);
             fluid_settings_setint(e->settings,"synth.reverb.active",0);fluid_settings_setint(e->settings,"synth.chorus.active",0);
             e->fluid=new_fluid_synth(e->settings);require(e->fluid,"Cannot create preview synth");
-            auto* loader=new_fluid_defsfloader(e->settings);require(loader,"Cannot create memory loader");
-            if(fluid_sfloader_set_callbacks(loader,PreviewMemory::open,PreviewMemory::read,PreviewMemory::seek,PreviewMemory::tell,PreviewMemory::close)!=FLUID_OK){delete_fluid_sfloader(loader);throw std::runtime_error("Cannot configure memory loader");}
-            fluid_synth_add_sfloader(e->fluid,loader);
-            static std::atomic<uint64_t> serial{0};auto token=std::string("LSFX-memory-")+std::to_string(++serial)+".sf2";
-            PreviewMemory::loading=&bytes;PreviewMemory::token=token.c_str();int id=fluid_synth_sfload(e->fluid,token.c_str(),0);PreviewMemory::loading=nullptr;PreviewMemory::token=nullptr;
-            require(id>=0&&fluid_synth_program_select(e->fluid,0,id,0,0)==FLUID_OK,"Cannot load SF2 editor preview");
+            e->bank->install(e->fluid);
             fluid_synth_cc(e->fluid,0,7,100);fluid_synth_cc(e->fluid,0,11,127);
         }else{
-            // sfizz 1.2.3 reads SFZ text from RAM but resolves audio via files.
-            // Only a private scratch cache is written; never export or touch originals.
-            if(!cached||!cached->matches(p))cached=PreviewCache::create(p);e->cache=cached;auto dir=cached->dir;
-            e->sfz=sfizz_create_synth();require(e->sfz,"Cannot create SFZ editor preview");sfizz_set_sample_rate(e->sfz,float(rate));sfizz_set_samples_per_block(e->sfz,1024);sfizz_set_num_voices(e->sfz,128);
-            auto virtualPath=dir.getChildFile("Preview.sfz").getFullPathName();auto text=sfzText(p);require(sfizz_load_string(e->sfz,virtualPath.toRawUTF8(),text.c_str()),"Cannot load SFZ editor preview");
+            // Reuse the inactive sfizz instance and its decoded sample pool on
+            // same-path reloads. No files are created; only new assets are embedded.
+            if(standby&&standby->sfzMatches(p)&&std::abs(standby->rate-rate)<.01)e=std::move(standby);
+            else {standby.reset();e->sfz=sfizz_create_synth();require(e->sfz,"Cannot create SFZ editor preview");sfizz_set_sample_rate(e->sfz,float(rate));sfizz_set_samples_per_block(e->sfz,1024);sfizz_set_num_voices(e->sfz,256);
+                e->virtualPath=juce::File::getSpecialLocation(juce::File::tempDirectory).getChildFile("LSFX-RAM-"+juce::Uuid().toString()+".sfz").getFullPathName();}
+            e->reloadSFZ(p);
         }
         return e;
     }
 };
 class InstrumentPreview {
     std::mutex requestMutex,audioMutex;std::condition_variable cv;std::thread worker;
-    std::optional<Project> project;std::unique_ptr<PreviewEngine> live;
-    std::atomic<bool> enabled{false},kill{false},rawEnded{false};std::atomic<uint64_t> wanted{0},published{0};
+    std::optional<Project> project;std::unique_ptr<PreviewEngine> live,parked;
+    std::atomic<bool> enabled{false},kill{false},rawEnded{false},allowPrevious{false};std::atomic<uint64_t> wanted{0},published{0};
     double rate=44100;int audition=-1;bool stopping=false;juce::String status;
 public:
     ~InstrumentPreview(){enabled.store(false);{std::lock_guard<std::mutex> g(requestMutex);stopping=true;}cv.notify_one();if(worker.joinable())worker.join();}
     bool active()const{return enabled.load();}
     void update(const Project& p,double r,int raw=-1){
-        std::lock_guard<std::mutex> g(requestMutex);project=p;rate=r;audition=raw;kill.store(false);rawEnded.store(false);++wanted;enabled.store(true);status=p.zones.empty()&&raw<0?"Preview: import samples":"Preview: preparing";
+        std::lock_guard<std::mutex> g(requestMutex);
+        if(raw<0&&audition<0&&project&&std::abs(rate-r)<.01&&sameSound(*project,p)&&!status.startsWith("Preview error")){
+            enabled.store(true);if(published.load()!=wanted.load())allowPrevious.store(true);return;
+        }
+        project=p;rate=r;audition=raw;kill.store(false);rawEnded.store(false);++wanted;allowPrevious.store(raw<0&&!p.zones.empty()&&enabled.load());enabled.store(true);status=p.zones.empty()&&raw<0?"Preview: import samples":"Preview: preparing";
+        if(raw<0){
+            std::string sfzDefinition;if(p.format==Format::sfz&&!p.zones.empty())sfzDefinition=sfzText(p);
+            PreviewEngine* compatibleEngine=nullptr;
+            {std::lock_guard<std::mutex> a(audioMutex);
+                auto compatible=[&](const std::unique_ptr<PreviewEngine>& e){return e&&!e->raw&&std::abs(e->rate-r)<.01&&(p.format==Format::sf2?(e->bank&&e->bank->matches(p)):(e->sfzMatches(p)&&e->definition==sfzDefinition));};
+                if(!compatible(live)&&compatible(parked))live.swap(parked);
+                if(compatible(live))compatibleEngine=live.get();
+            }
+            // requestMutex prevents the worker from retiring compatibleEngine.
+            // Prepare descriptor arrays while audio continues on the old table.
+            if(compatibleEngine){
+                try{
+                    FluidEditorBank::Prepared next;if(compatibleEngine->bank)next=compatibleEngine->bank->prepareZones(p);
+                    {std::lock_guard<std::mutex> a(audioMutex);if(compatibleEngine->bank)compatibleEngine->bank->installZones(next);published.store(wanted.load());}
+                    status=p.zones.empty()?"Preview: import samples":"Preview: ready, play MIDI";cv.notify_one();return;
+                }catch(const std::exception& e){status=juce::String("Preview error: ")+juce::String::fromUTF8(e.what());}
+            }
+        }
         if(!worker.joinable())worker=std::thread([this]{run();});cv.notify_one();
     }
-    void setRate(double r){std::lock_guard<std::mutex> g(requestMutex);if(std::abs(rate-r)>0.01){rate=r;if(enabled.load()&&project){++wanted;status="Preview: preparing";cv.notify_one();}}}
-    void disable(){std::lock_guard<std::mutex> g(requestMutex);enabled.store(false);project.reset();++wanted;status=juce::String{};cv.notify_one();}
+    void setRate(double r){std::lock_guard<std::mutex> g(requestMutex);if(std::abs(rate-r)>0.01){rate=r;if(project){++wanted;status="Preview: preparing";cv.notify_one();}}}
+    void disable(){std::lock_guard<std::mutex> g(requestMutex);enabled.store(false);allowPrevious.store(false);kill.store(false);
+        // Suspend audio, not the draft. Restore the mapped engine if raw audition was active.
+        PreviewEngine* mapped=nullptr;
+        {std::lock_guard<std::mutex> a(audioMutex);if(live)live->stop();if(parked)parked->stop();if(audition>=0&&live&&live->raw&&parked)live.swap(parked);if(live&&!live->raw)mapped=live.get();}
+        if(audition>=0&&project){audition=-1;++wanted;rawEnded.store(false);bool ready=false;
+            if(mapped&&std::abs(mapped->rate-rate)<.01&&!project->zones.empty())try{
+                if(project->format==Format::sf2&&mapped->bank&&mapped->bank->matches(*project)){auto next=mapped->bank->prepareZones(*project);std::lock_guard<std::mutex> a(audioMutex);mapped->bank->installZones(next);ready=true;}
+                else if(project->format==Format::sfz&&mapped->sfzMatches(*project)&&mapped->definition==sfzText(*project))ready=true;
+            }catch(...){ready=false;}
+            if(ready){published.store(wanted.load());status="Preview: ready, play MIDI";}else status="Preview: preparing";
+            cv.notify_one();
+        }
+    }
     void panic(){kill.store(true);}
     juce::String getStatus(){std::lock_guard<std::mutex> g(requestMutex);if(audition>=0&&rawEnded.load()&&published.load()==wanted.load())return "Preview: sample ended";return status;}
     bool render(juce::AudioBuffer<float>& b,juce::MidiBuffer& midi){
         if(!enabled.load())return false;
         std::unique_lock<std::mutex> lock(audioMutex,std::try_to_lock);
-        if(lock.owns_lock()&&live&&published.load()==wanted.load()&&b.getNumChannels()>=2){
+        if(lock.owns_lock()&&live&&(published.load()==wanted.load()||(allowPrevious.load()&&!live->raw))&&b.getNumChannels()>=2){
             if(kill.exchange(false))live->stop();int pos=0;
             for(const auto m:midi){int at=juce::jlimit(pos,b.getNumSamples(),m.samplePosition);live->render(b,pos,at-pos);live->event(m.data,m.numBytes);pos=at;}
             live->render(b,pos,b.getNumSamples()-pos);
@@ -127,16 +138,25 @@ public:
         midi.clear();return true;
     }
 private:
-    void run(){uint64_t seen=0;std::shared_ptr<PreviewCache> cached;for(;;){std::optional<Project> p;double r=0;int raw=-1;uint64_t serial=0;
+    void run(){uint64_t seen=0;std::unique_ptr<PreviewEngine> standby;for(;;){std::optional<Project> p;double r=0;int raw=-1;uint64_t serial=0;
         {std::unique_lock<std::mutex> g(requestMutex);cv.wait(g,[&]{return stopping||wanted.load()!=seen;});if(stopping)return;
-            // Coalesce keyboard autorepeat into one rebuild, with no audio-thread wait.
-            while(enabled.load()){auto current=wanted.load();if(!cv.wait_for(g,std::chrono::milliseconds(80),[&]{return stopping||wanted.load()!=current;}))break;if(stopping)return;}
-            serial=wanted.load();seen=serial;p=project;r=rate;raw=audition;}
-        if(!p)cached.reset();std::unique_ptr<PreviewEngine> next;juce::String result="Preview: import samples";
-        try{if(p&&(raw>=0||!p->zones.empty())){next=PreviewEngine::build(std::move(*p),r,raw,cached);result=raw>=0?"Preview: sample audition":"Preview: ready, play MIDI";}}catch(const std::exception& e){result=juce::String("Preview error: ")+juce::String::fromUTF8(e.what());}catch(...){result="Preview error: cannot build instrument";}
-        {std::lock_guard<std::mutex> g(requestMutex);if(stopping)return;if(serial!=wanted.load())continue;
-            {std::lock_guard<std::mutex> a(audioMutex);live.swap(next);rawEnded.store(false);published.store(serial);}status=enabled.load()?result:juce::String{};}
-        // next owns the retired engine; destroy it outside both locks.
+            serial=wanted.load();seen=serial;if(published.load()==serial)continue;p=project;r=rate;raw=audition;
+            if(p&&raw<0){std::lock_guard<std::mutex> a(audioMutex);if(live&&live->raw&&parked){live.swap(parked);}}
+}
+        if(!p||p->format!=Format::sfz||p->zones.empty())standby.reset();std::unique_ptr<PreviewEngine> next;juce::String result="Preview: import samples";
+        try{if(p&&(raw>=0||!p->zones.empty())){next=PreviewEngine::build(std::move(*p),r,raw,standby);result=raw>=0?"Preview: sample audition":"Preview: ready, play MIDI";}}catch(const std::exception& e){result=juce::String("Preview error: ")+juce::String::fromUTF8(e.what());}catch(...){result="Preview error: cannot build instrument";}
+        std::unique_ptr<PreviewEngine> retired;
+        {std::lock_guard<std::mutex> g(requestMutex);if(stopping)return;if(serial!=wanted.load()){if(next&&next->sfz)standby=std::move(next);continue;}
+            {std::lock_guard<std::mutex> a(audioMutex);
+                if(next&&next->raw&&live&&!live->raw){live->stop();retired.swap(parked);parked.swap(live);}
+                else if(!next||!next->raw){retired.swap(parked);}
+                if(next||!result.startsWith("Preview error")){live.swap(next);}rawEnded.store(false);published.store(serial);
+            }status=result;
+            }
+
+        // Retired SFZ engine is a warm standby. It will be updated on the
+        // worker without blocking the audio thread or touching the live pool.
+        if(next&&next->sfz){next->stop();standby=std::move(next);}
     }}
 };
 }

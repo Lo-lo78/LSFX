@@ -126,3 +126,10 @@ endif()
 
 # TEST34: portable instrument editor model and region writer.
 add_executable(LSFXInstrumentProjectTest Tests/InstrumentProjectTest.cpp)
+
+# TEST36: real native virtual-preset rendering without the host or JUCE.
+add_executable(LSFXFluidEditorBankTest Tests/FluidEditorBankTest.cpp)
+target_link_libraries(LSFXFluidEditorBankTest PRIVATE FluidSynth::libfluidsynth)
+if(WIN32)
+    target_compile_definitions(LSFXFluidEditorBankTest PRIVATE NOMINMAX)
+endif()

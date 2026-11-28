@@ -28,7 +28,7 @@ inline int inferRoot(const juce::AudioFormatReader& reader,const juce::String& n
 inline Sample importSample(juce::AudioFormatManager& formats,const juce::File& f) {
     auto ext=ss(f.getFileExtension().substring(1).toLowerCase());require(extensionOK(ext),"Only WAV, AIFF and FLAC samples are supported");
     auto stream=f.createInputStream();require(bool(stream),"Cannot open sample");auto b=readBlob(*stream,f.getSize(),maxSampleBytes);
-    auto reader=readerFor(formats,*b);return {ss(f.getFileName()),ext,b,fingerprint(*b),inferRoot(*reader,f.getFileNameWithoutExtension())};
+    auto reader=readerFor(formats,*b);return {ss(f.getFileName()),ext,b,fingerprint(*b),inferRoot(*reader,f.getFileNameWithoutExtension()),int(reader->lengthInSamples)};
 }
 inline sfzexport::Audio decode(juce::AudioFormatManager& formats,const Sample& s) {
     auto r=readerFor(formats,*s.bytes);sfzexport::Audio a;a.rate=int(r->sampleRate);a.channels=int(r->numChannels);a.root=s.root;
@@ -48,7 +48,7 @@ inline void saveProject(const Project& p,const juce::File& target,bool replaceKn
     juce::XmlElement xml("LSFXInstrument");xml.setAttribute("version",1);xml.setAttribute("name",js(p.name));xml.setAttribute("format",p.format==Format::sf2?"sf2":"sfz");
     auto* samples=xml.createNewChildElement("Samples");auto* zones=xml.createNewChildElement("Zones");
     for(size_t i=0;i<p.samples.size();++i){auto& s=p.samples[i];auto* node=samples->createNewChildElement("Sample");node->setAttribute("name",js(s.name));node->setAttribute("extension",js(s.extension));node->setAttribute("root",s.root);node->setAttribute("bytes",juce::String(juce::int64(s.bytes->size())));node->setAttribute("hash",js(hashText(s.hash)));}
-    for(const auto& z:p.zones){auto* n=zones->createNewChildElement("Zone");n->setAttribute("sample",z.sample);n->setAttribute("root",z.root);n->setAttribute("low",z.low);n->setAttribute("high",z.high);n->setAttribute("lowVel",z.lowVel);n->setAttribute("highVel",z.highVel);n->setAttribute("level",z.level);n->setAttribute("pan",z.pan);n->setAttribute("pitch",z.pitch);}
+    for(const auto& z:p.zones){auto* n=zones->createNewChildElement("Zone");for(const auto& param:zoneParams)n->setAttribute(param.key,z.*param.member);}
     const auto text=xml.toString();juce::ZipFile::Builder zip;
     zip.addEntry(new juce::MemoryInputStream(text.toRawUTF8(),size_t(text.getNumBytesAsUTF8()),true),6,"project.xml",juce::Time::getCurrentTime());
     for(size_t i=0;i<p.samples.size();++i){const auto& s=p.samples[i];zip.addEntry(new juce::MemoryInputStream(s.bytes->data(),s.bytes->size(),false),s.extension=="flac"?0:6,"Samples/"+js(sampleFilename(i,s)),juce::Time::getCurrentTime());}
@@ -71,9 +71,9 @@ inline Project openProject(const juce::File& f) {
     juce::AudioFormatManager formats;formats.registerBasicFormats();size_t total=0;
     for(auto* n=samples->getFirstChildElement();n;n=n->getNextElement()) {
         require(n->hasTagName("Sample"),"Invalid sample record");Sample s;s.name=ss(n->getStringAttribute("name"));s.extension=ss(n->getStringAttribute("extension"));s.root=intAttr(*n,"root");auto size=intAttr(*n,"bytes");require(extensionOK(s.extension)&&size>0&&size_t(size)<=maxSampleBytes&&size_t(size)<=maxProjectBytes-total,"Project sample size limit exceeded");
-        s.bytes=entry(zip,"Samples/"+js(sampleFilename(p.samples.size(),s)),size_t(size));require(s.bytes->size()==size_t(size),"Project sample length mismatch");s.hash=fingerprint(*s.bytes);require(js(hashText(s.hash))==n->getStringAttribute("hash"),"Project sample integrity check failed");readerFor(formats,*s.bytes);total+=s.bytes->size();p.samples.push_back(std::move(s));
+        s.bytes=entry(zip,"Samples/"+js(sampleFilename(p.samples.size(),s)),size_t(size));require(s.bytes->size()==size_t(size),"Project sample length mismatch");s.hash=fingerprint(*s.bytes);require(js(hashText(s.hash))==n->getStringAttribute("hash"),"Project sample integrity check failed");s.frames=int(readerFor(formats,*s.bytes)->lengthInSamples);total+=s.bytes->size();p.samples.push_back(std::move(s));
     }
-    for(auto* n=zones->getFirstChildElement();n;n=n->getNextElement()){require(n->hasTagName("Zone"),"Invalid zone record");p.zones.push_back({intAttr(*n,"sample"),intAttr(*n,"root"),intAttr(*n,"low"),intAttr(*n,"high"),intAttr(*n,"lowVel"),intAttr(*n,"highVel"),intAttr(*n,"level"),intAttr(*n,"pan"),intAttr(*n,"pitch")});}
+    for(auto* n=zones->getFirstChildElement();n;n=n->getNextElement()){require(n->hasTagName("Zone"),"Invalid zone record");Zone z;for(size_t i=0;i<std::size(zoneParams);++i){const auto& param=zoneParams[i];if(n->hasAttribute(param.key))z.*param.member=intAttr(*n,param.key);else if(i==0||i==1||i==2||i==3||i==4||i==5||i==6||i==7||i==8)throw std::runtime_error("Missing core zone parameter");}p.zones.push_back(z);}
     p.validate();return p;
 }
 inline juce::File exportInstrument(const Project& p,const juce::File& target) {
@@ -87,5 +87,6 @@ inline juce::File exportInstrument(const Project& p,const juce::File& target) {
     {sf2export::Source verified(pathOf(temp.getFile()));require(verified.presets.count({0,0})==1,"Generated SoundFont missing program 0");}
     installNew(temp.getFile(),target);return target;
 }
-struct Draft {Project project;juce::File savedFile;bool dirty=false;};
+struct EditorPosition {int page=0,sample=0,zone=0,parameter=0,mode=0,start=60,step=0,focus=10;};
+struct Draft {Project project;juce::File savedFile;bool dirty=false;EditorPosition position;std::vector<Project> undo,redo;std::optional<Zone> clipboard;};
 }

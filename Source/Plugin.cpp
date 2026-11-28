@@ -64,7 +64,7 @@ lsfx::sfzexport::Audio decodeSfzExportSample(juce::AudioFormatManager& formats,c
     return a;
 }
 constexpr int channels = 16;
-constexpr auto lsfxVersion="0.99.3 TEST35";
+constexpr auto lsfxVersion="0.99.3 TEST37";
 constexpr auto lsfxReleaseDate="28 November 2026";
 constexpr auto lsfxProjectUrl="https://github.com/Lo-lo78/LSFX";
 constexpr auto lsfxContactEmail="vmanolo301@gmail.com";
@@ -1492,7 +1492,7 @@ public:
     explicit Editor(Processor& p) : AudioProcessorEditor(p), proc(p) {
         setWantsKeyboardFocus(true);
         setFocusContainerType(juce::Component::FocusContainerType::keyboardFocusContainer);
-        title.setText(sf2MultiOutput?"LSFX 0.99.3 TEST35":"LSFX 0.99.3 TEST35 SF2 stereo recovery",juce::dontSendNotification); title.setFont(juce::FontOptions(21.0f)); title.setAccessible(false); addAndMakeVisible(title);
+        title.setText(sf2MultiOutput?"LSFX 0.99.3 TEST37":"LSFX 0.99.3 TEST37 SF2 stereo recovery",juce::dontSendNotification); title.setFont(juce::FontOptions(21.0f)); title.setAccessible(false); addAndMakeVisible(title);
         status.setText("No SoundFont loaded",juce::dontSendNotification); status.setTitle("Instrument status"); addAndMakeVisible(status);
         setup(open,"Open SF2 or SFZ",1); setup(parameters,"Parameters",2); setup(channel,"MIDI channel",3); setup(bank,"Bank",37); setup(program,"Program",38); setup(level,"Master output gain",36);
         setup(grid,"Parameter grid",1); setup(value,"Parameter value",2); setup(closeGrid,"Close parameters",3);
