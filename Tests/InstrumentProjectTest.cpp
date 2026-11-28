@@ -1,4 +1,4 @@
-#include "../Source/InstrumentProject.h"
+#include "../Source/InstrumentSourceImport.h"
 #include <iostream>
 using namespace lsfx::instrument;
 int main(int argc,char** argv) {
@@ -70,6 +70,15 @@ int main(int argc,char** argv) {
         require(std::string(libSF2.ph.begin(),libSF2.ph.begin()+5)=="First"&&std::string(libSF2.ph.begin()+38,libSF2.ph.begin()+44)=="Second","Export used draft name instead of saved program");
         auto zlib=lib;for(auto& item:zlib)item.second.format=Format::sfz;second.format=Format::sfz;auto zpath=exportSFZLibrary(second,zlib,base/"library-sfz");require(std::filesystem::exists(zpath/"Bank002_Program004.sfz")&&std::filesystem::exists(zpath/"Bank128_Program000.sfz")&&std::filesystem::exists(zpath/"Programs.csv"),"SFZ library files missing");require(std::distance(std::filesystem::directory_iterator(zpath/"Samples"),std::filesystem::directory_iterator{})==1,"SFZ library duplicated samples");
         rejected=false;try{exportSFZLibrary(second,zlib,zpath);}catch(...){rejected=true;}require(rejected,"Library export overwrite accepted");
+        // A selected source address becomes an independent, editable draft.
+        auto imported=importSF2Program(libPath,2,4);require(imported.project.name=="First"&&imported.project.zones.size()==1&&imported.project.zones[0].low==60&&imported.project.samples[0].frames==8192,"Selected SF2 program import failed");
+        auto drum=importSF2Program(libPath,128,0);require(drum.project.name=="Second"&&drum.project.zones[0].low==62,"SF2 drum bank import failed");
+        auto rich=importSF2Program(modPath,0,0);const auto& importedZone=rich.project.zones[0];require(importedZone.loopMode==1&&importedZone.loopEnd-importedZone.loopStart==1919&&std::abs(importedZone.cutoff-2400)<=2&&importedZone.ampAttack==50&&importedZone.mods.size()==2,"SF2 loop, envelope, filter or modulation import failed");
+        rejected=false;try{importSF2Program(libPath,2,5);}catch(...){rejected=true;}require(rejected,"Missing source program accepted");
+        auto source=base/"loaded.sfz";{std::ofstream f(source);f<<"<global> sample=sample.wav ampeg_attack=0.05\n<group> lovel=10 hivel=100 cutoff=2400\n<region> key=C4 loop_mode=loop_continuous loop_start=16 loop_end=255 pitch_oncc1=50\n<region> key=D4 seq_length=2 seq_position=2 sw_last=36\n";}
+        int reads=0;auto sfzIn=importSFZProgram(source,[&](const Path& f){++reads;require(f.filename()=="sample.wav","SFZ path resolution failed");return ImportedAudio{{"sample.wav","wav",a,0,60,8192},-1,-1};});
+        require(reads==1&&sfzIn.project.samples.size()==1&&sfzIn.project.zones.size()==2,"SFZ sample sharing or region import failed");const auto& sz=sfzIn.project.zones[0];require(sz.root==60&&sz.low==60&&sz.high==60&&sz.lowVel==10&&sz.highVel==100&&sz.ampAttack==50&&sz.cutoff==2400&&sz.loopStart==16&&sz.loopEnd==255&&sz.mods.size()==1,"SFZ mapping, envelope, loop or modulation failed");require(sfzIn.project.zones[1].seqPosition==2&&sfzIn.warnings.count("Unsupported SFZ opcode sw_last"),"SFZ articulation or unsupported opcode warning failed");
+        std::cout<<"PASS: editable SF2/SFZ source import, selected MIDI addresses, loop/envelope/modulation and unsupported opcode diagnostics\n";
         std::cout<<"PASS: multi-program library, shared sample pool, address preservation and non-destructive SF2/SFZ export\n";
         std::cout<<"PASS: editor sample sharing, four mapping modes, range validation, non-destructive SFZ package and direct SF2 export\n";
     } catch(const std::exception& e){std::cerr<<"FAIL: "<<e.what()<<'\n';return 1;}

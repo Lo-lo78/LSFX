@@ -1,3 +1,10 @@
+# TEST40 — Loaded program to editable instrument
+
+- Alt+O load a GM SF2, select a nonzero program on the current MIDI channel, Alt+T, Enter on Format: SF2. Current mapped address is selected; arrows change selection without modifying the playback map; Enter imports into F2. Verify sample names, mapping, loops, amp/filter envelopes, modulators and audition. Tab skips, Escape returns to F1. Verify Bank 128 drums and remapped addresses where original source bank/program differs.
+- Load a single SFZ; Alt+T, Enter on SFZ imports straight into F2. With multiple SFZ files, select an entry; duplicate paths appear once. Tab skips selection, or Tab past Format for a single SFZ. No sources of selected format: Enter goes to F2. Check NVDA silent boundaries, F2 focus, F3 edits, undo, F6 explicit save/export, and main map unchanged on Escape.
+- Existing working instrument prompts before replacement; Cancel retains it. Existing saved slots survive import. Unsupported values/opcodes prompt before installing approximation; invalid sources fail without replacing draft. Verify on Windows with real SF2/SFZ banks. Source format remains the project format if it contains saved programs.
+- Portable model test covers SF2 selected bank/program, drum bank, native PCM, loop/envelope/filter/modulators, absent program, SFZ inherited ranges and CC modulation, shared sample paths and unsupported keyswitch warning. Full Windows/JUCE/NVDA and playback equivalence still need verification.
+
 # TEST39 — Multi-program instrument projects
 
 - F6 Bank/Program are independent of main map. Enter on Bank selects Program only. Enter on an empty slot stores; on occupied slot default Cancel, Tab to Confirm, Enter replaces; Space loads; Delete confirms removal. F1 New instrument preserves all saved slots. Ctrl+S archives working draft plus all slots. Reopen and verify addresses, names, samples, modulators and independent edits. Older project v1/v2 opens as a draft. Export only committed slots. No main map changes. Test focus and folder memory in REAPER/NVDA.

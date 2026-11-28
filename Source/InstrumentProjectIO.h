@@ -1,6 +1,7 @@
 #pragma once
 #include <JuceHeader.h>
 #include "InstrumentProject.h"
+#include "InstrumentSourceImport.h"
 namespace lsfx::instrument {
 inline juce::String js(const std::string& s) {return juce::String::fromUTF8(s.c_str());}
 inline std::string ss(const juce::String& s) {return s.toStdString();}
@@ -29,6 +30,14 @@ inline Sample importSample(juce::AudioFormatManager& formats,const juce::File& f
     auto ext=ss(f.getFileExtension().substring(1).toLowerCase());require(extensionOK(ext),"Only WAV, AIFF and FLAC samples are supported");
     auto stream=f.createInputStream();require(bool(stream),"Cannot open sample");auto b=readBlob(*stream,f.getSize(),maxSampleBytes);
     auto reader=readerFor(formats,*b);return {ss(f.getFileName()),ext,b,fingerprint(*b),inferRoot(*reader,f.getFileNameWithoutExtension()),int(reader->lengthInSamples)};
+}
+inline SourceImport importLoadedSource(const juce::File& file,int bank,int program) {
+    if(file.hasFileExtension("sf2"))return importSF2Program(pathOf(file),bank,program);
+    require(file.hasFileExtension("sfz"),"Unsupported instrument source");
+    juce::AudioFormatManager formats;formats.registerBasicFormats();
+    return importSFZProgram(pathOf(file),[&](const Path& path){ImportedAudio a;a.sample=importSample(formats,fileOf(path));auto reader=readerFor(formats,*a.sample.bytes);const auto& m=reader->metadataValues;
+        if(m.getValue("NumSampleLoops","0").getIntValue()>0){auto start=m.getValue("Loop0Start","-1").getLargeIntValue(),end=m.getValue("Loop0End","-1").getLargeIntValue();if(start>=0&&end>=start&&end<a.sample.frames){a.loopStart=int(start);a.loopEnd=int(end);}}
+        return a;});
 }
 inline sfzexport::Audio decode(juce::AudioFormatManager& formats,const Sample& s) {
     auto r=readerFor(formats,*s.bytes);sfzexport::Audio a;a.rate=int(r->sampleRate);a.channels=int(r->numChannels);a.root=s.root;
